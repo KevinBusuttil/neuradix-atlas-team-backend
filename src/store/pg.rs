@@ -12,8 +12,8 @@ use crate::model::{
     WebhookEvent,
 };
 use crate::posting::model::{
-    format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument,
-    PostingCommit, Settlement, StockLedgerEntry,
+    format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit,
+    Settlement, StockLedgerEntry,
 };
 
 use super::{Store, StoreError};

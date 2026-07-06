@@ -1,0 +1,85 @@
+{
+  "name": "FIFO issue costing, including the moving-average shortfall fallback (negative stock allowed)",
+  "setup": {
+    "settings": { "allow_negative_stock": true },
+    "items": [
+      { "id": "ITEM-F", "item_type": "Stock", "valuation_method": "FIFO" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Layer 1: 10 @ €5",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-F1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-01",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-F", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": { "bins": { "ITEM-F@WH": { "qty": 10, "value": 50 } } }
+    },
+    {
+      "comment": "Layer 2: 10 @ €7 → 20 on hand worth €120 (moving average would be €6)",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-F2",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-02",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-F", "qty": 10, "rate": 7 }]
+      },
+      "expect_status": 200,
+      "expect": { "bins": { "ITEM-F@WH": { "qty": 20, "value": 120, "rate": 6 } } }
+    },
+    {
+      "comment": "Sell 12: FIFO consumes 10 @ €5 + 2 @ €7 = €64 COGS (moving average would have been €72)",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-F1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-03",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-F", "qty": 12, "rate": 20 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "account_balances": { "COGS": 64, "Stock": 56 },
+        "bins": { "ITEM-F@WH": { "qty": 8, "value": 56, "rate": 7 } }
+      }
+    },
+    {
+      "comment": "Oversell 10 with 8 on hand: 8 @ €7 from the last layer + 2 shortfall at the €7 moving average (never free) → €70",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-F2",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-04",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-F", "qty": 10, "rate": 20 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "account_balances": { "COGS": 134, "Stock": -14 },
+        "bins": { "ITEM-F@WH": { "qty": -2, "value": -14 } }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "COGS": 134, "Stock": -14 },
+    "bins": { "ITEM-F@WH": { "qty": -2, "value": -14, "rate": 7 } }
+  }
+}

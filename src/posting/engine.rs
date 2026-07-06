@@ -230,9 +230,7 @@ async fn build_submit(
     // Item registry: drop service-item movements before costing (they never
     // touch stock), then cost issues from the authoritative ledger.
     let items = load_items(store, company_id, &sles, &payload).await?;
-    sles.retain(|sle| {
-        is_stock_item_type(items.get(&sle.item).map(|item| item.item_type.as_str()))
-    });
+    sles.retain(|sle| is_stock_item_type(items.get(&sle.item).map(|item| item.item_type.as_str())));
     let mut ledgers = Ledgers::default();
     cost_stock_movements(store, company_id, &mut sles, &items, &payload, &mut ledgers).await?;
 
@@ -251,8 +249,7 @@ async fn build_submit(
     let mut outstanding_updates = Vec::new();
     if doctype == "Payment Entry" {
         settlements = derive_settlements(&ctx, &payload);
-        outstanding_updates =
-            payment_outstanding_updates(store, company_id, &settlements).await?;
+        outstanding_updates = payment_outstanding_updates(store, company_id, &settlements).await?;
     }
 
     let bins = recompute_bins(company_id, &ledgers);
@@ -319,8 +316,7 @@ async fn build_cancel(
             cmd.doctype, cmd.document_id, document.docstatus
         )));
     }
-    let posting_date =
-        as_non_empty(document.payload.get("posting_date")).unwrap_or_else(today);
+    let posting_date = as_non_empty(document.payload.get("posting_date")).unwrap_or_else(today);
     check_period_lock(&settings, &posting_date)?;
 
     let document_id = cmd.document_id.as_str();
@@ -536,14 +532,8 @@ fn resolve_account_fallbacks(
     settings: &CompanySettings,
 ) {
     let fallbacks: &[(&str, &str)] = match doctype {
-        "Sales Invoice" => &[
-            ("debit_to", "receivable"),
-            ("income_account", "income"),
-        ],
-        "Purchase Invoice" => &[
-            ("credit_to", "payable"),
-            ("expense_account", "expense"),
-        ],
+        "Sales Invoice" => &[("debit_to", "receivable"), ("income_account", "income")],
+        "Purchase Invoice" => &[("credit_to", "payable"), ("expense_account", "expense")],
         "Payment Entry" => match as_non_empty(payload.get("payment_type")).as_deref() {
             Some("Receive") => &[("paid_from", "receivable"), ("paid_to", "cash")],
             Some("Pay") => &[("paid_from", "cash"), ("paid_to", "payable")],
@@ -694,7 +684,14 @@ fn tax_legs(ctx: &RowContext<'_>, payload: &Map<String, Value>, is_output: bool)
         } else {
             (tax_amount, 0.0)
         };
-        out.push(ctx.gl(format!("GL-{id}-tax-{i}"), account, debit, credit, None, None));
+        out.push(ctx.gl(
+            format!("GL-{id}-tax-{i}"),
+            account,
+            debit,
+            credit,
+            None,
+            None,
+        ));
     }
     out
 }
@@ -727,7 +724,9 @@ fn stock_document_rows(
     let id = ctx.document_id;
     let mut rows = Vec::new();
     for (i, line) in items_of(payload).iter().enumerate() {
-        let Some(line) = line.as_object() else { continue };
+        let Some(line) = line.as_object() else {
+            continue;
+        };
         let Some(item) = as_non_empty(line.get("item")) else {
             continue;
         };
@@ -743,7 +742,14 @@ fn stock_document_rows(
             Some(v) if !v.is_null() => as_num(Some(v)),
             _ => as_num(line.get("rate")),
         };
-        rows.push(ctx.sle(format!("SLE-{id}-{i}"), trans_type, item, warehouse, qty_change, rate));
+        rows.push(ctx.sle(
+            format!("SLE-{id}-{i}"),
+            trans_type,
+            item,
+            warehouse,
+            qty_change,
+            rate,
+        ));
     }
     rows
 }
@@ -763,7 +769,9 @@ fn stock_entry_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<S
     let id = ctx.document_id;
     let mut rows = Vec::new();
     for (i, line) in items_of(payload).iter().enumerate() {
-        let Some(line) = line.as_object() else { continue };
+        let Some(line) = line.as_object() else {
+            continue;
+        };
         let Some(item) = as_non_empty(line.get("item")) else {
             continue;
         };
@@ -771,11 +779,25 @@ fn stock_entry_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<S
         let rate = as_num(line.get("valuation_rate"));
         if let Some(source) = as_non_empty(line.get("source_warehouse")) {
             // Leaves the source on submit.
-            rows.push(ctx.sle(format!("SLE-{id}-{i}-out"), trans, item.clone(), source, -qty, rate));
+            rows.push(ctx.sle(
+                format!("SLE-{id}-{i}-out"),
+                trans,
+                item.clone(),
+                source,
+                -qty,
+                rate,
+            ));
         }
         if let Some(target) = as_non_empty(line.get("target_warehouse")) {
             // Enters the target on submit.
-            rows.push(ctx.sle(format!("SLE-{id}-{i}-in"), trans, item.clone(), target, qty, rate));
+            rows.push(ctx.sle(
+                format!("SLE-{id}-{i}-in"),
+                trans,
+                item.clone(),
+                target,
+                qty,
+                rate,
+            ));
         }
     }
     rows
@@ -886,7 +908,10 @@ async fn load_items(
     ids.sort();
     ids.dedup();
     let items = store.items(company_id, &ids).await?;
-    Ok(items.into_iter().map(|item| (item.id.clone(), item)).collect())
+    Ok(items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect())
 }
 
 /// Costs the voucher's outgoing rows at the item's valuation method (issues
@@ -923,9 +948,7 @@ async fn cost_stock_movements(
             )
         };
         if qty_change < 0.0 {
-            let method = items
-                .get(&item)
-                .and_then(|i| i.valuation_method.as_deref());
+            let method = items.get(&item).and_then(|i| i.valuation_method.as_deref());
             let prior = ledgers
                 .prior_for(store, company_id, &item, &warehouse)
                 .await?;
@@ -1056,7 +1079,10 @@ fn stock_gl_legs(
     items: &HashMap<String, Item>,
     settings: &CompanySettings,
 ) -> Vec<GlEntry> {
-    let sale = matches!(ctx.doctype, "Sales Invoice" | "Delivery Note" | "POS Invoice");
+    let sale = matches!(
+        ctx.doctype,
+        "Sales Invoice" | "Delivery Note" | "POS Invoice"
+    );
     let purchase = matches!(ctx.doctype, "Purchase Invoice" | "Purchase Receipt");
     let mut legs = Vec::new();
     for sle in sles {
@@ -1071,7 +1097,11 @@ fn stock_gl_legs(
             &settings.default_inventory_account,
         );
         let counter = if sale {
-            resolve_account(item, |i| i.cogs_account.as_ref(), &settings.default_cogs_account)
+            resolve_account(
+                item,
+                |i| i.cogs_account.as_ref(),
+                &settings.default_cogs_account,
+            )
         } else if purchase {
             settings.default_grni_account.as_str()
         } else {
@@ -1087,8 +1117,22 @@ fn stock_gl_legs(
         } else {
             (counter, inventory)
         };
-        legs.push(ctx.gl(format!("{}-gl-d", sle.id), dr.to_string(), amount, 0.0, None, None));
-        legs.push(ctx.gl(format!("{}-gl-c", sle.id), cr.to_string(), 0.0, amount, None, None));
+        legs.push(ctx.gl(
+            format!("{}-gl-d", sle.id),
+            dr.to_string(),
+            amount,
+            0.0,
+            None,
+            None,
+        ));
+        legs.push(ctx.gl(
+            format!("{}-gl-c", sle.id),
+            cr.to_string(),
+            0.0,
+            amount,
+            None,
+            None,
+        ));
     }
     legs
 }

@@ -1,0 +1,53 @@
+{
+  "name": "Stock count adjustments: up posts Dr Inventory / Cr Stock Adjustment, down posts the reverse at moving-average cost",
+  "setup": {
+    "items": [
+      { "id": "ITEM-A", "item_type": "Stock", "valuation_method": "Moving Average" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Count found 5 units @ €4 more than booked: adjust up",
+      "submit": {
+        "doctype": "Stock Entry",
+        "document_id": "STE-1",
+        "payload": {
+          "stock_entry_type": "Stock Count",
+          "posting_date": "2026-07-01"
+        },
+        "items": [
+          { "item": "ITEM-A", "target_warehouse": "WH", "qty": 5, "valuation_rate": 4 }
+        ]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "STE-00001",
+        "bins": { "ITEM-A@WH": { "qty": 5, "value": 20, "rate": 4 } },
+        "account_balances": { "Stock": 20, "Stock Adjustment": -20 }
+      }
+    },
+    {
+      "comment": "Count is 2 short: adjust down — the issue is costed at the €4 moving average, not a supplied rate",
+      "submit": {
+        "doctype": "Stock Entry",
+        "document_id": "STE-2",
+        "payload": {
+          "stock_entry_type": "Stock Count",
+          "posting_date": "2026-07-02"
+        },
+        "items": [
+          { "item": "ITEM-A", "source_warehouse": "WH", "qty": 2 }
+        ]
+      },
+      "expect_status": 200,
+      "expect": {
+        "bins": { "ITEM-A@WH": { "qty": 3, "value": 12, "rate": 4 } },
+        "account_balances": { "Stock": 12, "Stock Adjustment": -12 }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "Stock": 12, "Stock Adjustment": -12, "COGS": 0 },
+    "bins": { "ITEM-A@WH": { "qty": 3, "value": 12 } }
+  }
+}

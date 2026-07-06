@@ -1,0 +1,79 @@
+{
+  "name": "Roles gate the command API per doctype: sales may not post purchases, stock may not post sales, cancel needs the same role",
+  "setup": {
+    "items": [{ "id": "SVC-1", "item_type": "Service" }]
+  },
+  "actions": [
+    {
+      "comment": "A sales user may not submit a Purchase Invoice",
+      "as_role": "sales",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-R1",
+        "payload": { "supplier": "SUPP-1", "posting_date": "2026-07-01" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 30 }]
+      },
+      "expect_status": 403,
+      "expect": { "gl_count": { "PINV-R1": 0 } }
+    },
+    {
+      "comment": "A stock user may not submit a Sales Invoice",
+      "as_role": "stock",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-R1",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-07-01" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 30 }]
+      },
+      "expect_status": 403
+    },
+    {
+      "comment": "An advisor may not submit a Payment Entry (accountant/owner/admin only)",
+      "as_role": "advisor",
+      "submit": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-R1",
+        "payload": { "payment_type": "Receive", "party": "CUST-1", "paid_amount": 10, "posting_date": "2026-07-01" },
+        "items": []
+      },
+      "expect_status": 403
+    },
+    {
+      "comment": "The sales user may submit a Sales Invoice",
+      "as_role": "sales",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-R2",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-07-01" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 30 }]
+      },
+      "expect_status": 200
+    },
+    {
+      "comment": "A purchasing user may submit a Purchase Invoice",
+      "as_role": "purchasing",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-R2",
+        "payload": { "supplier": "SUPP-1", "posting_date": "2026-07-01" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 30 }]
+      },
+      "expect_status": 200
+    },
+    {
+      "comment": "Cancellation is gated by the same per-doctype roles: sales may not cancel a purchase document",
+      "as_role": "sales",
+      "cancel": { "doctype": "Purchase Invoice", "document_id": "PINV-R2" },
+      "expect_status": 403
+    },
+    {
+      "comment": "The owner may cancel anything",
+      "as_role": "owner",
+      "cancel": { "doctype": "Purchase Invoice", "document_id": "PINV-R2" },
+      "expect_status": 200
+    }
+  ],
+  "expect": {
+    "gl_count": { "PINV-R1": 0, "SINV-R1": 0, "PAY-R1": 0, "SINV-R2": 2, "PINV-R2": 4 }
+  }
+}

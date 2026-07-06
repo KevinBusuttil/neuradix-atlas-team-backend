@@ -1,0 +1,67 @@
+{
+  "name": "Payment Entry references settle an invoice and maintain its outstanding; cancelling the payment restores it",
+  "setup": {
+    "items": [{ "id": "SVC-1", "item_type": "Service" }]
+  },
+  "actions": [
+    {
+      "comment": "Invoice €100 (service) → outstanding €100",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-P1",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-07-01" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 100 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "outstanding": { "Sales Invoice/SINV-P1": 100 },
+        "voucher_accounts": [
+          { "account": "Debtors", "voucher": "SINV-P1", "balance": 100 }
+        ]
+      }
+    },
+    {
+      "comment": "Receive €60 allocated against the invoice → settlement row, outstanding €40",
+      "submit": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-1",
+        "payload": {
+          "payment_type": "Receive",
+          "party": "CUST-1",
+          "paid_amount": 60,
+          "posting_date": "2026-07-02",
+          "references": [
+            {
+              "reference_doctype": "Sales Invoice",
+              "reference_name": "SINV-P1",
+              "allocated_amount": 60
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "PAY-00001",
+        "settlement_count": { "PAY-1": 1 },
+        "outstanding": { "Sales Invoice/SINV-P1": 40 },
+        "account_balances": { "Cash": 60, "Debtors": 40 }
+      }
+    },
+    {
+      "comment": "Cancelling the payment negates the settlement and restores the outstanding",
+      "cancel": { "doctype": "Payment Entry", "document_id": "PAY-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "settlement_count": { "PAY-1": 2 },
+        "outstanding": { "Sales Invoice/SINV-P1": 100 },
+        "account_balances": { "Cash": 0, "Debtors": 100 }
+      }
+    }
+  ],
+  "expect": {
+    "outstanding": { "Sales Invoice/SINV-P1": 100 },
+    "account_balances": { "Cash": 0, "Debtors": 100 }
+  }
+}

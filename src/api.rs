@@ -590,7 +590,9 @@ async fn put_settings(
     let current = state.store.company_settings(company_id).await?;
     let mut merged = serde_json::to_value(&current).map_err(|e| ApiError::Internal(e.into()))?;
     let (Some(target), Some(fields)) = (merged.as_object_mut(), patch.as_object()) else {
-        return Err(ApiError::BadRequest("settings body must be an object".into()));
+        return Err(ApiError::BadRequest(
+            "settings body must be an object".into(),
+        ));
     };
     for (key, value) in fields {
         if !target.contains_key(key) {
@@ -678,9 +680,8 @@ async fn submit_document(
 ) -> Result<Json<Value>, ApiError> {
     let role = require_membership(&state, &auth, company_id).await?;
     auth.require_device()?;
-    let allowed = allowed_roles(&req.doctype).ok_or_else(|| {
-        ApiError::BadRequest(format!("unsupported doctype {}", req.doctype))
-    })?;
+    let allowed = allowed_roles(&req.doctype)
+        .ok_or_else(|| ApiError::BadRequest(format!("unsupported doctype {}", req.doctype)))?;
     require_role(role, allowed)?;
     let outcome = engine_submit(
         state.store.as_ref(),
@@ -719,9 +720,8 @@ async fn cancel_document(
 ) -> Result<Json<Value>, ApiError> {
     let role = require_membership(&state, &auth, company_id).await?;
     auth.require_device()?;
-    let allowed = allowed_roles(&req.doctype).ok_or_else(|| {
-        ApiError::BadRequest(format!("unsupported doctype {}", req.doctype))
-    })?;
+    let allowed = allowed_roles(&req.doctype)
+        .ok_or_else(|| ApiError::BadRequest(format!("unsupported doctype {}", req.doctype)))?;
     require_role(role, allowed)?;
     let outcome = engine_cancel(
         state.store.as_ref(),

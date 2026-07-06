@@ -1,0 +1,49 @@
+{
+  "name": "Period lock: postings dated on or before books_lock_date are rejected; later dates post",
+  "setup": {
+    "settings": { "books_lock_date": "2026-06-30" },
+    "items": [{ "id": "SVC-1", "item_type": "Service" }]
+  },
+  "actions": [
+    {
+      "comment": "Posting into the locked period is rejected",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-L1",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-06-15" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 50 }]
+      },
+      "expect_status": 422,
+      "error_contains": "locked",
+      "expect": { "gl_count": { "SINV-L1": 0 } }
+    },
+    {
+      "comment": "The lock boundary itself is still locked",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-L2",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-06-30" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 50 }]
+      },
+      "expect_status": 422,
+      "error_contains": "locked"
+    },
+    {
+      "comment": "The first open day posts fine — and takes the FIRST official number (no number was burnt by the rejections)",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-L3",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-07-01" },
+        "items": [{ "item": "SVC-1", "qty": 1, "rate": 50 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "SINV-00001",
+        "gl_count": { "SINV-L3": 2 }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "Sales": -50, "Debtors": 50 }
+  }
+}

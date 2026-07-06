@@ -1,0 +1,187 @@
+{
+  "name": "Mandatory perpetual-inventory acceptance scenario (STOCK_COGS_IMPLEMENTATION_PLAN §5 fixture #1)",
+  "setup": {
+    "items": [
+      { "id": "ITEM-A", "item_type": "Stock", "valuation_method": "Moving Average" },
+      { "id": "SVC-1", "item_type": "Service" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "1-2. Buy 10 × Item A @ €5 via update_stock Purchase Invoice → qty 10, Bin €50, GL Inventory €50, GRNI nets to zero inside the document",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-01",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "PINV-00001",
+        "bins": { "ITEM-A@WH": { "qty": 10, "value": 50, "rate": 5 } },
+        "account_balances": { "Stock": 50, "GRNI": 0, "COGS": 0 },
+        "voucher_accounts": [
+          { "account": "Creditors", "voucher": "PINV-1", "balance": -50 }
+        ]
+      }
+    },
+    {
+      "comment": "3-5. Sell 3 @ €12 (VAT-exclusive) via update_stock Sales Invoice → qty 7, Bin €35 == GL Inventory, Revenue €36, COGS €15 (3 × €5 valuation, never the selling price), Gross Profit €21",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-02",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 3, "rate": 12 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "SINV-00001",
+        "bins": { "ITEM-A@WH": { "qty": 7, "value": 35 } },
+        "account_balances": { "Stock": 35, "COGS": 15 },
+        "voucher_accounts": [
+          { "account": "Sales", "voucher": "SINV-1", "balance": -36 },
+          { "account": "Debtors", "voucher": "SINV-1", "balance": 36 }
+        ],
+        "gross_profit": { "income": "Sales", "cogs": "COGS", "value": 21 }
+      }
+    },
+    {
+      "comment": "6. Service-item sale: revenue posts, but no SLE, no inventory movement, no COGS",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-2",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-02",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "SVC-1", "qty": 2, "rate": 100 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "sle_count": { "SINV-2": 0 },
+        "gl_count": { "SINV-2": 2 },
+        "bins": { "ITEM-A@WH": { "qty": 7, "value": 35 } },
+        "account_balances": { "Stock": 35, "COGS": 15 },
+        "voucher_accounts": [
+          { "account": "Debtors", "voucher": "SINV-2", "balance": 200 }
+        ]
+      }
+    },
+    {
+      "comment": "7. Cancel the sale: GL and stock fully reversed at the original €5 cost",
+      "cancel": { "doctype": "Sales Invoice", "document_id": "SINV-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "gl_count": { "SINV-1": 8 },
+        "bins": { "ITEM-A@WH": { "qty": 10, "value": 50 } },
+        "account_balances": { "Stock": 50, "COGS": 0 },
+        "voucher_accounts": [
+          { "account": "Sales", "voucher": "SINV-1", "balance": 0 },
+          { "account": "Debtors", "voucher": "SINV-1", "balance": 0 }
+        ]
+      }
+    },
+    {
+      "comment": "8a. Reinstate the sale (new official document — submitted history is immutable)",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-3",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-03",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 3, "rate": 12 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "bins": { "ITEM-A@WH": { "qty": 7, "value": 35 } },
+        "account_balances": { "Stock": 35, "COGS": 15 }
+      }
+    },
+    {
+      "comment": "8b. Sales return (credit note): inventory back at the €5 issue cost — never the €12 selling price — and COGS reversed",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-4",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-04",
+          "update_stock": 1,
+          "set_warehouse": "WH",
+          "is_return": 1,
+          "return_against": "SINV-3"
+        },
+        "items": [{ "item": "ITEM-A", "qty": -3, "rate": 12 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "bins": { "ITEM-A@WH": { "qty": 10, "value": 50, "rate": 5 } },
+        "account_balances": { "Stock": 50, "COGS": 0 },
+        "voucher_accounts": [
+          { "account": "Sales", "voucher": "SINV-4", "balance": 36 }
+        ]
+      }
+    },
+    {
+      "comment": "9a. Two-document purchase: Purchase Receipt posts Dr Inventory / Cr GRNI at receipt valuation",
+      "submit": {
+        "doctype": "Purchase Receipt",
+        "document_id": "PREC-1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-05",
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "PREC-00001",
+        "gl_count": { "PREC-1": 2 },
+        "bins": { "ITEM-A@WH": { "qty": 20, "value": 100 } },
+        "account_balances": { "Stock": 100, "GRNI": -50 }
+      }
+    },
+    {
+      "comment": "9b. The bill (no update_stock) posts Dr GRNI / Cr AP — GRNI clears, stock untouched, still nothing expensed to COGS",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-2",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-05"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "PINV-00002",
+        "gl_count": { "PINV-2": 2 },
+        "bins": { "ITEM-A@WH": { "qty": 20, "value": 100 } },
+        "account_balances": { "GRNI": 0, "Stock": 100, "COGS": 0 },
+        "voucher_accounts": [
+          { "account": "Creditors", "voucher": "PINV-2", "balance": -50 }
+        ]
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "Stock": 100, "GRNI": 0, "COGS": 0 },
+    "bins": { "ITEM-A@WH": { "qty": 20, "value": 100, "rate": 5 } }
+  }
+}

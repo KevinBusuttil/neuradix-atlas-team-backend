@@ -1,0 +1,86 @@
+{
+  "name": "Negative stock is rejected (default policy) and a failed submit posts nothing",
+  "setup": {
+    "items": [
+      { "id": "ITEM-A", "item_type": "Stock", "valuation_method": "Moving Average" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Selling 5 with nothing on hand is rejected atomically: no document, no GL, no SLE, no bin",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-N1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-01",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 5, "rate": 10 }]
+      },
+      "expect_status": 422,
+      "error_contains": "insufficient stock",
+      "expect": {
+        "gl_count": { "SINV-N1": 0 },
+        "sle_count": { "SINV-N1": 0 },
+        "account_balances": { "Stock": 0, "COGS": 0, "Sales": 0 }
+      }
+    },
+    {
+      "comment": "Buy 5 @ €4 so there is stock to sell",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-N1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-02",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 5, "rate": 4 }]
+      },
+      "expect_status": 200,
+      "expect": { "bins": { "ITEM-A@WH": { "qty": 5, "value": 20 } } }
+    },
+    {
+      "comment": "Selling exactly what is on hand is allowed (balance goes to zero, not negative)",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-N2",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-03",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 5, "rate": 9 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "bins": { "ITEM-A@WH": { "qty": 0, "value": 0 } },
+        "account_balances": { "Stock": 0, "COGS": 20 }
+      }
+    },
+    {
+      "comment": "One more unit is again rejected",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-N3",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-04",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 1, "rate": 9 }]
+      },
+      "expect_status": 422,
+      "error_contains": "insufficient stock"
+    }
+  ],
+  "expect": {
+    "account_balances": { "Stock": 0, "COGS": 20 },
+    "bins": { "ITEM-A@WH": { "qty": 0, "value": 0 } }
+  }
+}

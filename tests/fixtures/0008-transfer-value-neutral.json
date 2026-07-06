@@ -1,0 +1,57 @@
+{
+  "name": "Warehouse transfer moves quantity at cost between bins with zero P&L / GL effect",
+  "setup": {
+    "items": [
+      { "id": "ITEM-A", "item_type": "Stock", "valuation_method": "Moving Average" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Buy 10 @ €5 into WH1",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-T1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-01",
+          "update_stock": 1,
+          "set_warehouse": "WH1"
+        },
+        "items": [{ "item": "ITEM-A", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": { "bins": { "ITEM-A@WH1": { "qty": 10, "value": 50 } } }
+    },
+    {
+      "comment": "Transfer 4 to WH2: the incoming leg inherits the outgoing €5 cost; no GL is posted",
+      "submit": {
+        "doctype": "Stock Entry",
+        "document_id": "STE-T1",
+        "payload": {
+          "stock_entry_type": "Material Transfer",
+          "posting_date": "2026-07-02"
+        },
+        "items": [
+          { "item": "ITEM-A", "source_warehouse": "WH1", "target_warehouse": "WH2", "qty": 4 }
+        ]
+      },
+      "expect_status": 200,
+      "expect": {
+        "gl_count": { "STE-T1": 0 },
+        "sle_count": { "STE-T1": 2 },
+        "bins": {
+          "ITEM-A@WH1": { "qty": 6, "value": 30, "rate": 5 },
+          "ITEM-A@WH2": { "qty": 4, "value": 20, "rate": 5 }
+        },
+        "account_balances": { "Stock": 50, "Stock Adjustment": 0, "COGS": 0 }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "Stock": 50 },
+    "bins": {
+      "ITEM-A@WH1": { "qty": 6, "value": 30 },
+      "ITEM-A@WH2": { "qty": 4, "value": 20 }
+    }
+  }
+}
