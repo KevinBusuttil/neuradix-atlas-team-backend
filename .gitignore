@@ -1,0 +1,4 @@
+/target
+/backups
+*.sql.bak
+.env

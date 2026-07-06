@@ -1,0 +1,10 @@
+# Caddy reverse-proxy stub (decision doc §5: Caddy default, automatic TLS).
+# Replace the placeholder domain, then enable the `caddy` service in
+# docker-compose.yml. Caddy provisions and renews certificates automatically.
+
+atlas.example.com {
+	encode gzip
+
+	# Everything — API, sync, blobs, webhook intake — goes to the backend.
+	reverse_proxy backend:8080
+}

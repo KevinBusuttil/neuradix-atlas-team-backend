@@ -1,0 +1,534 @@
+//! HTTP surface of the Phase 2 coordination backend: identity bootstrap,
+//! invitations, devices, mutation-log sync, content-addressed blobs, webhook
+//! intake and the audit feed. Every state-changing endpoint writes an audit
+//! row (roadmap §6 criterion 8).
+
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+use chrono::{Duration, Utc};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::auth::{generate_token, hash_token, require_membership, require_role, AuthContext};
+use crate::error::ApiError;
+use crate::model::{
+    AuditEntry, Device, Invitation, MutationRecord, Role, WebhookEvent, WebhookKind,
+};
+use crate::AppState;
+
+const INVITATION_TTL_DAYS: i64 = 7;
+const DEFAULT_AUDIT_LIMIT: i64 = 100;
+const MAX_AUDIT_LIMIT: i64 = 500;
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/companies", post(create_company))
+        .route(
+            "/companies/{company_id}/invitations",
+            post(create_invitation),
+        )
+        .route("/invitations/{token}/accept", post(accept_invitation))
+        .route("/companies/{company_id}/devices", post(register_device))
+        .route("/companies/{company_id}/sync/push", post(sync_push))
+        .route("/companies/{company_id}/sync/pull", get(sync_pull))
+        .route("/companies/{company_id}/sync/ack", post(sync_ack))
+        .route(
+            "/companies/{company_id}/blobs/{sha256}",
+            put(put_blob).get(get_blob).head(head_blob),
+        )
+        .route("/webhooks/payments/{provider}", post(webhook_payment))
+        .route("/webhooks/channels/{connector}", post(webhook_channel))
+        .route("/companies/{company_id}/audit", get(read_audit))
+        .with_state(state)
+}
+
+async fn audit(
+    state: &AppState,
+    company_id: Uuid,
+    auth: Option<&AuthContext>,
+    action: &str,
+    detail: Value,
+) -> Result<(), ApiError> {
+    state
+        .store
+        .append_audit(AuditEntry {
+            id: Uuid::new_v4(),
+            company_id,
+            user_id: auth.map(|a| a.user_id()),
+            device_id: auth.and_then(|a| a.device_id()),
+            action: action.to_string(),
+            detail,
+            at: Utc::now(),
+        })
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+// ---------------------------------------------------------------------------
+// Companies + identity
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateCompanyRequest {
+    name: String,
+    #[serde(alias = "ownerEmail")]
+    owner_email: String,
+    #[serde(alias = "ownerName")]
+    owner_name: String,
+}
+
+/// Bootstrap: create company + owner user + owner membership, return a user
+/// token (roadmap §6 criterion 1).
+async fn create_company(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCompanyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if req.name.trim().is_empty() || req.owner_email.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "name and owner_email are required".into(),
+        ));
+    }
+    let company = state.store.create_company(req.name.trim()).await?;
+    let owner = state
+        .store
+        .upsert_user(req.owner_email.trim(), req.owner_name.trim())
+        .await?;
+    state
+        .store
+        .upsert_membership(owner.id, company.id, Role::Owner)
+        .await?;
+    let token = generate_token();
+    state
+        .store
+        .insert_user_token(&hash_token(&token), owner.id, company.id)
+        .await?;
+    state
+        .store
+        .append_audit(AuditEntry {
+            id: Uuid::new_v4(),
+            company_id: company.id,
+            user_id: Some(owner.id),
+            device_id: None,
+            action: "company.create".into(),
+            detail: json!({ "name": company.name, "ownerEmail": owner.email }),
+            at: Utc::now(),
+        })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "company": company,
+            "userId": owner.id,
+            "token": token,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateInvitationRequest {
+    email: String,
+    role: Role,
+}
+
+/// Owner/admin invites a user by email (roadmap §6 criterion 2).
+async fn create_invitation(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<CreateInvitationRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner, Role::Admin])?;
+    if req.email.trim().is_empty() {
+        return Err(ApiError::BadRequest("email is required".into()));
+    }
+    let token = generate_token();
+    let expires_at = Utc::now() + Duration::days(INVITATION_TTL_DAYS);
+    state
+        .store
+        .create_invitation(Invitation {
+            token: token.clone(),
+            company_id,
+            email: req.email.trim().to_string(),
+            role: req.role,
+            created_by: auth.user_id(),
+            accepted_by: None,
+            created_at: Utc::now(),
+            expires_at,
+        })
+        .await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "invitation.create",
+        json!({ "email": req.email.trim(), "role": req.role }),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "token": token, "expiresAt": expires_at })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AcceptInvitationRequest {
+    #[serde(alias = "displayName")]
+    display_name: String,
+}
+
+/// Invited user joins: creates the user (if new) + membership, returns a user
+/// token (roadmap §6 criterion 3, first half).
+async fn accept_invitation(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Json(req): Json<AcceptInvitationRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let invitation = state
+        .store
+        .invitation(&token)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if invitation.accepted_by.is_some() {
+        return Err(ApiError::Conflict("invitation already accepted".into()));
+    }
+    if invitation.expires_at < Utc::now() {
+        return Err(ApiError::Gone("invitation expired".into()));
+    }
+    let user = state
+        .store
+        .upsert_user(&invitation.email, req.display_name.trim())
+        .await?;
+    state
+        .store
+        .upsert_membership(user.id, invitation.company_id, invitation.role)
+        .await?;
+    state
+        .store
+        .mark_invitation_accepted(&token, user.id)
+        .await?;
+    let user_token = generate_token();
+    state
+        .store
+        .insert_user_token(&hash_token(&user_token), user.id, invitation.company_id)
+        .await?;
+    state
+        .store
+        .append_audit(AuditEntry {
+            id: Uuid::new_v4(),
+            company_id: invitation.company_id,
+            user_id: Some(user.id),
+            device_id: None,
+            action: "invitation.accept".into(),
+            detail: json!({ "email": invitation.email, "role": invitation.role }),
+            at: Utc::now(),
+        })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "userId": user.id,
+            "companyId": invitation.company_id,
+            "role": invitation.role,
+            "token": user_token,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct RegisterDeviceRequest {
+    name: String,
+}
+
+/// Register a device for the authenticated member; returns the device token
+/// (roadmap §6 criterion 3, second half).
+async fn register_device(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<RegisterDeviceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    if req.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("name is required".into()));
+    }
+    let device_token = generate_token();
+    let device = Device {
+        id: Uuid::new_v4(),
+        company_id,
+        user_id: auth.user_id(),
+        name: req.name.trim().to_string(),
+        token_hash: hash_token(&device_token),
+        created_at: Utc::now(),
+        revoked_at: None,
+    };
+    state.store.create_device(device.clone()).await?;
+    state
+        .store
+        .append_audit(AuditEntry {
+            id: Uuid::new_v4(),
+            company_id,
+            user_id: Some(auth.user_id()),
+            device_id: Some(device.id),
+            action: "device.register".into(),
+            detail: json!({ "name": device.name }),
+            at: Utc::now(),
+        })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "deviceId": device.id, "deviceToken": device_token })),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Sync (mutation log — replication plane, decision doc §7)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PushRequest {
+    mutations: Vec<MutationRecord>,
+}
+
+/// Device pushes a batch of `MutationRecord`s. The server assigns
+/// monotonically increasing per-company sync versions; the call is idempotent
+/// on mutation id (roadmap §6 criterion 4).
+async fn sync_push(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<PushRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    let count = req.mutations.len();
+    let assigned = state
+        .store
+        .push_mutations(company_id, req.mutations)
+        .await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "sync.push",
+        json!({ "count": count }),
+    )
+    .await?;
+    let versions: serde_json::Map<String, Value> = assigned
+        .into_iter()
+        .map(|(id, version)| (id, Value::from(version)))
+        .collect();
+    Ok(Json(json!({ "versions": versions })))
+}
+
+#[derive(Deserialize)]
+struct PullQuery {
+    after: Option<i64>,
+}
+
+/// Incremental pull: all mutations with sync version > `after` (default 0),
+/// ordered by version, `syncVersion` set on each record.
+async fn sync_pull(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Query(query): Query<PullQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    let mutations = state
+        .store
+        .pull_mutations(company_id, query.after.unwrap_or(0))
+        .await?;
+    Ok(Json(json!({ "mutations": mutations })))
+}
+
+#[derive(Deserialize)]
+struct AckRequest {
+    ids: Vec<String>,
+}
+
+async fn sync_ack(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<AckRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    let acknowledged = state.store.ack_mutations(company_id, &req.ids).await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "sync.ack",
+        json!({ "count": acknowledged }),
+    )
+    .await?;
+    Ok(Json(json!({ "acknowledged": acknowledged })))
+}
+
+// ---------------------------------------------------------------------------
+// Blobs (content-addressed attachment bytes, ADR-048 contract)
+// ---------------------------------------------------------------------------
+
+async fn put_blob(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((company_id, sha256)): Path<(Uuid, String)>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    let sha256 = sha256.to_lowercase();
+    let actual = hex::encode(Sha256::digest(&body));
+    if actual != sha256 {
+        return Err(ApiError::Unprocessable(format!(
+            "body sha256 {actual} does not match path {sha256}"
+        )));
+    }
+    state
+        .store
+        .put_blob(company_id, &sha256, body.to_vec())
+        .await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "blob.put",
+        json!({ "sha256": sha256, "size": body.len() }),
+    )
+    .await?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn get_blob(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((company_id, sha256)): Path<(Uuid, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    let bytes = state
+        .store
+        .get_blob(company_id, &sha256.to_lowercase())
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/octet-stream")],
+        bytes,
+    ))
+}
+
+async fn head_blob(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((company_id, sha256)): Path<(Uuid, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    if state
+        .store
+        .has_blob(company_id, &sha256.to_lowercase())
+        .await?
+    {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NOT_FOUND)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook intake (roadmap §6 criteria 12–13 — log only; signature
+// verification and processing are Phase 4)
+// ---------------------------------------------------------------------------
+
+fn headers_to_json(headers: &HeaderMap) -> Value {
+    let map: serde_json::Map<String, Value> = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                Value::from(String::from_utf8_lossy(value.as_bytes()).into_owned()),
+            )
+        })
+        .collect();
+    Value::Object(map)
+}
+
+async fn log_webhook(
+    state: &AppState,
+    kind: WebhookKind,
+    provider: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .store
+        .insert_webhook_event(WebhookEvent {
+            id: Uuid::new_v4(),
+            kind,
+            provider,
+            headers: headers_to_json(&headers),
+            body: body.to_vec(),
+            received_at: Utc::now(),
+        })
+        .await?;
+    Ok(Json(json!({ "logged": true })))
+}
+
+async fn webhook_payment(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    log_webhook(&state, WebhookKind::Payment, provider, headers, body).await
+}
+
+async fn webhook_channel(
+    State(state): State<AppState>,
+    Path(connector): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    log_webhook(&state, WebhookKind::Channel, connector, headers, body).await
+}
+
+// ---------------------------------------------------------------------------
+// Audit feed (roadmap §6 criteria 8–9)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<i64>,
+}
+
+async fn read_audit(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner, Role::Admin, Role::Accountant])?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_AUDIT_LIMIT)
+        .clamp(1, MAX_AUDIT_LIMIT);
+    let entries = state.store.recent_audit(company_id, limit).await?;
+    Ok(Json(json!({ "entries": entries })))
+}
