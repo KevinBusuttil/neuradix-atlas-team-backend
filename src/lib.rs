@@ -1,11 +1,13 @@
-//! Atlas Team Rust Backend — Phase 2 coordination MVP.
+//! Atlas Team Rust Backend — Phase 2 coordination plane + Phase 3 posting
+//! authority.
 //!
 //! Local-first Flutter clients keep drafting locally; this service is the
-//! always-on coordination authority: identity (companies, users, memberships,
-//! devices), the per-company mutation-log sync the client's `CloudAdapter`
-//! contract expects, content-addressed blobs, webhook intake, and the audit
-//! log. The posting engine (official documents, numbering, GL) is Phase 3 and
-//! deliberately absent.
+//! always-on authority: identity (companies, users, memberships, devices),
+//! the per-company mutation-log sync the client's `CloudAdapter` contract
+//! expects, content-addressed blobs, webhook intake, the audit log, and —
+//! since Phase 3 — official document postings (gap-free numbering, GL +
+//! stock ledger + COGS, reversals, settlements) via the command API in
+//! [`posting`].
 
 pub mod api;
 pub mod auth;

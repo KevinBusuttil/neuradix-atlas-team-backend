@@ -1,23 +1,27 @@
 # Atlas Team Rust Backend
 
-The **Phase 2 coordination MVP** of the Neuradix Atlas Team backend: the always-on
-counterpart to the local-first Flutter client. It provides identity (companies,
-users, memberships, devices), the per-company **mutation-log sync** the client's
-`CloudAdapter` contract expects, content-addressed **blob** storage for attachment
-bytes, raw **webhook intake**, and a server-side **audit log**.
+The Neuradix Atlas Team backend: the always-on counterpart to the local-first
+Flutter client. **Phase 2** provides identity (companies, users, memberships,
+devices), the per-company **mutation-log sync** the client's `CloudAdapter`
+contract expects, content-addressed **blob** storage for attachment bytes, raw
+**webhook intake**, and a server-side **audit log**. **Phase 3** adds the
+**posting authority**: backend-confirmed official document submission with
+gap-free numbering, perpetual-inventory stock + COGS GL posting, reversals,
+settlements and server-side immutability (see the Phase 3 section below).
 
 Design references (in the `mercantis.hub.flutter` repo):
 
 - `docs/ATLAS_SOLO_TEAM_BACKEND_DECISION.md` — why this backend exists, the stack
   (§5), the authority model (§6), the sync model (§7), identity/audit (§8).
-- `docs/ROADMAP_V2_SOLO_TEAM.md` — §6 lists the acceptance criteria this MVP
-  implements (the [P2] items; see the table below).
+- `docs/ROADMAP_V2_SOLO_TEAM.md` — §6 lists the acceptance criteria: the [P2]
+  coordination items and the [P3] posting-authority items, both covered by the
+  tables below.
+- `docs/STOCK_COGS_IMPLEMENTATION_PLAN.md` — §2 target accounting behaviour,
+  §4 Track B (this engine), §5 the shared fixture suite.
 
-**Not in this scaffold:** the posting engine. Official document submission,
-gap-free numbering, immutability of submitted documents and the stock/COGS
-fixture (roadmap §6 criteria 5–7 and 11, all tagged [P3]) are **Phase 3** —
-this service deliberately contains no posting authority yet. Webhook signature
-verification and processing are Phase 4; intake here is log-only.
+**Not in this service yet:** webhook signature verification and processing
+(Phase 4; intake here is log-only), POS session close, and the client
+preview-vs-official flow (client-side work).
 
 ## Architecture notes
 
@@ -98,8 +102,16 @@ missing or unknown).
 | POST | `/webhooks/payments/{provider}` | none (Phase 4 verifies signatures) | Logs raw headers+body to `webhook_events` → `{"logged": true}` |
 | POST | `/webhooks/channels/{connector}` | none (Phase 4 verifies signatures) | Same, `kind = channel` |
 | GET | `/companies/{id}/audit?limit=n` | **owner, admin or accountant** | Recent audit rows (newest first) |
+| GET / PUT | `/companies/{id}/settings` | member / **owner, admin or accountant** | Company posting settings (merge-patch): `allow_negative_stock`, `books_lock_date`, default posting accounts |
+| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, *_account overrides}` |
+| POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, bins, settlements}` |
+| POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 
 Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
+Command-role gates: Sales Invoice → sales/owner/admin · Purchase
+Invoice/Receipt → purchasing/owner/admin · Stock Entry → stock/owner/admin ·
+Payment Entry → accountant/owner/admin (cancel requires the same role as
+submit).
 
 ## ROADMAP_V2 §6 — [P2] acceptance criteria coverage
 
@@ -115,18 +127,80 @@ Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
 | 12 | Payment link events can be received and logged | `POST /webhooks/payments/{provider}` | `webhooks_are_logged_without_auth` |
 | 13 | Online store webhook events can be received and logged | `POST /webhooks/channels/{connector}` | `webhooks_are_logged_without_auth` |
 
-**Posting authority — criteria 5, 6, 7 and 11 ([P3]) — is Phase 3 and is not
-part of this scaffold.** Nothing here allocates official numbers, submits
-documents or posts GL/stock entries.
+## Phase 3 — backend-authoritative postings
+
+Track B of `docs/STOCK_COGS_IMPLEMENTATION_PLAN.md`: the Rust engine is the
+posting authority for Team companies, semantically ported from the Dart Solo
+engine (`lib/ledger/ledger_derivation.dart`, `ledger_derivation_service.dart`,
+`stock_costing.dart`, `stock_balance.dart`) — same deterministic row ids
+(`GL-{id}-debit`, `SLE-{id}-{i}`, `{sleId}-gl-d`/`-gl-c`, `-reversal` suffix),
+same moving-average/FIFO issue costing (FIFO shortfall falls back to moving
+average), same perpetual-inventory GL mapping (sales issue → Dr COGS / Cr
+Inventory at valuation cost; purchase receipt → Dr Inventory / Cr GRNI with the
+Purchase Invoice's stock value split off the expense leg onto GRNI; stock-entry
+movements → the stock-adjustment account; transfers value-neutral, no GL), same
+return semantics (goods re-enter at the original voucher's issue cost).
+
+Each command is **one atomic store transaction** (`Store::posting_commit`):
+validate (per-doctype role, period lock via `books_lock_date`, JE-style balance
+guard on the generated GL, negative-stock rejection unless
+`allow_negative_stock`) → allocate the gap-free official number → insert
+document + GL + SLE + settlements + posting batch → recompute the touched bins
+→ write the audit row. Costing reads are protected by optimistic stock-ledger
+expectations: if a concurrent commit moved a touched (item, warehouse) pair,
+the commit fails `Stale` and the command recomputes. `idempotency_key` replays
+return the originally committed response without posting again. Cancellation
+mirrors the stored rows (reusing stored SLE rates — issues are never re-costed)
+into a linked `PB-{id}-reversal` batch and sets docstatus 2. Official (posted)
+documents are immutable on the sync plane: `sync/push` rejects any mutation
+targeting them with 409.
+
+### ROADMAP_V2 §6 — [P3] acceptance criteria coverage
+
+| # | Criterion ([P3]) | Endpoint(s) | Test |
+|---|---|---|---|
+| 5 | Official document submission is backend-confirmed | `POST …/commands/submit-document`, `POST …/commands/cancel-document` | `tests/fixtures.rs` (all fixtures), `tests/posting.rs::commands_require_device_tokens_and_write_audit_rows` |
+| 6 | Official numbers allocated safely (no duplicates/races; gap-free) | number allocation inside `posting_commit`; rejected submits burn no number | `tests/posting.rs::gap_free_numbering_under_20_concurrent_submits`, `…::idempotency_key_replay_returns_same_result_without_double_posting`, fixture `0006` |
+| 7 | Submitted documents cannot be destructively edited | `sync/push` 409 guard; cancel-only state machine | `tests/posting.rs::submitted_documents_are_immutable_via_sync_push`, `…::cancel_requires_a_submitted_document_and_cannot_repeat` |
+| 11 | Mandatory stock/COGS posting test passes on Rust | full command surface | `tests/fixtures.rs::fixture_0001_mandatory_perpetual_inventory` |
+
+Phase 3 also extends criterion 8: every submit/cancel writes a
+`command.submit-document` / `command.cancel-document` audit row (user + device
+attributed) inside the same transaction as the posting.
+
+### Shared fixture suite — one truth, two engines
+
+`tests/fixtures/*.json` is the **language-neutral Dart ↔ Rust accounting
+contract** (plan §5): each file is `{setup, actions, expect}`, driven here over
+the command API + `MemStore` by `tests/fixtures.rs`. Fixture
+`0001-mandatory-perpetual-inventory.json` is the mandatory acceptance scenario
+verbatim; the Dart side runs the same scenario today as
+`mercantis.hub.flutter/test/stock_cogs_acceptance_test.dart` (JSON-driving the
+Dart engine from these files is future work). The rest: `0002` FIFO costing
+incl. shortfall fallback, `0003` negative-stock rejection, `0004` adjustment
+up/down, `0005` payment settlement + outstanding, `0006` period lock, `0007`
+role rejection, `0008` value-neutral transfer.
+
+Deliberate Phase 3 MVP bounds (deviations from the full Dart engine, all
+flagged in the plan as later refinements): no UOM conversion at posting (line
+qty is taken in stock units), no multi-currency base-amount stamping
+(company-currency postings only), no customer/supplier/tax subledger rows
+(GL + settlements carry party fields; the client derives its subledgers), no
+receipt↔invoice line-linkage variance posting (the two-document flow clears
+GRNI at matching values), and Delivery Note / POS Invoice doctypes arrive with
+POS session close in Phase 6.
 
 ## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 15 integration tests over MemStore; no DB required
+cargo test          # 34 tests over MemStore (unit + API + fixtures + posting); no DB required
 ```
 
-Schema lives in `migrations/0001_init.sql` (applied by `PgStore::connect` via
-embedded SQLx migrations; includes the `mutations(company_id, sync_version)`
-index the pull path relies on).
+Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
+migrations): `0001_init.sql` for the coordination plane (includes the
+`mutations(company_id, sync_version)` index the pull path relies on) and
+`0002_postings.sql` for the posting authority (documents, numbering_series,
+gl_entries, stock_ledger_entries, bins, settlements, posting_batches, items,
+company_settings, idempotency_keys).
