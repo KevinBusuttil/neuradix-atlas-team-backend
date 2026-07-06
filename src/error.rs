@@ -56,7 +56,23 @@ impl From<StoreError> for ApiError {
     fn from(err: StoreError) -> Self {
         match err {
             StoreError::Conflict(msg) => ApiError::Conflict(msg),
+            // Stale is retried inside the posting engine; if one leaks the
+            // command genuinely lost a concurrency race — 409 lets the
+            // client retry.
+            StoreError::Stale(msg) => ApiError::Conflict(msg),
             other => ApiError::Internal(other.into()),
+        }
+    }
+}
+
+impl From<crate::posting::engine::PostingError> for ApiError {
+    fn from(err: crate::posting::engine::PostingError) -> Self {
+        use crate::posting::engine::PostingError;
+        match err {
+            PostingError::Validation(msg) => ApiError::Unprocessable(msg),
+            PostingError::NotFound => ApiError::NotFound,
+            PostingError::Conflict(msg) => ApiError::Conflict(msg),
+            PostingError::Store(err) => err.into(),
         }
     }
 }

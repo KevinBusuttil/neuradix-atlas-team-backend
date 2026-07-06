@@ -1,0 +1,1264 @@
+//! Command orchestration: builds one atomic [`PostingCommit`] per official
+//! action (submit / cancel), semantically ported from the Dart
+//! `LedgerDerivation` + `LedgerDerivationService` pair so both engines pass
+//! the shared fixture suite.
+//!
+//! Submit derives GL + stock ledger rows forward, costs issues from the
+//! authoritative SLE history (moving average / FIFO, `stock.rs`), posts the
+//! perpetual-inventory GL counterpart of every costed movement, splits a
+//! Purchase Invoice's stock value off the expense leg onto GRNI, validates
+//! (balance, negative stock, period lock) and recomputes the touched bins.
+//! Cancel mirrors the stored rows exactly — negated quantities at the
+//! original stored rates (never re-costed), swapped GL columns, `-reversal`
+//! ids — so a cancellation backs out precisely what was posted.
+
+use std::collections::{BTreeMap, HashMap};
+
+use chrono::Utc;
+use serde_json::{json, Map, Value};
+use uuid::Uuid;
+
+use crate::model::AuditEntry;
+use crate::posting::model::{
+    series_key, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PostingBatch, PostingCommit,
+    Settlement, StockLedgerEntry, POSTED_DOCTYPES,
+};
+use crate::posting::stock::{compute_balance, issue_rate, LedgerRow};
+use crate::posting::values::{
+    as_non_empty, as_num, is_stock_item_type, is_true, outstanding_amount, REVERSAL_SUFFIX,
+};
+use crate::store::{Store, StoreError};
+
+/// Amounts below this are treated as zero (mirrors the Dart 1e-7 epsilon).
+const EPS: f64 = 1e-7;
+/// JE-style balance guard tolerance on the generated GL.
+const BALANCE_TOLERANCE: f64 = 0.005;
+/// Stale-state retries before giving up under pathological contention.
+const MAX_RETRIES: usize = 16;
+
+#[derive(Debug)]
+pub enum PostingError {
+    /// 422 — the command is well-formed but violates an accounting rule.
+    Validation(String),
+    /// 404 — the referenced document does not exist.
+    NotFound,
+    /// 409 — duplicate id / wrong docstatus / exhausted retries.
+    Conflict(String),
+    Store(StoreError),
+}
+
+impl From<StoreError> for PostingError {
+    fn from(err: StoreError) -> Self {
+        PostingError::Store(err)
+    }
+}
+
+/// Who is acting, for the audit row written inside the commit.
+#[derive(Debug, Clone, Copy)]
+pub struct Actor {
+    pub user_id: Uuid,
+    pub device_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmitCommand {
+    pub doctype: String,
+    /// Client-supplied id (deterministic fixtures / offline drafts) or
+    /// server-generated when absent.
+    pub document_id: Option<String>,
+    pub payload: Map<String, Value>,
+    pub items: Vec<Value>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CancelCommand {
+    pub doctype: String,
+    pub document_id: String,
+    pub idempotency_key: Option<String>,
+}
+
+/// Roles allowed to submit/cancel each official doctype (server-enforced).
+pub fn allowed_roles(doctype: &str) -> Option<&'static [crate::model::Role]> {
+    use crate::model::Role::{Accountant, Admin, Owner, Purchasing, Sales, Stock};
+    Some(match doctype {
+        "Sales Invoice" => &[Owner, Admin, Sales],
+        "Purchase Invoice" | "Purchase Receipt" => &[Owner, Admin, Purchasing],
+        "Stock Entry" => &[Owner, Admin, Stock],
+        "Payment Entry" => &[Owner, Admin, Accountant],
+        _ => return None,
+    })
+}
+
+fn today() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points (retry loop around build + atomic commit)
+// ---------------------------------------------------------------------------
+
+pub async fn submit_document(
+    store: &dyn Store,
+    company_id: Uuid,
+    cmd: SubmitCommand,
+    actor: Actor,
+) -> Result<CommitOutcome, PostingError> {
+    if !POSTED_DOCTYPES.contains(&cmd.doctype.as_str()) {
+        return Err(PostingError::Validation(format!(
+            "unsupported doctype {}",
+            cmd.doctype
+        )));
+    }
+    if let Some(outcome) = replay(store, company_id, cmd.idempotency_key.as_deref()).await? {
+        return Ok(outcome);
+    }
+    // Fixed across retries so a stale-state recompute posts the same document.
+    let document_id = cmd
+        .document_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    for _ in 0..MAX_RETRIES {
+        let commit = build_submit(store, company_id, &cmd, &document_id, actor).await?;
+        match store.posting_commit(commit).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(StoreError::Stale(_)) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(PostingError::Conflict(
+        "posting contention: stock ledger kept moving; retry".into(),
+    ))
+}
+
+pub async fn cancel_document(
+    store: &dyn Store,
+    company_id: Uuid,
+    cmd: CancelCommand,
+    actor: Actor,
+) -> Result<CommitOutcome, PostingError> {
+    if let Some(outcome) = replay(store, company_id, cmd.idempotency_key.as_deref()).await? {
+        return Ok(outcome);
+    }
+    for _ in 0..MAX_RETRIES {
+        let commit = build_cancel(store, company_id, &cmd, actor).await?;
+        match store.posting_commit(commit).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(StoreError::Stale(_)) => continue,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(PostingError::Conflict(
+        "posting contention: stock ledger kept moving; retry".into(),
+    ))
+}
+
+async fn replay(
+    store: &dyn Store,
+    company_id: Uuid,
+    key: Option<&str>,
+) -> Result<Option<CommitOutcome>, PostingError> {
+    match key {
+        Some(key) => Ok(store
+            .idempotent_response(company_id, key)
+            .await?
+            .map(|response| CommitOutcome {
+                response,
+                replayed: true,
+            })),
+        None => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Submit
+// ---------------------------------------------------------------------------
+
+async fn build_submit(
+    store: &dyn Store,
+    company_id: Uuid,
+    cmd: &SubmitCommand,
+    document_id: &str,
+    actor: Actor,
+) -> Result<PostingCommit, PostingError> {
+    let settings = store.company_settings(company_id).await?;
+    let doctype = cmd.doctype.as_str();
+
+    let mut payload = cmd.payload.clone();
+    payload.insert("items".into(), Value::Array(cmd.items.clone()));
+    let posting_date = as_non_empty(payload.get("posting_date")).unwrap_or_else(today);
+    payload.insert("posting_date".into(), json!(posting_date));
+    check_period_lock(&settings, &posting_date)?;
+
+    if store
+        .posted_document(company_id, doctype, document_id)
+        .await?
+        .is_some()
+    {
+        return Err(PostingError::Conflict(format!(
+            "document {doctype} {document_id} was already submitted"
+        )));
+    }
+
+    resolve_account_fallbacks(doctype, &mut payload, &settings);
+    if matches!(doctype, "Sales Invoice" | "Purchase Invoice") {
+        ensure_invoice_totals(&mut payload);
+    }
+
+    let batch_id = format!("PB-{document_id}");
+    let batch = PostingBatch {
+        id: batch_id.clone(),
+        company_id,
+        document_id: document_id.to_string(),
+        doctype: doctype.to_string(),
+        kind: "submit".into(),
+        reversal_of: None,
+        created_at: Utc::now(),
+    };
+
+    // Forward derivation: monetary GL legs + raw (uncosted) SLE rows.
+    let ctx = RowContext {
+        company_id,
+        document_id,
+        doctype,
+        posting_date: &posting_date,
+        batch_id: &batch_id,
+    };
+    let mut gl = derive_monetary_gl(&ctx, &payload);
+    let mut sles = derive_stock_rows(&ctx, &payload);
+
+    // Item registry: drop service-item movements before costing (they never
+    // touch stock), then cost issues from the authoritative ledger.
+    let items = load_items(store, company_id, &sles, &payload).await?;
+    sles.retain(|sle| {
+        is_stock_item_type(items.get(&sle.item).map(|item| item.item_type.as_str()))
+    });
+    let mut ledgers = Ledgers::default();
+    cost_stock_movements(store, company_id, &mut sles, &items, &payload, &mut ledgers).await?;
+
+    // Perpetual inventory: every costed movement posts its GL counterpart,
+    // and a Purchase Invoice's stock value moves from the expense leg to GRNI.
+    gl.extend(stock_gl_legs(&ctx, &sles, &items, &settings));
+    if doctype == "Purchase Invoice" {
+        split_grni_from_expense(&ctx, &mut gl, &payload, &items, &settings);
+    }
+
+    check_balanced(&gl)?;
+    check_negative_stock(&settings, &ledgers)?;
+
+    // Settlements + invoice outstanding maintenance.
+    let mut settlements = Vec::new();
+    let mut outstanding_updates = Vec::new();
+    if doctype == "Payment Entry" {
+        settlements = derive_settlements(&ctx, &payload);
+        outstanding_updates =
+            payment_outstanding_updates(store, company_id, &settlements).await?;
+    }
+
+    let bins = recompute_bins(company_id, &ledgers);
+    let document = crate::posting::model::PostedDocument {
+        id: document_id.to_string(),
+        company_id,
+        doctype: doctype.to_string(),
+        payload: Value::Object(payload),
+        docstatus: 1,
+        official_number: None, // allocated inside the commit
+        created_at: Utc::now(),
+    };
+    let response = json!({
+        "document_id": document_id,
+        "number": Value::Null, // stamped by the store after allocation
+        "docstatus": 1,
+        "gl_entries": &gl,
+        "stock_ledger_entries": &sles,
+        "bins": &bins,
+        "settlements": &settlements,
+    });
+
+    Ok(PostingCommit {
+        company_id,
+        idempotency_key: cmd.idempotency_key.clone(),
+        batch,
+        document,
+        document_is_new: true,
+        series_key: series_key(doctype).map(str::to_string),
+        gl_entries: gl,
+        stock_ledger_entries: sles,
+        settlements,
+        bins,
+        outstanding_updates,
+        sle_expectations: ledgers.expectations(),
+        audit: audit_row(
+            company_id,
+            actor,
+            "command.submit-document",
+            json!({ "doctype": doctype, "documentId": document_id }),
+        ),
+        response,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Cancel — mirror the stored rows exactly (never re-cost)
+// ---------------------------------------------------------------------------
+
+async fn build_cancel(
+    store: &dyn Store,
+    company_id: Uuid,
+    cmd: &CancelCommand,
+    actor: Actor,
+) -> Result<PostingCommit, PostingError> {
+    let settings = store.company_settings(company_id).await?;
+    let mut document = store
+        .posted_document(company_id, &cmd.doctype, &cmd.document_id)
+        .await?
+        .ok_or(PostingError::NotFound)?;
+    if document.docstatus != 1 {
+        return Err(PostingError::Conflict(format!(
+            "document {} {} is not submitted (docstatus {})",
+            cmd.doctype, cmd.document_id, document.docstatus
+        )));
+    }
+    let posting_date =
+        as_non_empty(document.payload.get("posting_date")).unwrap_or_else(today);
+    check_period_lock(&settings, &posting_date)?;
+
+    let document_id = cmd.document_id.as_str();
+    let batch_id = format!("PB-{document_id}{REVERSAL_SUFFIX}");
+    let batch = PostingBatch {
+        id: batch_id.clone(),
+        company_id,
+        document_id: document_id.to_string(),
+        doctype: cmd.doctype.clone(),
+        kind: "cancel".into(),
+        reversal_of: Some(format!("PB-{document_id}")),
+        created_at: Utc::now(),
+    };
+
+    // Reversal legs: negate the stored originals with `-reversal` ids. The
+    // stored SLE rates are reused verbatim so issues are reversed at their
+    // original cost.
+    let gl: Vec<GlEntry> = store
+        .gl_for_voucher(company_id, document_id)
+        .await?
+        .into_iter()
+        .filter(|entry| !entry.is_reversal)
+        .map(|entry| GlEntry {
+            id: format!("{}{REVERSAL_SUFFIX}", entry.id),
+            debit: entry.credit,
+            credit: entry.debit,
+            is_reversal: true,
+            batch_id: batch_id.clone(),
+            ..entry
+        })
+        .collect();
+    let sles: Vec<StockLedgerEntry> = store
+        .sles_for_voucher(company_id, document_id)
+        .await?
+        .into_iter()
+        .filter(|sle| !sle.is_reversal)
+        .map(|sle| StockLedgerEntry {
+            id: format!("{}{REVERSAL_SUFFIX}", sle.id),
+            qty_change: -sle.qty_change,
+            is_reversal: true,
+            batch_id: batch_id.clone(),
+            seq: 0,
+            ..sle
+        })
+        .collect();
+    let settlements: Vec<Settlement> = store
+        .settlements_for_payment(company_id, document_id)
+        .await?
+        .into_iter()
+        .filter(|s| !s.is_reversal)
+        .map(|s| Settlement {
+            id: format!("{}{REVERSAL_SUFFIX}", s.id),
+            allocated_amount: -s.allocated_amount,
+            is_reversal: true,
+            batch_id: batch_id.clone(),
+            ..s
+        })
+        .collect();
+
+    // Replay the reversal rows onto the current ledger for the negative-stock
+    // guard and the bin recompute (e.g. cancelling a receipt whose goods were
+    // already sold would drive stock negative).
+    let mut ledgers = Ledgers::default();
+    for sle in &sles {
+        let prior = ledgers
+            .prior_for(store, company_id, &sle.item, &sle.warehouse)
+            .await?;
+        prior.push(LedgerRow {
+            qty_change: sle.qty_change,
+            valuation_rate: sle.valuation_rate,
+        });
+    }
+    check_negative_stock(&settings, &ledgers)?;
+    let bins = recompute_bins(company_id, &ledgers);
+
+    let outstanding_updates = if cmd.doctype == "Payment Entry" {
+        payment_outstanding_updates(store, company_id, &settlements).await?
+    } else {
+        Vec::new()
+    };
+
+    document.docstatus = 2;
+    let response = json!({
+        "document_id": document_id,
+        "number": &document.official_number,
+        "docstatus": 2,
+        "gl_entries": &gl,
+        "stock_ledger_entries": &sles,
+        "bins": &bins,
+        "settlements": &settlements,
+    });
+
+    Ok(PostingCommit {
+        company_id,
+        idempotency_key: cmd.idempotency_key.clone(),
+        batch,
+        document,
+        document_is_new: false,
+        series_key: None, // cancellation never consumes a number
+        gl_entries: gl,
+        stock_ledger_entries: sles,
+        settlements,
+        bins,
+        outstanding_updates,
+        sle_expectations: ledgers.expectations(),
+        audit: audit_row(
+            company_id,
+            actor,
+            "command.cancel-document",
+            json!({ "doctype": cmd.doctype, "documentId": document_id }),
+        ),
+        response,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Forward derivation (port of the Dart `LedgerDerivation`, submit side)
+// ---------------------------------------------------------------------------
+
+struct RowContext<'a> {
+    company_id: Uuid,
+    document_id: &'a str,
+    doctype: &'a str,
+    posting_date: &'a str,
+    batch_id: &'a str,
+}
+
+impl RowContext<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn gl(
+        &self,
+        id: String,
+        account: String,
+        debit: f64,
+        credit: f64,
+        party_type: Option<&str>,
+        party: Option<String>,
+    ) -> GlEntry {
+        GlEntry {
+            id,
+            company_id: self.company_id,
+            account,
+            debit,
+            credit,
+            party_type: party_type.map(str::to_string),
+            party,
+            voucher_type: self.doctype.to_string(),
+            voucher_no: self.document_id.to_string(),
+            posting_date: self.posting_date.to_string(),
+            is_reversal: false,
+            batch_id: self.batch_id.to_string(),
+        }
+    }
+
+    fn sle(
+        &self,
+        id: String,
+        trans_type: &str,
+        item: String,
+        warehouse: String,
+        qty_change: f64,
+        valuation_rate: f64,
+    ) -> StockLedgerEntry {
+        StockLedgerEntry {
+            id,
+            company_id: self.company_id,
+            trans_type: trans_type.to_string(),
+            item,
+            warehouse,
+            qty_change,
+            valuation_rate,
+            voucher_type: self.doctype.to_string(),
+            voucher_no: self.document_id.to_string(),
+            posting_date: self.posting_date.to_string(),
+            is_reversal: false,
+            batch_id: self.batch_id.to_string(),
+            seq: 0, // assigned by the store at commit
+        }
+    }
+}
+
+fn items_of(payload: &Map<String, Value>) -> &[Value] {
+    match payload.get("items") {
+        Some(Value::Array(items)) => items,
+        _ => &[],
+    }
+}
+
+fn line_amount(line: &Map<String, Value>) -> f64 {
+    if line.contains_key("amount") {
+        as_num(line.get("amount"))
+    } else {
+        as_num(line.get("qty")) * as_num(line.get("rate"))
+    }
+}
+
+fn total_tax(payload: &Map<String, Value>) -> f64 {
+    match payload.get("taxes") {
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|row| as_num(row.get("tax_amount")))
+            .sum(),
+        _ => 0.0,
+    }
+}
+
+/// Blank posting accounts resolve from the company defaults (the Dart
+/// `accountFallbacks` map), so a minimal voucher still posts balanced GL.
+fn resolve_account_fallbacks(
+    doctype: &str,
+    payload: &mut Map<String, Value>,
+    settings: &CompanySettings,
+) {
+    let fallbacks: &[(&str, &str)] = match doctype {
+        "Sales Invoice" => &[
+            ("debit_to", "receivable"),
+            ("income_account", "income"),
+        ],
+        "Purchase Invoice" => &[
+            ("credit_to", "payable"),
+            ("expense_account", "expense"),
+        ],
+        "Payment Entry" => match as_non_empty(payload.get("payment_type")).as_deref() {
+            Some("Receive") => &[("paid_from", "receivable"), ("paid_to", "cash")],
+            Some("Pay") => &[("paid_from", "cash"), ("paid_to", "payable")],
+            _ => &[],
+        },
+        _ => &[],
+    };
+    for (field, default) in fallbacks {
+        if as_non_empty(payload.get(*field)).is_none() {
+            let value = match *default {
+                "receivable" => &settings.default_receivable_account,
+                "payable" => &settings.default_payable_account,
+                "income" => &settings.default_income_account,
+                "expense" => &settings.default_expense_account,
+                _ => &settings.default_cash_account,
+            };
+            payload.insert((*field).to_string(), json!(value));
+        }
+    }
+}
+
+/// Backend-computed invoice totals: `grand_total` = Σ line amounts + Σ tax
+/// rows when the client did not supply it, and the initial outstanding.
+fn ensure_invoice_totals(payload: &mut Map<String, Value>) {
+    if as_non_empty(payload.get("grand_total")).is_none()
+        && !matches!(payload.get("grand_total"), Some(Value::Number(_)))
+    {
+        let net: f64 = items_of(payload)
+            .iter()
+            .filter_map(Value::as_object)
+            .map(line_amount)
+            .sum();
+        let grand = net + total_tax(payload);
+        payload.insert("grand_total".into(), json!(grand));
+    }
+    let grand = as_num(payload.get("grand_total"));
+    payload.insert("outstanding_amount".into(), json!(grand));
+}
+
+/// Monetary GL legs per doctype (receivable/payable, income/expense, VAT,
+/// payment source/destination). Stock GL legs are added after costing.
+fn derive_monetary_gl(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<GlEntry> {
+    let id = ctx.document_id;
+    match ctx.doctype {
+        "Sales Invoice" => {
+            let grand = as_num(payload.get("grand_total"));
+            let net = grand - total_tax(payload);
+            let customer = as_non_empty(payload.get("customer"));
+            let mut gl = vec![
+                // Dr Accounts Receivable (gross — customer owes net + VAT)
+                ctx.gl(
+                    format!("GL-{id}-debit"),
+                    as_non_empty(payload.get("debit_to")).unwrap_or_default(),
+                    grand,
+                    0.0,
+                    Some("Customer"),
+                    customer,
+                ),
+                // Cr Income (net of tax)
+                ctx.gl(
+                    format!("GL-{id}-credit"),
+                    as_non_empty(payload.get("income_account")).unwrap_or_default(),
+                    0.0,
+                    net,
+                    None,
+                    None,
+                ),
+            ];
+            gl.extend(tax_legs(ctx, payload, true));
+            gl
+        }
+        "Purchase Invoice" => {
+            let grand = as_num(payload.get("grand_total"));
+            let net = grand - total_tax(payload);
+            let supplier = as_non_empty(payload.get("supplier"));
+            let mut gl = vec![
+                // Cr Accounts Payable (gross — we owe net + VAT)
+                ctx.gl(
+                    format!("GL-{id}-credit"),
+                    as_non_empty(payload.get("credit_to")).unwrap_or_default(),
+                    0.0,
+                    grand,
+                    Some("Supplier"),
+                    supplier,
+                ),
+                // Dr Expense (net of tax); stock lines move to GRNI later.
+                ctx.gl(
+                    format!("GL-{id}-debit"),
+                    as_non_empty(payload.get("expense_account")).unwrap_or_default(),
+                    net,
+                    0.0,
+                    None,
+                    None,
+                ),
+            ];
+            gl.extend(tax_legs(ctx, payload, false));
+            gl
+        }
+        "Payment Entry" => {
+            let paid = as_num(payload.get("paid_amount"));
+            vec![
+                // Cr the source account (money leaves)
+                ctx.gl(
+                    format!("GL-{id}-from"),
+                    as_non_empty(payload.get("paid_from")).unwrap_or_default(),
+                    0.0,
+                    paid,
+                    None,
+                    None,
+                ),
+                // Dr the destination account (money arrives)
+                ctx.gl(
+                    format!("GL-{id}-to"),
+                    as_non_empty(payload.get("paid_to")).unwrap_or_default(),
+                    paid,
+                    0.0,
+                    None,
+                    None,
+                ),
+            ]
+        }
+        // Purchase Receipt / Stock Entry: GL comes only from costed stock
+        // movements.
+        _ => Vec::new(),
+    }
+}
+
+/// One VAT GL leg per invoice tax row: output VAT credited on sales, input
+/// VAT debited on purchases; zero-amount rows post nothing.
+fn tax_legs(ctx: &RowContext<'_>, payload: &Map<String, Value>, is_output: bool) -> Vec<GlEntry> {
+    let rows = match payload.get("taxes") {
+        Some(Value::Array(rows)) => rows.as_slice(),
+        _ => &[],
+    };
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let Some(row) = row.as_object() else { continue };
+        let tax_amount = as_num(row.get("tax_amount"));
+        let Some(account) = as_non_empty(row.get("tax_account")) else {
+            continue;
+        };
+        if tax_amount.abs() < EPS {
+            continue;
+        }
+        let id = ctx.document_id;
+        let (debit, credit) = if is_output {
+            (0.0, tax_amount)
+        } else {
+            (tax_amount, 0.0)
+        };
+        out.push(ctx.gl(format!("GL-{id}-tax-{i}"), account, debit, credit, None, None));
+    }
+    out
+}
+
+/// Raw (uncosted) stock ledger rows per doctype: `SLE-{id}-{i}` for item
+/// documents, `SLE-{id}-{i}-out`/`-in` for Stock Entry legs. Line index `i`
+/// is the position in `items`, matching the Dart id scheme even when lines
+/// are skipped.
+fn derive_stock_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<StockLedgerEntry> {
+    match ctx.doctype {
+        "Sales Invoice" if is_true(payload.get("update_stock")) => {
+            stock_document_rows(ctx, payload, false, "Issue")
+        }
+        "Purchase Invoice" if is_true(payload.get("update_stock")) => {
+            stock_document_rows(ctx, payload, true, "Receipt")
+        }
+        "Purchase Receipt" => stock_document_rows(ctx, payload, true, "Receipt"),
+        "Stock Entry" => stock_entry_rows(ctx, payload),
+        _ => Vec::new(),
+    }
+}
+
+fn stock_document_rows(
+    ctx: &RowContext<'_>,
+    payload: &Map<String, Value>,
+    incoming: bool,
+    trans_type: &str,
+) -> Vec<StockLedgerEntry> {
+    let set_warehouse = as_non_empty(payload.get("set_warehouse"));
+    let id = ctx.document_id;
+    let mut rows = Vec::new();
+    for (i, line) in items_of(payload).iter().enumerate() {
+        let Some(line) = line.as_object() else { continue };
+        let Some(item) = as_non_empty(line.get("item")) else {
+            continue;
+        };
+        let Some(warehouse) = as_non_empty(line.get("warehouse")).or_else(|| set_warehouse.clone())
+        else {
+            continue;
+        };
+        let qty = as_num(line.get("qty"));
+        // Receipt: +qty on submit; issue: -qty.
+        let qty_change = if incoming { qty } else { -qty };
+        // `valuation_rate ?? rate`, treating an explicit null as absent.
+        let rate = match line.get("valuation_rate") {
+            Some(v) if !v.is_null() => as_num(Some(v)),
+            _ => as_num(line.get("rate")),
+        };
+        rows.push(ctx.sle(format!("SLE-{id}-{i}"), trans_type, item, warehouse, qty_change, rate));
+    }
+    rows
+}
+
+fn stock_entry_trans_type(purpose: Option<&str>) -> &'static str {
+    match purpose {
+        Some("Material Receipt") => "Receipt",
+        Some("Material Transfer") => "Transfer",
+        Some("Repack") | Some("Stock Count") => "Adjustment",
+        Some("Manufacture") | Some("Manufacturing") => "Production",
+        _ => "Issue",
+    }
+}
+
+fn stock_entry_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<StockLedgerEntry> {
+    let trans = stock_entry_trans_type(as_non_empty(payload.get("stock_entry_type")).as_deref());
+    let id = ctx.document_id;
+    let mut rows = Vec::new();
+    for (i, line) in items_of(payload).iter().enumerate() {
+        let Some(line) = line.as_object() else { continue };
+        let Some(item) = as_non_empty(line.get("item")) else {
+            continue;
+        };
+        let qty = as_num(line.get("qty"));
+        let rate = as_num(line.get("valuation_rate"));
+        if let Some(source) = as_non_empty(line.get("source_warehouse")) {
+            // Leaves the source on submit.
+            rows.push(ctx.sle(format!("SLE-{id}-{i}-out"), trans, item.clone(), source, -qty, rate));
+        }
+        if let Some(target) = as_non_empty(line.get("target_warehouse")) {
+            // Enters the target on submit.
+            rows.push(ctx.sle(format!("SLE-{id}-{i}-in"), trans, item.clone(), target, qty, rate));
+        }
+    }
+    rows
+}
+
+fn derive_settlements(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<Settlement> {
+    let refs = match payload.get("references") {
+        Some(Value::Array(refs)) => refs.as_slice(),
+        _ => &[],
+    };
+    let party_type = if as_non_empty(payload.get("payment_type")).as_deref() == Some("Receive") {
+        "Customer"
+    } else {
+        "Supplier"
+    };
+    let party = as_non_empty(payload.get("party"));
+    let id = ctx.document_id;
+    let mut out = Vec::new();
+    for (i, reference) in refs.iter().enumerate() {
+        let Some(reference) = reference.as_object() else {
+            continue;
+        };
+        let Some(ref_doctype) = as_non_empty(reference.get("reference_doctype")) else {
+            continue;
+        };
+        let Some(ref_name) = as_non_empty(reference.get("reference_name")) else {
+            continue;
+        };
+        out.push(Settlement {
+            id: format!("STL-{id}-{i}"),
+            company_id: ctx.company_id,
+            payment_voucher_type: ctx.doctype.to_string(),
+            payment_voucher_no: id.to_string(),
+            invoice_voucher_type: ref_doctype,
+            invoice_voucher_no: ref_name,
+            party_type: party_type.to_string(),
+            party: party.clone(),
+            allocated_amount: as_num(reference.get("allocated_amount")),
+            posting_date: ctx.posting_date.to_string(),
+            is_reversal: false,
+            batch_id: ctx.batch_id.to_string(),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Costing (port of `LedgerDerivationService._costStockMovements`)
+// ---------------------------------------------------------------------------
+
+/// Per-(item, warehouse) ledger cache: the stored prior rows (count recorded
+/// for the commit's optimistic expectations) plus rows appended by the
+/// voucher being built, so sequential issues consume in order.
+#[derive(Default)]
+struct Ledgers {
+    rows: BTreeMap<(String, String), Vec<LedgerRow>>,
+    prior_counts: HashMap<(String, String), usize>,
+}
+
+impl Ledgers {
+    async fn prior_for(
+        &mut self,
+        store: &dyn Store,
+        company_id: Uuid,
+        item: &str,
+        warehouse: &str,
+    ) -> Result<&mut Vec<LedgerRow>, PostingError> {
+        let key = (item.to_string(), warehouse.to_string());
+        if !self.rows.contains_key(&key) {
+            let stored = store.sles_for_pair(company_id, item, warehouse).await?;
+            self.prior_counts.insert(key.clone(), stored.len());
+            self.rows.insert(
+                key.clone(),
+                stored
+                    .iter()
+                    .map(|sle| LedgerRow {
+                        qty_change: sle.qty_change,
+                        valuation_rate: sle.valuation_rate,
+                    })
+                    .collect(),
+            );
+        }
+        Ok(self.rows.get_mut(&key).expect("just inserted"))
+    }
+
+    fn expectations(&self) -> Vec<(String, String, usize)> {
+        self.prior_counts
+            .iter()
+            .map(|((item, warehouse), count)| (item.clone(), warehouse.clone(), *count))
+            .collect()
+    }
+}
+
+async fn load_items(
+    store: &dyn Store,
+    company_id: Uuid,
+    sles: &[StockLedgerEntry],
+    payload: &Map<String, Value>,
+) -> Result<HashMap<String, Item>, PostingError> {
+    let mut ids: Vec<String> = sles.iter().map(|sle| sle.item.clone()).collect();
+    // The GRNI split needs the stock/service status of every invoice line,
+    // including lines that produced no SLE.
+    for line in items_of(payload) {
+        if let Some(item) = line.as_object().and_then(|l| as_non_empty(l.get("item"))) {
+            ids.push(item);
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let items = store.items(company_id, &ids).await?;
+    Ok(items.into_iter().map(|item| (item.id.clone(), item)).collect())
+}
+
+/// Costs the voucher's outgoing rows at the item's valuation method (issues
+/// remove inventory at *cost*, never the selling rate), makes a Transfer's
+/// incoming leg inherit its outgoing cost, re-enters returned goods at the
+/// original voucher's cost, and spreads a Production entry's consumed cost
+/// across its output.
+async fn cost_stock_movements(
+    store: &dyn Store,
+    company_id: Uuid,
+    sles: &mut [StockLedgerEntry],
+    items: &HashMap<String, Item>,
+    payload: &Map<String, Value>,
+    ledgers: &mut Ledgers,
+) -> Result<(), PostingError> {
+    let is_return = is_true(payload.get("is_return"));
+    let return_against = as_non_empty(payload.get("return_against"));
+    let mut out_cost_by_item: HashMap<String, f64> = HashMap::new();
+    let mut consumed_cost = 0.0;
+    let mut production_legs: Vec<usize> = Vec::new();
+    let mut produced_qty = 0.0;
+
+    // Indexed loop: the body mutates `sles[index]` while also borrowing the
+    // ledger cache mutably, which `iter_mut()` + await points can't express.
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..sles.len() {
+        let (item, warehouse, qty_change, trans_type) = {
+            let sle = &sles[index];
+            (
+                sle.item.clone(),
+                sle.warehouse.clone(),
+                sle.qty_change,
+                sle.trans_type.clone(),
+            )
+        };
+        if qty_change < 0.0 {
+            let method = items
+                .get(&item)
+                .and_then(|i| i.valuation_method.as_deref());
+            let prior = ledgers
+                .prior_for(store, company_id, &item, &warehouse)
+                .await?;
+            let rate = issue_rate(prior, -qty_change, method);
+            sles[index].valuation_rate = rate;
+            out_cost_by_item.insert(item.clone(), rate);
+            consumed_cost += -qty_change * rate;
+        } else if qty_change > 0.0 {
+            if is_return {
+                // Goods returning to stock re-enter at the cost they were
+                // sold at (the original voucher's rate), falling back to the
+                // current moving average.
+                let rate = return_cost(
+                    store,
+                    company_id,
+                    &item,
+                    &warehouse,
+                    return_against.as_deref(),
+                    ledgers,
+                )
+                .await?;
+                sles[index].valuation_rate = rate;
+            } else if trans_type == "Transfer" {
+                if let Some(rate) = out_cost_by_item.get(&item) {
+                    sles[index].valuation_rate = *rate;
+                }
+            } else if trans_type == "Production" {
+                production_legs.push(index);
+                produced_qty += qty_change;
+            }
+            // Make sure the pair's prior ledger is loaded (for expectations,
+            // the negative-stock guard and the bin recompute).
+            ledgers
+                .prior_for(store, company_id, &item, &warehouse)
+                .await?;
+        } else {
+            ledgers
+                .prior_for(store, company_id, &item, &warehouse)
+                .await?;
+        }
+
+        // Reflect this row in the simulated ledger for later lines.
+        let rate = sles[index].valuation_rate;
+        let prior = ledgers
+            .prior_for(store, company_id, &item, &warehouse)
+            .await?;
+        prior.push(LedgerRow {
+            qty_change,
+            valuation_rate: rate,
+        });
+    }
+
+    // Allocate the consumed raw cost across all produced output at one
+    // per-unit rate, so total output value equals what was consumed.
+    if !production_legs.is_empty() && produced_qty > 0.0 && consumed_cost > 0.0 {
+        let rate = consumed_cost / produced_qty;
+        for index in production_legs {
+            let sle = &mut sles[index];
+            // Patch the simulated ledger row appended above as well.
+            let key = (sle.item.clone(), sle.warehouse.clone());
+            if let Some(rows) = ledgers.rows.get_mut(&key) {
+                for row in rows.iter_mut().rev() {
+                    if (row.qty_change - sle.qty_change).abs() < EPS
+                        && (row.valuation_rate - sle.valuation_rate).abs() < EPS
+                    {
+                        row.valuation_rate = rate;
+                        break;
+                    }
+                }
+            }
+            sle.valuation_rate = rate;
+        }
+    }
+    Ok(())
+}
+
+/// The cost to re-enter returned stock: the rate the original voucher moved
+/// this item at (preferring the same warehouse), or the current moving
+/// average when no original row exists.
+async fn return_cost(
+    store: &dyn Store,
+    company_id: Uuid,
+    item: &str,
+    warehouse: &str,
+    return_against: Option<&str>,
+    ledgers: &mut Ledgers,
+) -> Result<f64, PostingError> {
+    if let Some(voucher) = return_against {
+        let originals = store.sles_for_voucher(company_id, voucher).await?;
+        let mut any_rate = None;
+        for original in originals.iter().filter(|sle| sle.item == item) {
+            if original.warehouse == warehouse {
+                return Ok(original.valuation_rate); // exact warehouse match
+            }
+            any_rate.get_or_insert(original.valuation_rate);
+        }
+        if let Some(rate) = any_rate {
+            return Ok(rate);
+        }
+    }
+    let prior = ledgers
+        .prior_for(store, company_id, item, warehouse)
+        .await?;
+    Ok(compute_balance(prior).valuation_rate)
+}
+
+// ---------------------------------------------------------------------------
+// Perpetual-inventory GL (port of `_stockGlLegs` + `_splitGrniFromExpense`)
+// ---------------------------------------------------------------------------
+
+fn resolve_account<'a>(
+    item: Option<&'a Item>,
+    pick: impl Fn(&Item) -> Option<&String>,
+    default: &'a str,
+) -> &'a str {
+    item.and_then(|item| pick(item).map(String::as_str))
+        .unwrap_or(default)
+}
+
+/// The GL counterpart of every costed stock movement, `v = qty × rate`:
+/// sale vouchers issue Dr COGS / Cr Inventory (returns flip); purchase
+/// vouchers receive Dr Inventory / Cr GRNI (returns flip); Stock Entry
+/// movements post against the stock-adjustment account. Transfers and
+/// Production legs post no GL — value-neutral with one inventory account.
+fn stock_gl_legs(
+    ctx: &RowContext<'_>,
+    sles: &[StockLedgerEntry],
+    items: &HashMap<String, Item>,
+    settings: &CompanySettings,
+) -> Vec<GlEntry> {
+    let sale = matches!(ctx.doctype, "Sales Invoice" | "Delivery Note" | "POS Invoice");
+    let purchase = matches!(ctx.doctype, "Purchase Invoice" | "Purchase Receipt");
+    let mut legs = Vec::new();
+    for sle in sles {
+        let value = sle.qty_change * sle.valuation_rate;
+        if value.abs() < EPS || sle.trans_type == "Transfer" || sle.trans_type == "Production" {
+            continue;
+        }
+        let item = items.get(&sle.item);
+        let inventory = resolve_account(
+            item,
+            |i| i.inventory_account.as_ref(),
+            &settings.default_inventory_account,
+        );
+        let counter = if sale {
+            resolve_account(item, |i| i.cogs_account.as_ref(), &settings.default_cogs_account)
+        } else if purchase {
+            settings.default_grni_account.as_str()
+        } else {
+            resolve_account(
+                item,
+                |i| i.stock_adjustment_account.as_ref(),
+                &settings.default_stock_adjustment_account,
+            )
+        };
+        let amount = value.abs();
+        let (dr, cr) = if value > 0.0 {
+            (inventory, counter)
+        } else {
+            (counter, inventory)
+        };
+        legs.push(ctx.gl(format!("{}-gl-d", sle.id), dr.to_string(), amount, 0.0, None, None));
+        legs.push(ctx.gl(format!("{}-gl-c", sle.id), cr.to_string(), 0.0, amount, None, None));
+    }
+    legs
+}
+
+/// Moves a Purchase Invoice's stock-line value off the expense leg onto GRNI
+/// so buying stock never lands in COGS at purchase time: the bill's own SLE
+/// legs post Dr Inventory / Cr GRNI (one-document flow) or the earlier
+/// receipt did (two-document flow); this split posts the Dr GRNI clearing
+/// side. Service / non-stock lines keep their expense treatment.
+fn split_grni_from_expense(
+    ctx: &RowContext<'_>,
+    gl: &mut Vec<GlEntry>,
+    payload: &Map<String, Value>,
+    items: &HashMap<String, Item>,
+    settings: &CompanySettings,
+) {
+    let stock_net: f64 = items_of(payload)
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|line| {
+            as_non_empty(line.get("item")).is_some_and(|id| {
+                is_stock_item_type(items.get(&id).map(|item| item.item_type.as_str()))
+            })
+        })
+        .map(line_amount)
+        .sum();
+    if stock_net.abs() < EPS {
+        return;
+    }
+
+    let expense_id = format!("GL-{}-debit", ctx.document_id);
+    if let Some(pos) = gl.iter().position(|entry| entry.id == expense_id) {
+        gl[pos].debit -= stock_net;
+        if gl[pos].debit.abs() < EPS && gl[pos].credit.abs() < EPS {
+            gl.remove(pos);
+        }
+    }
+    gl.push(ctx.gl(
+        format!("GL-{}-grni", ctx.document_id),
+        settings.default_grni_account.clone(),
+        stock_net,
+        0.0,
+        None,
+        None,
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Validation + derived balances
+// ---------------------------------------------------------------------------
+
+fn check_period_lock(settings: &CompanySettings, posting_date: &str) -> Result<(), PostingError> {
+    if let Some(lock) = &settings.books_lock_date {
+        // ISO dates compare correctly as strings.
+        if posting_date <= lock.as_str() {
+            return Err(PostingError::Validation(format!(
+                "posting date {posting_date} falls in a locked period (books locked through {lock})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// JE-style balance guard over the generated GL.
+fn check_balanced(gl: &[GlEntry]) -> Result<(), PostingError> {
+    let debit: f64 = gl.iter().map(|entry| entry.debit).sum();
+    let credit: f64 = gl.iter().map(|entry| entry.credit).sum();
+    if (debit - credit).abs() > BALANCE_TOLERANCE {
+        return Err(PostingError::Validation(format!(
+            "generated GL does not balance: debit {debit} vs credit {credit}"
+        )));
+    }
+    Ok(())
+}
+
+fn check_negative_stock(settings: &CompanySettings, ledgers: &Ledgers) -> Result<(), PostingError> {
+    if settings.allow_negative_stock {
+        return Ok(());
+    }
+    for ((item, warehouse), rows) in &ledgers.rows {
+        let snap = compute_balance(rows);
+        if snap.actual_qty < 0.0 {
+            return Err(PostingError::Validation(format!(
+                "insufficient stock: {item} in {warehouse} would go to {}",
+                snap.actual_qty
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The recomputed bins for every pair this posting touched (prior rows plus
+/// the voucher's own, already folded into the ledger cache).
+fn recompute_bins(company_id: Uuid, ledgers: &Ledgers) -> Vec<Bin> {
+    ledgers
+        .rows
+        .iter()
+        .map(|((item, warehouse), rows)| {
+            let snap = compute_balance(rows);
+            Bin {
+                company_id,
+                item: item.clone(),
+                warehouse: warehouse.clone(),
+                actual_qty: snap.actual_qty,
+                valuation_rate: snap.valuation_rate,
+                stock_value: snap.stock_value,
+            }
+        })
+        .collect()
+}
+
+/// Recomputes `outstanding_amount` for every submitted invoice this payment
+/// (or its cancellation) touches: grand total less all stored settlements
+/// plus the new signed allocations.
+async fn payment_outstanding_updates(
+    store: &dyn Store,
+    company_id: Uuid,
+    new_settlements: &[Settlement],
+) -> Result<Vec<(String, String, f64)>, PostingError> {
+    let mut updates = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for settlement in new_settlements {
+        let key = (
+            settlement.invoice_voucher_type.clone(),
+            settlement.invoice_voucher_no.clone(),
+        );
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let invoice = store
+            .posted_document(company_id, &key.0, &key.1)
+            .await?
+            .ok_or_else(|| {
+                PostingError::Validation(format!(
+                    "payment references unknown invoice {} {}",
+                    key.0, key.1
+                ))
+            })?;
+        if invoice.docstatus != 1 {
+            return Err(PostingError::Validation(format!(
+                "payment references invoice {} {} which is not submitted",
+                key.0, key.1
+            )));
+        }
+        let grand = as_num(invoice.payload.get("grand_total"));
+        let stored: f64 = store
+            .settlements_for_invoice(company_id, &key.0, &key.1)
+            .await?
+            .iter()
+            .map(|s| s.allocated_amount)
+            .sum();
+        let new: f64 = new_settlements
+            .iter()
+            .filter(|s| s.invoice_voucher_type == key.0 && s.invoice_voucher_no == key.1)
+            .map(|s| s.allocated_amount)
+            .sum();
+        updates.push((key.0, key.1, outstanding_amount(grand, [stored, new])));
+    }
+    Ok(updates)
+}
+
+fn audit_row(company_id: Uuid, actor: Actor, action: &str, detail: Value) -> AuditEntry {
+    AuditEntry {
+        id: Uuid::new_v4(),
+        company_id,
+        user_id: Some(actor.user_id),
+        device_id: actor.device_id,
+        action: action.to_string(),
+        detail,
+        at: Utc::now(),
+    }
+}

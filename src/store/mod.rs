@@ -6,11 +6,16 @@ pub mod mem;
 pub mod pg;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
     AuditEntry, Company, Device, Invitation, MutationRecord, Role, TokenIdentity, User,
     WebhookEvent,
+};
+use crate::posting::model::{
+    CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit, Settlement,
+    StockLedgerEntry,
 };
 
 pub use mem::MemStore;
@@ -21,6 +26,10 @@ pub enum StoreError {
     /// A uniqueness / state conflict the caller may surface as 409.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Optimistic-concurrency failure inside a posting commit: the state the
+    /// engine computed from moved underneath it. The command layer retries.
+    #[error("stale: {0}")]
+    Stale(String),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -106,4 +115,78 @@ pub trait Store: Send + Sync {
 
     // Webhook intake
     async fn insert_webhook_event(&self, event: WebhookEvent) -> Result<(), StoreError>;
+
+    // ------------------------------------------------------------------
+    // Posting authority (Phase 3)
+    // ------------------------------------------------------------------
+
+    /// Company posting settings; defaults when the company never stored any.
+    async fn company_settings(&self, company_id: Uuid) -> Result<CompanySettings, StoreError>;
+    async fn put_company_settings(
+        &self,
+        company_id: Uuid,
+        settings: CompanySettings,
+    ) -> Result<(), StoreError>;
+
+    /// Item registry upsert (last write wins on the whole record).
+    async fn upsert_item(&self, company_id: Uuid, item: Item) -> Result<(), StoreError>;
+    /// Registry entries for the given ids; unknown ids are simply absent
+    /// (the engine treats unregistered items as stock items, like Dart).
+    async fn items(&self, company_id: Uuid, ids: &[String]) -> Result<Vec<Item>, StoreError>;
+
+    /// An official document by (doctype, id), if it was ever submitted.
+    async fn posted_document(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+        id: &str,
+    ) -> Result<Option<PostedDocument>, StoreError>;
+
+    /// Full stock ledger for an (item, warehouse) pair, oldest first (by
+    /// insertion sequence — the FIFO replay depends on this order).
+    async fn sles_for_pair(
+        &self,
+        company_id: Uuid,
+        item: &str,
+        warehouse: &str,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError>;
+    /// All stock ledger rows a voucher produced (submit and reversal rows).
+    async fn sles_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError>;
+    /// All GL rows a voucher produced (submit and reversal rows).
+    async fn gl_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<GlEntry>, StoreError>;
+    /// All settlements allocated against an invoice (signed; reversals net).
+    async fn settlements_for_invoice(
+        &self,
+        company_id: Uuid,
+        invoice_doctype: &str,
+        invoice_no: &str,
+    ) -> Result<Vec<Settlement>, StoreError>;
+    /// All settlements a payment voucher produced.
+    async fn settlements_for_payment(
+        &self,
+        company_id: Uuid,
+        payment_no: &str,
+    ) -> Result<Vec<Settlement>, StoreError>;
+
+    /// A previously committed response for this idempotency key, if any.
+    async fn idempotent_response(
+        &self,
+        company_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Value>, StoreError>;
+
+    /// Applies one posting command atomically: idempotency-key replay check,
+    /// stock-ledger expectations (`StoreError::Stale` on mismatch), gap-free
+    /// official-number allocation, document insert/update, GL + SLE +
+    /// settlement appends, bin upserts, invoice outstanding maintenance, the
+    /// posting batch and the audit row — all or nothing.
+    async fn posting_commit(&self, commit: PostingCommit) -> Result<CommitOutcome, StoreError>;
 }

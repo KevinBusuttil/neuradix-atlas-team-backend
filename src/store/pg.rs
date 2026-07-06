@@ -2,13 +2,18 @@
 //! build never needs a live database). Schema lives in `migrations/`.
 
 use async_trait::async_trait;
-use sqlx::postgres::PgPool;
+use serde_json::{json, Value};
+use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::model::{
     AuditEntry, Company, Device, Invitation, MutationRecord, Role, TokenIdentity, User,
     WebhookEvent,
+};
+use crate::posting::model::{
+    format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument,
+    PostingCommit, Settlement, StockLedgerEntry,
 };
 
 use super::{Store, StoreError};
@@ -35,6 +40,70 @@ impl PgStore {
 
 fn parse_role(raw: &str) -> Result<Role, StoreError> {
     Role::parse(raw).ok_or_else(|| StoreError::Internal(format!("unknown role in db: {raw}")))
+}
+
+fn gl_from_row(row: &PgRow) -> Result<GlEntry, StoreError> {
+    Ok(GlEntry {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        account: row.try_get("account")?,
+        debit: row.try_get("debit")?,
+        credit: row.try_get("credit")?,
+        party_type: row.try_get("party_type")?,
+        party: row.try_get("party")?,
+        voucher_type: row.try_get("voucher_type")?,
+        voucher_no: row.try_get("voucher_no")?,
+        posting_date: row.try_get("posting_date")?,
+        is_reversal: row.try_get("is_reversal")?,
+        batch_id: row.try_get("batch_id")?,
+    })
+}
+
+fn sle_from_row(row: &PgRow) -> Result<StockLedgerEntry, StoreError> {
+    Ok(StockLedgerEntry {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        trans_type: row.try_get("trans_type")?,
+        item: row.try_get("item")?,
+        warehouse: row.try_get("warehouse")?,
+        qty_change: row.try_get("qty_change")?,
+        valuation_rate: row.try_get("valuation_rate")?,
+        voucher_type: row.try_get("voucher_type")?,
+        voucher_no: row.try_get("voucher_no")?,
+        posting_date: row.try_get("posting_date")?,
+        is_reversal: row.try_get("is_reversal")?,
+        batch_id: row.try_get("batch_id")?,
+        seq: row.try_get("seq")?,
+    })
+}
+
+fn settlement_from_row(row: &PgRow) -> Result<Settlement, StoreError> {
+    Ok(Settlement {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        payment_voucher_type: row.try_get("payment_voucher_type")?,
+        payment_voucher_no: row.try_get("payment_voucher_no")?,
+        invoice_voucher_type: row.try_get("invoice_voucher_type")?,
+        invoice_voucher_no: row.try_get("invoice_voucher_no")?,
+        party_type: row.try_get("party_type")?,
+        party: row.try_get("party")?,
+        allocated_amount: row.try_get("allocated_amount")?,
+        posting_date: row.try_get("posting_date")?,
+        is_reversal: row.try_get("is_reversal")?,
+        batch_id: row.try_get("batch_id")?,
+    })
+}
+
+fn document_from_row(row: &PgRow) -> Result<PostedDocument, StoreError> {
+    Ok(PostedDocument {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        doctype: row.try_get("doctype")?,
+        payload: row.try_get("payload")?,
+        docstatus: row.try_get("docstatus")?,
+        official_number: row.try_get("official_number")?,
+        created_at: row.try_get("created_at")?,
+    })
 }
 
 #[async_trait]
@@ -425,5 +494,482 @@ impl Store for PgStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Posting authority (Phase 3)
+    // ------------------------------------------------------------------
+
+    async fn company_settings(&self, company_id: Uuid) -> Result<CompanySettings, StoreError> {
+        let row = sqlx::query("select settings from company_settings where company_id = $1")
+            .bind(company_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: Value = row.try_get("settings")?;
+                Ok(serde_json::from_value(value)?)
+            }
+            None => Ok(CompanySettings::default()),
+        }
+    }
+
+    async fn put_company_settings(
+        &self,
+        company_id: Uuid,
+        settings: CompanySettings,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "insert into company_settings (company_id, settings, updated_at) \
+             values ($1, $2, now()) \
+             on conflict (company_id) do update \
+             set settings = excluded.settings, updated_at = now()",
+        )
+        .bind(company_id)
+        .bind(serde_json::to_value(&settings)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_item(&self, company_id: Uuid, item: Item) -> Result<(), StoreError> {
+        sqlx::query(
+            "insert into items (company_id, id, item, updated_at) values ($1, $2, $3, now()) \
+             on conflict (company_id, id) do update \
+             set item = excluded.item, updated_at = now()",
+        )
+        .bind(company_id)
+        .bind(&item.id)
+        .bind(serde_json::to_value(&item)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn items(&self, company_id: Uuid, ids: &[String]) -> Result<Vec<Item>, StoreError> {
+        let rows = sqlx::query("select item from items where company_id = $1 and id = any($2)")
+            .bind(company_id)
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value: Value = row.try_get("item")?;
+            out.push(serde_json::from_value(value)?);
+        }
+        Ok(out)
+    }
+
+    async fn posted_document(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+        id: &str,
+    ) -> Result<Option<PostedDocument>, StoreError> {
+        let row = sqlx::query(
+            "select company_id, doctype, id, payload, docstatus, official_number, created_at \
+             from documents where company_id = $1 and doctype = $2 and id = $3",
+        )
+        .bind(company_id)
+        .bind(doctype)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| document_from_row(&row)).transpose()
+    }
+
+    async fn sles_for_pair(
+        &self,
+        company_id: Uuid,
+        item: &str,
+        warehouse: &str,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError> {
+        let rows = sqlx::query(
+            "select seq, company_id, id, trans_type, item, warehouse, qty_change, \
+             valuation_rate, voucher_type, voucher_no, posting_date, is_reversal, batch_id \
+             from stock_ledger_entries \
+             where company_id = $1 and item = $2 and warehouse = $3 order by seq",
+        )
+        .bind(company_id)
+        .bind(item)
+        .bind(warehouse)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(sle_from_row).collect()
+    }
+
+    async fn sles_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError> {
+        let rows = sqlx::query(
+            "select seq, company_id, id, trans_type, item, warehouse, qty_change, \
+             valuation_rate, voucher_type, voucher_no, posting_date, is_reversal, batch_id \
+             from stock_ledger_entries \
+             where company_id = $1 and voucher_no = $2 order by seq",
+        )
+        .bind(company_id)
+        .bind(voucher_no)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(sle_from_row).collect()
+    }
+
+    async fn gl_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<GlEntry>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, account, debit, credit, party_type, party, voucher_type, \
+             voucher_no, posting_date, is_reversal, batch_id \
+             from gl_entries where company_id = $1 and voucher_no = $2 order by id",
+        )
+        .bind(company_id)
+        .bind(voucher_no)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(gl_from_row).collect()
+    }
+
+    async fn settlements_for_invoice(
+        &self,
+        company_id: Uuid,
+        invoice_doctype: &str,
+        invoice_no: &str,
+    ) -> Result<Vec<Settlement>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, payment_voucher_type, payment_voucher_no, \
+             invoice_voucher_type, invoice_voucher_no, party_type, party, allocated_amount, \
+             posting_date, is_reversal, batch_id \
+             from settlements \
+             where company_id = $1 and invoice_voucher_type = $2 and invoice_voucher_no = $3",
+        )
+        .bind(company_id)
+        .bind(invoice_doctype)
+        .bind(invoice_no)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(settlement_from_row).collect()
+    }
+
+    async fn settlements_for_payment(
+        &self,
+        company_id: Uuid,
+        payment_no: &str,
+    ) -> Result<Vec<Settlement>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, payment_voucher_type, payment_voucher_no, \
+             invoice_voucher_type, invoice_voucher_no, party_type, party, allocated_amount, \
+             posting_date, is_reversal, batch_id \
+             from settlements where company_id = $1 and payment_voucher_no = $2",
+        )
+        .bind(company_id)
+        .bind(payment_no)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(settlement_from_row).collect()
+    }
+
+    async fn idempotent_response(
+        &self,
+        company_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Value>, StoreError> {
+        let row =
+            sqlx::query("select response from idempotency_keys where company_id = $1 and key = $2")
+                .bind(company_id)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get("response")?),
+            None => None,
+        })
+    }
+
+    async fn posting_commit(&self, commit: PostingCommit) -> Result<CommitOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let company = commit.company_id;
+
+        // Serialize all posting commits per company (the MemStore analogue is
+        // its single mutex): numbering stays gap-free and the stock-ledger
+        // expectation counts below can't race a concurrent commit.
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended($1::text, 42))")
+            .bind(company)
+            .execute(&mut *tx)
+            .await?;
+
+        // Idempotency replay.
+        if let Some(key) = &commit.idempotency_key {
+            let row = sqlx::query(
+                "select response from idempotency_keys where company_id = $1 and key = $2",
+            )
+            .bind(company)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = row {
+                return Ok(CommitOutcome {
+                    response: row.try_get("response")?,
+                    replayed: true,
+                });
+            }
+        }
+
+        // Optimistic stock-ledger expectations.
+        for (item, warehouse, expected) in &commit.sle_expectations {
+            let row = sqlx::query(
+                "select count(*) as n from stock_ledger_entries \
+                 where company_id = $1 and item = $2 and warehouse = $3",
+            )
+            .bind(company)
+            .bind(item)
+            .bind(warehouse)
+            .fetch_one(&mut *tx)
+            .await?;
+            let actual: i64 = row.try_get("n")?;
+            if actual != *expected as i64 {
+                return Err(StoreError::Stale(format!(
+                    "stock ledger for {item}/{warehouse} moved ({expected} -> {actual})"
+                )));
+            }
+        }
+
+        let mut document = commit.document;
+        let existing = sqlx::query(
+            "select docstatus from documents where company_id = $1 and doctype = $2 and id = $3",
+        )
+        .bind(company)
+        .bind(&document.doctype)
+        .bind(&document.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if commit.document_is_new {
+            if existing.is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "document {} {} already exists",
+                    document.doctype, document.id
+                )));
+            }
+        } else {
+            let Some(row) = existing else {
+                return Err(StoreError::Conflict(format!(
+                    "document {} {} does not exist",
+                    document.doctype, document.id
+                )));
+            };
+            let docstatus: i16 = row.try_get("docstatus")?;
+            if docstatus != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "document {} {} is not submitted",
+                    document.doctype, document.id
+                )));
+            }
+        }
+
+        // Gap-free number allocation inside the transaction.
+        let mut response = commit.response;
+        if let Some(series) = &commit.series_key {
+            sqlx::query(
+                "insert into numbering_series (company_id, series_key, next_value) \
+                 values ($1, $2, 0) on conflict (company_id, series_key) do nothing",
+            )
+            .bind(company)
+            .bind(series)
+            .execute(&mut *tx)
+            .await?;
+            let row = sqlx::query(
+                "update numbering_series set next_value = next_value + 1 \
+                 where company_id = $1 and series_key = $2 returning next_value",
+            )
+            .bind(company)
+            .bind(series)
+            .fetch_one(&mut *tx)
+            .await?;
+            let value: i64 = row.try_get("next_value")?;
+            let number = format_number(series, value);
+            document.official_number = Some(number.clone());
+            response["number"] = json!(number);
+        }
+
+        if commit.document_is_new {
+            sqlx::query(
+                "insert into documents \
+                 (company_id, doctype, id, payload, docstatus, official_number, created_at) \
+                 values ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(company)
+            .bind(&document.doctype)
+            .bind(&document.id)
+            .bind(&document.payload)
+            .bind(document.docstatus)
+            .bind(&document.official_number)
+            .bind(document.created_at)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "update documents set payload = $4, docstatus = $5 \
+                 where company_id = $1 and doctype = $2 and id = $3",
+            )
+            .bind(company)
+            .bind(&document.doctype)
+            .bind(&document.id)
+            .bind(&document.payload)
+            .bind(document.docstatus)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for entry in &commit.gl_entries {
+            sqlx::query(
+                "insert into gl_entries \
+                 (company_id, id, account, debit, credit, party_type, party, voucher_type, \
+                  voucher_no, posting_date, is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(company)
+            .bind(&entry.id)
+            .bind(&entry.account)
+            .bind(entry.debit)
+            .bind(entry.credit)
+            .bind(&entry.party_type)
+            .bind(&entry.party)
+            .bind(&entry.voucher_type)
+            .bind(&entry.voucher_no)
+            .bind(&entry.posting_date)
+            .bind(entry.is_reversal)
+            .bind(&entry.batch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for sle in &commit.stock_ledger_entries {
+            sqlx::query(
+                "insert into stock_ledger_entries \
+                 (company_id, id, trans_type, item, warehouse, qty_change, valuation_rate, \
+                  voucher_type, voucher_no, posting_date, is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(company)
+            .bind(&sle.id)
+            .bind(&sle.trans_type)
+            .bind(&sle.item)
+            .bind(&sle.warehouse)
+            .bind(sle.qty_change)
+            .bind(sle.valuation_rate)
+            .bind(&sle.voucher_type)
+            .bind(&sle.voucher_no)
+            .bind(&sle.posting_date)
+            .bind(sle.is_reversal)
+            .bind(&sle.batch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for settlement in &commit.settlements {
+            sqlx::query(
+                "insert into settlements \
+                 (company_id, id, payment_voucher_type, payment_voucher_no, \
+                  invoice_voucher_type, invoice_voucher_no, party_type, party, \
+                  allocated_amount, posting_date, is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(company)
+            .bind(&settlement.id)
+            .bind(&settlement.payment_voucher_type)
+            .bind(&settlement.payment_voucher_no)
+            .bind(&settlement.invoice_voucher_type)
+            .bind(&settlement.invoice_voucher_no)
+            .bind(&settlement.party_type)
+            .bind(&settlement.party)
+            .bind(settlement.allocated_amount)
+            .bind(&settlement.posting_date)
+            .bind(settlement.is_reversal)
+            .bind(&settlement.batch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for bin in &commit.bins {
+            sqlx::query(
+                "insert into bins \
+                 (company_id, item, warehouse, actual_qty, valuation_rate, stock_value) \
+                 values ($1, $2, $3, $4, $5, $6) \
+                 on conflict (company_id, item, warehouse) do update set \
+                 actual_qty = excluded.actual_qty, valuation_rate = excluded.valuation_rate, \
+                 stock_value = excluded.stock_value",
+            )
+            .bind(company)
+            .bind(&bin.item)
+            .bind(&bin.warehouse)
+            .bind(bin.actual_qty)
+            .bind(bin.valuation_rate)
+            .bind(bin.stock_value)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for (doctype, id, outstanding) in &commit.outstanding_updates {
+            sqlx::query(
+                "update documents \
+                 set payload = jsonb_set(payload, '{outstanding_amount}', to_jsonb($4::float8)) \
+                 where company_id = $1 and doctype = $2 and id = $3",
+            )
+            .bind(company)
+            .bind(doctype)
+            .bind(id)
+            .bind(outstanding)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "insert into posting_batches \
+             (company_id, id, document_id, doctype, kind, reversal_of, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(company)
+        .bind(&commit.batch.id)
+        .bind(&commit.batch.document_id)
+        .bind(&commit.batch.doctype)
+        .bind(&commit.batch.kind)
+        .bind(&commit.batch.reversal_of)
+        .bind(commit.batch.created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "insert into audit_log (id, company_id, user_id, device_id, action, detail, at) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(commit.audit.id)
+        .bind(commit.audit.company_id)
+        .bind(commit.audit.user_id)
+        .bind(commit.audit.device_id)
+        .bind(&commit.audit.action)
+        .bind(&commit.audit.detail)
+        .bind(commit.audit.at)
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(key) = &commit.idempotency_key {
+            sqlx::query(
+                "insert into idempotency_keys (company_id, key, response) values ($1, $2, $3)",
+            )
+            .bind(company)
+            .bind(key)
+            .bind(&response)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(CommitOutcome {
+            response,
+            replayed: false,
+        })
     }
 }

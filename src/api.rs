@@ -20,6 +20,11 @@ use crate::error::ApiError;
 use crate::model::{
     AuditEntry, Device, Invitation, MutationRecord, Role, WebhookEvent, WebhookKind,
 };
+use crate::posting::engine::{
+    allowed_roles, cancel_document as engine_cancel, submit_document as engine_submit, Actor,
+    CancelCommand, SubmitCommand,
+};
+use crate::posting::model::{CompanySettings, Item, POSTED_DOCTYPES};
 use crate::AppState;
 
 const INVITATION_TTL_DAYS: i64 = 7;
@@ -46,6 +51,19 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/payments/{provider}", post(webhook_payment))
         .route("/webhooks/channels/{connector}", post(webhook_channel))
         .route("/companies/{company_id}/audit", get(read_audit))
+        .route(
+            "/companies/{company_id}/settings",
+            put(put_settings).get(get_settings),
+        )
+        .route("/companies/{company_id}/items", post(upsert_item))
+        .route(
+            "/companies/{company_id}/commands/submit-document",
+            post(submit_document),
+        )
+        .route(
+            "/companies/{company_id}/commands/cancel-document",
+            post(cancel_document),
+        )
         .with_state(state)
 }
 
@@ -316,6 +334,27 @@ async fn sync_push(
 ) -> Result<Json<Value>, ApiError> {
     require_membership(&state, &auth, company_id).await?;
     auth.require_device()?;
+    // Immutability (roadmap §6 criterion 7): once a posted-doctype document is
+    // official (submitted or cancelled), the sync plane may not touch it —
+    // changes must go through the command API, which posts reversals instead
+    // of editing history.
+    for mutation in &req.mutations {
+        if !POSTED_DOCTYPES.contains(&mutation.doc_type.as_str()) {
+            continue;
+        }
+        if let Some(doc) = state
+            .store
+            .posted_document(company_id, &mutation.doc_type, &mutation.document_id)
+            .await?
+        {
+            if doc.docstatus >= 1 {
+                return Err(ApiError::Conflict(format!(
+                    "{} {} is officially posted (docstatus {}) and immutable; use the command API",
+                    mutation.doc_type, mutation.document_id, doc.docstatus
+                )));
+            }
+        }
+    }
     let count = req.mutations.len();
     let assigned = state
         .store
@@ -531,4 +570,172 @@ async fn read_audit(
         .clamp(1, MAX_AUDIT_LIMIT);
     let entries = state.store.recent_audit(company_id, limit).await?;
     Ok(Json(json!({ "entries": entries })))
+}
+
+// ---------------------------------------------------------------------------
+// Posting authority (Phase 3 — roadmap §6 criteria 5–7 and 11)
+// ---------------------------------------------------------------------------
+
+/// Company posting settings (negative-stock policy, period lock, default
+/// posting accounts). The request body is merged over the current settings so
+/// callers can PATCH-style update a single field.
+async fn put_settings(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(patch): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner, Role::Admin, Role::Accountant])?;
+    let current = state.store.company_settings(company_id).await?;
+    let mut merged = serde_json::to_value(&current).map_err(|e| ApiError::Internal(e.into()))?;
+    let (Some(target), Some(fields)) = (merged.as_object_mut(), patch.as_object()) else {
+        return Err(ApiError::BadRequest("settings body must be an object".into()));
+    };
+    for (key, value) in fields {
+        if !target.contains_key(key) {
+            return Err(ApiError::BadRequest(format!("unknown setting {key}")));
+        }
+        target.insert(key.clone(), value.clone());
+    }
+    let settings: CompanySettings = serde_json::from_value(merged)
+        .map_err(|e| ApiError::BadRequest(format!("invalid settings: {e}")))?;
+    state
+        .store
+        .put_company_settings(company_id, settings.clone())
+        .await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "settings.update",
+        patch.clone(),
+    )
+    .await?;
+    Ok(Json(
+        serde_json::to_value(&settings).map_err(|e| ApiError::Internal(e.into()))?,
+    ))
+}
+
+async fn get_settings(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    let settings = state.store.company_settings(company_id).await?;
+    Ok(Json(
+        serde_json::to_value(&settings).map_err(|e| ApiError::Internal(e.into()))?,
+    ))
+}
+
+/// Item registry upsert: the posting engine's view of an item (stock vs
+/// service, valuation method, account overrides).
+async fn upsert_item(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(item): Json<Item>,
+) -> Result<impl IntoResponse, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner, Role::Admin, Role::Stock])?;
+    if item.id.trim().is_empty() {
+        return Err(ApiError::BadRequest("item id is required".into()));
+    }
+    state.store.upsert_item(company_id, item.clone()).await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "item.upsert",
+        json!({ "id": item.id, "itemType": item.item_type }),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(json!({ "id": item.id }))))
+}
+
+#[derive(Deserialize)]
+struct SubmitDocumentRequest {
+    doctype: String,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    payload: serde_json::Map<String, Value>,
+    #[serde(default)]
+    items: Vec<Value>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// Official submission (roadmap §6 criteria 5–6, 11): validates, allocates
+/// the gap-free number, posts GL + stock + settlements atomically and returns
+/// the official result. Device-token only, role-gated per doctype.
+async fn submit_document(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<SubmitDocumentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    let allowed = allowed_roles(&req.doctype).ok_or_else(|| {
+        ApiError::BadRequest(format!("unsupported doctype {}", req.doctype))
+    })?;
+    require_role(role, allowed)?;
+    let outcome = engine_submit(
+        state.store.as_ref(),
+        company_id,
+        SubmitCommand {
+            doctype: req.doctype,
+            document_id: req.document_id,
+            payload: req.payload,
+            items: req.items,
+            idempotency_key: req.idempotency_key,
+        },
+        Actor {
+            user_id: auth.user_id(),
+            device_id: auth.device_id(),
+        },
+    )
+    .await?;
+    Ok(Json(outcome.response))
+}
+
+#[derive(Deserialize)]
+struct CancelDocumentRequest {
+    doctype: String,
+    document_id: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// Cancellation: posts the linked reversal batch (negated legs, `-reversal`
+/// ids, stock restored at original cost) and sets docstatus 2.
+async fn cancel_document(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<CancelDocumentRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    let allowed = allowed_roles(&req.doctype).ok_or_else(|| {
+        ApiError::BadRequest(format!("unsupported doctype {}", req.doctype))
+    })?;
+    require_role(role, allowed)?;
+    let outcome = engine_cancel(
+        state.store.as_ref(),
+        company_id,
+        CancelCommand {
+            doctype: req.doctype,
+            document_id: req.document_id,
+            idempotency_key: req.idempotency_key,
+        },
+        Actor {
+            user_id: auth.user_id(),
+            device_id: auth.device_id(),
+        },
+    )
+    .await?;
+    Ok(Json(outcome.response))
 }
