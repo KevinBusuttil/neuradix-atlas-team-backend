@@ -17,6 +17,7 @@ use crate::posting::model::{
     format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument,
     PostingBatch, PostingCommit, Settlement, StockLedgerEntry,
 };
+use crate::posting::replication::{replication_mutations, ReplicationSources};
 
 use super::{Store, StoreError};
 
@@ -69,6 +70,42 @@ struct Inner {
     series: HashMap<(Uuid, String), i64>,
     /// (company_id, idempotency key) -> committed response
     idempotency: HashMap<(Uuid, String), Value>,
+}
+
+impl Inner {
+    /// Appends to the company mutation log with the same idempotent,
+    /// monotonic version assignment as `push_mutations` — callable while the
+    /// store mutex is already held (e.g. inside `posting_commit`). A record
+    /// whose id was already logged keeps its original version and is not
+    /// re-appended. Returns `(id, version)` pairs in input order.
+    fn append_mutations(
+        &mut self,
+        company_id: Uuid,
+        mutations: Vec<MutationRecord>,
+    ) -> Vec<(String, i64)> {
+        let mut versions = Vec::with_capacity(mutations.len());
+        for record in mutations {
+            let key = (company_id, record.id.clone());
+            if let Some(&existing) = self.mutation_versions.get(&key) {
+                versions.push((record.id, existing));
+                continue;
+            }
+            let next = self.counters.entry(company_id).or_insert(0);
+            *next += 1;
+            let version = *next;
+            self.mutation_versions.insert(key, version);
+            versions.push((record.id.clone(), version));
+            self.mutations
+                .entry(company_id)
+                .or_default()
+                .push(StoredMutation {
+                    record,
+                    version,
+                    acknowledged: false,
+                });
+        }
+        versions
+    }
 }
 
 #[derive(Default)]
@@ -272,29 +309,7 @@ impl Store for MemStore {
         mutations: Vec<MutationRecord>,
     ) -> Result<Vec<(String, i64)>, StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        let mut versions = Vec::with_capacity(mutations.len());
-        for record in mutations {
-            let key = (company_id, record.id.clone());
-            if let Some(&existing) = inner.mutation_versions.get(&key) {
-                versions.push((record.id, existing));
-                continue;
-            }
-            let next = inner.counters.entry(company_id).or_insert(0);
-            *next += 1;
-            let version = *next;
-            inner.mutation_versions.insert(key, version);
-            versions.push((record.id.clone(), version));
-            inner
-                .mutations
-                .entry(company_id)
-                .or_default()
-                .push(StoredMutation {
-                    record,
-                    version,
-                    acknowledged: false,
-                });
-        }
-        Ok(versions)
+        Ok(inner.append_mutations(company_id, mutations))
     }
 
     async fn pull_mutations(
@@ -617,18 +632,45 @@ impl Store for MemStore {
             response["number"] = json!(number);
         }
 
-        inner.documents.insert(doc_key, document);
-        inner
-            .gl_entries
-            .entry(company)
-            .or_default()
-            .extend(commit.gl_entries);
+        inner.documents.insert(doc_key, document.clone());
         let seq = inner.sle_seq.entry(company).or_insert(0);
         let mut sequenced = commit.stock_ledger_entries;
         for sle in &mut sequenced {
             *seq += 1;
             sle.seq = *seq;
         }
+        let mut outstanding_docs = Vec::new();
+        for (doctype, id, outstanding) in &commit.outstanding_updates {
+            if let Some(doc) = inner
+                .documents
+                .get_mut(&(company, doctype.clone(), id.clone()))
+            {
+                if let Some(payload) = doc.payload.as_object_mut() {
+                    payload.insert("outstanding_amount".into(), json!(outstanding));
+                }
+                outstanding_docs.push(doc.clone());
+            }
+        }
+        // Replicate the posted results onto the company mutation log inside
+        // this same mutex hold, so every device's normal sync pull receives
+        // the official state. Deterministic ids + the log's idempotency on id
+        // make retries and replays harmless.
+        let records = replication_mutations(&ReplicationSources {
+            document: &document,
+            is_cancel: commit.batch.kind == "cancel",
+            gl_entries: &commit.gl_entries,
+            stock_ledger_entries: &sequenced,
+            settlements: &commit.settlements,
+            bins: &commit.bins,
+            outstanding_documents: &outstanding_docs,
+            user_id: commit.audit.user_id,
+        })?;
+        inner.append_mutations(company, records);
+        inner
+            .gl_entries
+            .entry(company)
+            .or_default()
+            .extend(commit.gl_entries);
         inner
             .stock_ledger
             .entry(company)
@@ -643,13 +685,6 @@ impl Store for MemStore {
             inner
                 .bins
                 .insert((company, bin.item.clone(), bin.warehouse.clone()), bin);
-        }
-        for (doctype, id, outstanding) in commit.outstanding_updates {
-            if let Some(doc) = inner.documents.get_mut(&(company, doctype, id)) {
-                if let Some(payload) = doc.payload.as_object_mut() {
-                    payload.insert("outstanding_amount".into(), json!(outstanding));
-                }
-            }
         }
         inner
             .batches

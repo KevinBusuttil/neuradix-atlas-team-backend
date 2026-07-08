@@ -155,6 +155,15 @@ into a linked `PB-{id}-reversal` batch and sets docstatus 2. Official (posted)
 documents are immutable on the sync plane: `sync/push` rejects any mutation
 targeting them with 409.
 
+Posted results also **replicate to client devices through the mutation log**:
+the same atomic commit appends system-authored mutations (device id
+`atlas-backend`, deterministic `postmut-…` ids, log-idempotent) for the
+document (`submitDocument`/`cancelDocument`), every GL / stock ledger /
+settlement row, every touched bin, and each referenced invoice's
+outstanding-amount update — in the Dart sync engine's row-envelope wire shape
+(`src/posting/replication.rs`), so a normal `GET …/sync/pull` delivers the
+official state to every device (`tests/posting_replication.rs`).
+
 ### ROADMAP_V2 §6 — [P3] acceptance criteria coverage
 
 | # | Criterion ([P3]) | Endpoint(s) | Test |
@@ -195,7 +204,7 @@ POS session close in Phase 6.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 34 tests over MemStore (unit + API + fixtures + posting); no DB required
+cargo test          # 38 tests over MemStore (unit + API + fixtures + posting + replication); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx

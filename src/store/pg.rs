@@ -15,6 +15,7 @@ use crate::posting::model::{
     format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit,
     Settlement, StockLedgerEntry,
 };
+use crate::posting::replication::{replication_mutations, ReplicationSources};
 
 use super::{Store, StoreError};
 
@@ -92,6 +93,67 @@ fn settlement_from_row(row: &PgRow) -> Result<Settlement, StoreError> {
         is_reversal: row.try_get("is_reversal")?,
         batch_id: row.try_get("batch_id")?,
     })
+}
+
+/// Appends to the company mutation log with the same idempotent, monotonic
+/// version assignment as `push_mutations`, over the caller's connection —
+/// so `posting_commit` can append inside its own transaction (and advisory
+/// lock). A record whose id was already logged keeps its original version and
+/// is not re-inserted. Returns `(id, version)` pairs in input order.
+async fn append_mutations(
+    conn: &mut sqlx::PgConnection,
+    company_id: Uuid,
+    mutations: Vec<MutationRecord>,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    // Per-company counter row, locked for the duration of the append so
+    // concurrent pushes serialize and versions stay gap-free-monotonic.
+    sqlx::query(
+        "insert into sync_counters (company_id, last_version) values ($1, 0) \
+         on conflict (company_id) do nothing",
+    )
+    .bind(company_id)
+    .execute(&mut *conn)
+    .await?;
+    let row =
+        sqlx::query("select last_version from sync_counters where company_id = $1 for update")
+            .bind(company_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let mut last: i64 = row.try_get("last_version")?;
+
+    let mut versions = Vec::with_capacity(mutations.len());
+    for record in mutations {
+        let existing = sqlx::query(
+            "select sync_version from mutations where company_id = $1 and mutation_id = $2",
+        )
+        .bind(company_id)
+        .bind(&record.id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(row) = existing {
+            versions.push((record.id, row.try_get("sync_version")?));
+            continue;
+        }
+        last += 1;
+        let json = serde_json::to_value(&record)?;
+        sqlx::query(
+            "insert into mutations (company_id, mutation_id, sync_version, record) \
+             values ($1, $2, $3, $4)",
+        )
+        .bind(company_id)
+        .bind(&record.id)
+        .bind(last)
+        .bind(json)
+        .execute(&mut *conn)
+        .await?;
+        versions.push((record.id, last));
+    }
+    sqlx::query("update sync_counters set last_version = $2 where company_id = $1")
+        .bind(company_id)
+        .bind(last)
+        .execute(&mut *conn)
+        .await?;
+    Ok(versions)
 }
 
 fn document_from_row(row: &PgRow) -> Result<PostedDocument, StoreError> {
@@ -302,54 +364,7 @@ impl Store for PgStore {
         mutations: Vec<MutationRecord>,
     ) -> Result<Vec<(String, i64)>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        // Per-company counter row, locked for the duration of the push so
-        // concurrent pushes serialize and versions stay gap-free-monotonic.
-        sqlx::query(
-            "insert into sync_counters (company_id, last_version) values ($1, 0) \
-             on conflict (company_id) do nothing",
-        )
-        .bind(company_id)
-        .execute(&mut *tx)
-        .await?;
-        let row =
-            sqlx::query("select last_version from sync_counters where company_id = $1 for update")
-                .bind(company_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let mut last: i64 = row.try_get("last_version")?;
-
-        let mut versions = Vec::with_capacity(mutations.len());
-        for record in mutations {
-            let existing = sqlx::query(
-                "select sync_version from mutations where company_id = $1 and mutation_id = $2",
-            )
-            .bind(company_id)
-            .bind(&record.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(row) = existing {
-                versions.push((record.id, row.try_get("sync_version")?));
-                continue;
-            }
-            last += 1;
-            let json = serde_json::to_value(&record)?;
-            sqlx::query(
-                "insert into mutations (company_id, mutation_id, sync_version, record) \
-                 values ($1, $2, $3, $4)",
-            )
-            .bind(company_id)
-            .bind(&record.id)
-            .bind(last)
-            .bind(json)
-            .execute(&mut *tx)
-            .await?;
-            versions.push((record.id, last));
-        }
-        sqlx::query("update sync_counters set last_version = $2 where company_id = $1")
-            .bind(company_id)
-            .bind(last)
-            .execute(&mut *tx)
-            .await?;
+        let versions = append_mutations(&mut tx, company_id, mutations).await?;
         tx.commit().await?;
         Ok(versions)
     }
@@ -925,6 +940,39 @@ impl Store for PgStore {
             .execute(&mut *tx)
             .await?;
         }
+
+        // Replicate the posted results onto the company mutation log inside
+        // this same transaction (under the same advisory lock), so every
+        // device's normal sync pull receives the official state.
+        // Deterministic ids + the log's idempotency on id make retries and
+        // replays harmless. The referenced invoices are re-read so the
+        // replicated payloads carry the just-maintained outstanding amounts.
+        let mut outstanding_docs = Vec::new();
+        for (doctype, id, _) in &commit.outstanding_updates {
+            let row = sqlx::query(
+                "select company_id, doctype, id, payload, docstatus, official_number, created_at \
+                 from documents where company_id = $1 and doctype = $2 and id = $3",
+            )
+            .bind(company)
+            .bind(doctype)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = row {
+                outstanding_docs.push(document_from_row(&row)?);
+            }
+        }
+        let records = replication_mutations(&ReplicationSources {
+            document: &document,
+            is_cancel: commit.batch.kind == "cancel",
+            gl_entries: &commit.gl_entries,
+            stock_ledger_entries: &commit.stock_ledger_entries,
+            settlements: &commit.settlements,
+            bins: &commit.bins,
+            outstanding_documents: &outstanding_docs,
+            user_id: commit.audit.user_id,
+        })?;
+        append_mutations(&mut tx, company, records).await?;
 
         sqlx::query(
             "insert into posting_batches \
