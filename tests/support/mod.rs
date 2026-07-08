@@ -34,8 +34,14 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn new() -> Self {
+        Self::with_stripe_secret(None).await
+    }
+
+    /// A TestApp whose Stripe webhook secret is configured explicitly
+    /// (`None` = unset, the webhook endpoint fails closed).
+    pub async fn with_stripe_secret(secret: Option<&str>) -> Self {
         let store = Arc::new(MemStore::new());
-        let router = atlas_team_backend::router(store.clone());
+        let router = atlas_team_backend::router_with(store.clone(), secret.map(str::to_string));
         let mut app = Self {
             router,
             store,

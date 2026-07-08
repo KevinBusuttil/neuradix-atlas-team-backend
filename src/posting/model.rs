@@ -240,6 +240,9 @@ pub struct PostingCommit {
     /// based on; a mismatch at commit time means a concurrent posting touched
     /// the pair.
     pub sle_expectations: Vec<(String, String, usize)>,
+    /// Device id for the mutations this commit replicates onto the company
+    /// log; `None` → [`crate::posting::replication::SYSTEM_DEVICE_ID`].
+    pub replication_device_id: Option<&'static str>,
     pub audit: AuditEntry,
     /// Command response; the store stamps `number` after allocation and
     /// persists it under the idempotency key so replays return it verbatim.

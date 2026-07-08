@@ -27,20 +27,24 @@
 //! minimal server-rendered page (inline styles, no external assets, every
 //! interpolated value HTML-escaped); JSON is the default.
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::auth::{generate_token, hash_token, require_membership, require_role, AuthContext};
 use crate::error::ApiError;
-use crate::model::{AuditEntry, PayLink, Role};
+use crate::model::{AuditEntry, PayLink, Role, WebhookEvent, WebhookKind};
 use crate::portal::html_escape;
+use crate::posting::engine::{submit_document as engine_submit, Actor, SubmitCommand};
 use crate::posting::values::as_num;
 use crate::AppState;
 
@@ -52,6 +56,14 @@ pub const PAID_EPSILON: f64 = 0.005;
 const SALES_INVOICE: &str = "Sales Invoice";
 /// Roles that may manage pay links.
 const LINK_ROLES: [Role; 4] = [Role::Owner, Role::Admin, Role::Sales, Role::Accountant];
+/// Device id stamped on the mutations a webhook-posted Payment Entry
+/// replicates onto the company log — the payments plane's system authorship,
+/// alongside `atlas-backend` (posting replication) and `atlas-portal`
+/// (portal quote decisions).
+pub const PAYMENTS_DEVICE_ID: &str = "atlas-payments";
+/// Maximum Stripe-Signature timestamp skew (Stripe's own recommended
+/// tolerance): staler events are rejected as possible replays.
+const MAX_SIGNATURE_SKEW_SECONDS: i64 = 300;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -64,6 +76,10 @@ pub fn routes() -> Router<AppState> {
             delete(revoke_link),
         )
         .route("/pay/{token}", get(pay_page))
+        // Signature-verified Stripe processing; the path is frozen under the
+        // /webhooks/... surface (domain doc §9) and takes precedence over the
+        // generic log-only /webhooks/payments/{provider} intake route.
+        .route("/webhooks/payments/stripe", post(stripe_webhook))
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +404,274 @@ async fn pay_page(
         "payment_instructions": instructions,
     }))
     .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Stripe webhook processing (POST /webhooks/payments/stripe)
+// ---------------------------------------------------------------------------
+
+/// Event types that carry a completed checkout with `client_reference_id` +
+/// `amount_total` in `data.object`.
+const CHECKOUT_EVENT_TYPES: [&str; 2] = ["checkout.session.completed", "payment_link.completed"];
+
+/// Verifies a `Stripe-Signature: t=...,v1=...` header: `v1` is the
+/// hex-encoded HMAC-SHA256 of `{t}.{raw body}` under the webhook secret.
+/// Comparison is constant-time ([`Mac::verify_slice`]); timestamps more than
+/// [`MAX_SIGNATURE_SKEW_SECONDS`] from `now` are rejected as stale.
+fn verify_stripe_signature(
+    secret: &str,
+    header: &str,
+    body: &[u8],
+    now: i64,
+) -> Result<(), ApiError> {
+    let mut timestamp: Option<i64> = None;
+    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    for part in header.split(',') {
+        match part.trim().split_once('=') {
+            Some(("t", value)) => timestamp = value.trim().parse().ok(),
+            Some(("v1", value)) => {
+                if let Ok(signature) = hex::decode(value.trim()) {
+                    candidates.push(signature);
+                }
+            }
+            _ => {}
+        }
+    }
+    let t = timestamp.ok_or_else(|| {
+        ApiError::BadRequest("malformed Stripe-Signature header: missing timestamp".into())
+    })?;
+    if (now - t).abs() > MAX_SIGNATURE_SKEW_SECONDS {
+        return Err(ApiError::BadRequest(
+            "stale Stripe-Signature timestamp".into(),
+        ));
+    }
+    for candidate in &candidates {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(t.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        if mac.verify_slice(candidate).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(ApiError::BadRequest("invalid webhook signature".into()))
+}
+
+/// A 200 the provider will not retry, explaining why nothing was posted.
+fn unhandled(reason: &str) -> Json<Value> {
+    Json(json!({ "handled": false, "reason": reason }))
+}
+
+/// Signature-verified Stripe webhook processing. Every delivery is
+/// intake-logged first (`webhook_events` stays the durable inbox); with no
+/// configured secret the endpoint fails **closed** (503, nothing processed).
+/// A verified `checkout.session.completed` resolves its `client_reference_id`
+/// pay token to a company + invoice and posts an official Payment Entry
+/// through the posting engine — settlement, outstanding maintenance, gap-free
+/// numbering and device replication all come from the same
+/// `Store::posting_commit` path the command API uses. Idempotency key
+/// `stripe-{event id}` makes event redeliveries replays, never double
+/// postings. Business-level rejections (unknown/expired token, missing
+/// invoice, already-paid invoice) are 200 `handled:false` so Stripe does not
+/// retry forever; each is audit-logged when a company is attributable.
+async fn stripe_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    // Durable intake first, exactly like the generic log-only route.
+    state
+        .store
+        .insert_webhook_event(WebhookEvent {
+            id: Uuid::new_v4(),
+            kind: WebhookKind::Payment,
+            provider: "stripe".into(),
+            headers: crate::api::headers_to_json(&headers),
+            body: body.to_vec(),
+            received_at: Utc::now(),
+        })
+        .await?;
+
+    // Fail closed: without a secret nothing can be verified, and unverified
+    // events are never processed.
+    let Some(secret) = state.stripe_webhook_secret.as_deref() else {
+        tracing::error!(
+            "STRIPE_WEBHOOK_SECRET is not configured; refusing to process the Stripe event"
+        );
+        return Err(ApiError::Unavailable(
+            "webhook secret not configured".into(),
+        ));
+    };
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::BadRequest("missing Stripe-Signature header".into()))?;
+    verify_stripe_signature(secret, signature, &body, Utc::now().timestamp())?;
+
+    let event: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("webhook body is not valid JSON".into()))?;
+    let event_type = event["type"].as_str().unwrap_or_default();
+    if !CHECKOUT_EVENT_TYPES.contains(&event_type) {
+        return Ok(unhandled("ignored event type"));
+    }
+    let Some(event_id) = event["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(unhandled("missing event id"));
+    };
+    let object = &event["data"]["object"];
+    let Some(token) = object["client_reference_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(unhandled("missing client_reference_id"));
+    };
+    let Some(amount_cents) = object["amount_total"].as_i64().filter(|cents| *cents > 0) else {
+        return Ok(unhandled("missing or non-positive amount_total"));
+    };
+    let currency = object["currency"].as_str().unwrap_or_default().to_string();
+    let paid_amount = amount_cents as f64 / 100.0;
+
+    // Resolve the pay token. An unknown token has no company to audit
+    // against; expired/revoked ones do.
+    let Some(link) = state.store.pay_link_by_hash(&hash_token(token)).await? else {
+        return Ok(unhandled("unknown payment link"));
+    };
+    let company_id = link.company_id;
+    let webhook_audit = |reason: &str| {
+        json!({
+            "eventId": event_id,
+            "invoiceId": link.invoice_id,
+            "amount": paid_amount,
+            "currency": currency,
+            "reason": reason,
+        })
+    };
+    if link.revoked_at.is_some() || link.expires_at < Utc::now() {
+        let reason = "expired or revoked payment link";
+        audit(
+            &state,
+            company_id,
+            None,
+            "pay.webhook.rejected",
+            webhook_audit(reason),
+        )
+        .await?;
+        return Ok(unhandled(reason));
+    }
+
+    // Only an officially posted, submitted Sales Invoice can take an official
+    // Payment Entry (the engine validates references against posted
+    // documents).
+    let invoice = state
+        .store
+        .posted_document(company_id, SALES_INVOICE, &link.invoice_id)
+        .await?
+        .filter(|doc| doc.docstatus == 1);
+    let Some(invoice) = invoice else {
+        let reason = "invoice is not an officially posted Sales Invoice";
+        audit(
+            &state,
+            company_id,
+            None,
+            "pay.webhook.rejected",
+            webhook_audit(reason),
+        )
+        .await?;
+        return Ok(unhandled(reason));
+    };
+    let outstanding = as_num(invoice.payload.get("outstanding_amount"));
+    let idempotency_key = format!("stripe-{event_id}");
+    // A redelivered event replays through the idempotency key even though the
+    // invoice it settled now reads as paid; only genuinely new events are
+    // rejected on a zero outstanding.
+    let is_replay = state
+        .store
+        .idempotent_response(company_id, &idempotency_key)
+        .await?
+        .is_some();
+    if !is_replay && outstanding < PAID_EPSILON {
+        let reason = "invoice has no outstanding amount";
+        audit(
+            &state,
+            company_id,
+            None,
+            "pay.webhook.rejected",
+            webhook_audit(reason),
+        )
+        .await?;
+        return Ok(unhandled(reason));
+    }
+
+    // Post the official Payment Entry exactly like the command API does; the
+    // posting engine + replication handle settlement, outstanding update and
+    // device replication from here.
+    let mut payload = Map::new();
+    payload.insert("payment_type".into(), json!("Receive"));
+    if let Some(party) = invoice.payload.get("customer").and_then(Value::as_str) {
+        payload.insert("party".into(), json!(party));
+    }
+    payload.insert("paid_amount".into(), json!(paid_amount));
+    if !currency.is_empty() {
+        payload.insert("currency".into(), json!(currency));
+    }
+    if let Some(date) = event["created"]
+        .as_i64()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+    {
+        payload.insert(
+            "posting_date".into(),
+            json!(date.format("%Y-%m-%d").to_string()),
+        );
+    }
+    payload.insert(
+        "references".into(),
+        json!([{
+            "reference_doctype": SALES_INVOICE,
+            "reference_name": link.invoice_id,
+            "allocated_amount": paid_amount.min(outstanding),
+        }]),
+    );
+    let outcome = engine_submit(
+        state.store.as_ref(),
+        company_id,
+        SubmitCommand {
+            doctype: "Payment Entry".into(),
+            document_id: Some(format!("PAY-STRIPE-{event_id}")),
+            payload,
+            items: Vec::new(),
+            idempotency_key: Some(idempotency_key),
+        },
+        Actor::system(PAYMENTS_DEVICE_ID),
+    )
+    .await?;
+
+    audit(
+        &state,
+        company_id,
+        None,
+        "pay.webhook.payment",
+        json!({
+            "eventId": event_id,
+            "invoiceId": link.invoice_id,
+            "documentId": outcome.response["document_id"],
+            "number": outcome.response["number"],
+            "amount": paid_amount,
+            "currency": currency,
+            "replayed": outcome.replayed,
+        }),
+    )
+    .await?;
+    Ok(Json(json!({
+        "handled": true,
+        "document_id": outcome.response["document_id"],
+        "number": outcome.response["number"],
+        "replayed": outcome.replayed,
+    })))
 }
 
 // ---------------------------------------------------------------------------

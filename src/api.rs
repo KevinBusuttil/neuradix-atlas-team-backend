@@ -499,7 +499,7 @@ async fn head_blob(
 // verification and processing are Phase 4)
 // ---------------------------------------------------------------------------
 
-fn headers_to_json(headers: &HeaderMap) -> Value {
+pub(crate) fn headers_to_json(headers: &HeaderMap) -> Value {
     let map: serde_json::Map<String, Value> = headers
         .iter()
         .map(|(name, value)| {
@@ -697,10 +697,7 @@ async fn submit_document(
             items: req.items,
             idempotency_key: req.idempotency_key,
         },
-        Actor {
-            user_id: auth.user_id(),
-            device_id: auth.device_id(),
-        },
+        Actor::user(auth.user_id(), auth.device_id()),
     )
     .await?;
     Ok(Json(outcome.response))
@@ -735,10 +732,7 @@ async fn cancel_document(
             document_id: req.document_id,
             idempotency_key: req.idempotency_key,
         },
-        Actor {
-            user_id: auth.user_id(),
-            device_id: auth.device_id(),
-        },
+        Actor::user(auth.user_id(), auth.device_id()),
     )
     .await?;
     Ok(Json(outcome.response))

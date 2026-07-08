@@ -24,6 +24,9 @@ services:
       DATABASE_URL: postgres://atlas:${POSTGRES_PASSWORD:-atlas}@postgres:5432/atlas
       PORT: "8080"
       RUST_LOG: info
+      # Stripe webhook signing secret; unset = the Stripe webhook endpoint
+      # fails closed (503) and only intake-logs deliveries.
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     ports:
       - "8080:8080"
     depends_on:

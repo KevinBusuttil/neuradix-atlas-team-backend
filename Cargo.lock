@@ -52,6 +52,7 @@ dependencies = [
  "axum",
  "chrono",
  "hex",
+ "hmac",
  "http-body-util",
  "rand 0.9.4",
  "serde",

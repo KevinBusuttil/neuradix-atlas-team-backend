@@ -26,9 +26,26 @@ use store::Store;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn Store>,
+    /// Stripe webhook signing secret (env `STRIPE_WEBHOOK_SECRET`, read once
+    /// at startup). `None` makes the Stripe webhook endpoint fail **closed**:
+    /// events are intake-logged but never processed (503).
+    pub stripe_webhook_secret: Option<String>,
 }
 
-/// Build the full application router over any [`Store`].
+/// Build the full application router over any [`Store`], reading the Stripe
+/// webhook secret from the `STRIPE_WEBHOOK_SECRET` environment variable.
 pub fn router(store: Arc<dyn Store>) -> axum::Router {
-    api::router(AppState { store })
+    let stripe_webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET")
+        .ok()
+        .filter(|secret| !secret.trim().is_empty());
+    router_with(store, stripe_webhook_secret)
+}
+
+/// Build the router with an explicit Stripe webhook secret (tests; embedders
+/// that manage configuration themselves).
+pub fn router_with(store: Arc<dyn Store>, stripe_webhook_secret: Option<String>) -> axum::Router {
+    api::router(AppState {
+        store,
+        stripe_webhook_secret,
+    })
 }

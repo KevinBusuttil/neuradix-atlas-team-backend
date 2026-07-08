@@ -56,8 +56,39 @@ impl From<StoreError> for PostingError {
 /// Who is acting, for the audit row written inside the commit.
 #[derive(Debug, Clone, Copy)]
 pub struct Actor {
-    pub user_id: Uuid,
+    /// The acting user. `None` is the **system actor** — commands issued by
+    /// the backend itself (the Stripe webhook processor), with no user behind
+    /// them; audit rows carry a null user, matching how replication-authored
+    /// mutations carry an empty user id.
+    pub user_id: Option<Uuid>,
     pub device_id: Option<Uuid>,
+    /// Device id stamped on the mutations this commit replicates onto the
+    /// company log; `None` means the default
+    /// [`crate::posting::replication::SYSTEM_DEVICE_ID`]. System actors set
+    /// their own (e.g. `atlas-payments`) so the provenance of a posting is
+    /// visible in the log.
+    pub replication_device_id: Option<&'static str>,
+}
+
+impl Actor {
+    /// A user acting through the command API.
+    pub fn user(user_id: Uuid, device_id: Option<Uuid>) -> Self {
+        Self {
+            user_id: Some(user_id),
+            device_id,
+            replication_device_id: None,
+        }
+    }
+
+    /// A backend system actor: no user, no device, mutations replicated
+    /// under the given device id.
+    pub fn system(replication_device_id: &'static str) -> Self {
+        Self {
+            user_id: None,
+            device_id: None,
+            replication_device_id: Some(replication_device_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +316,7 @@ async fn build_submit(
         bins,
         outstanding_updates,
         sle_expectations: ledgers.expectations(),
+        replication_device_id: actor.replication_device_id,
         audit: audit_row(
             company_id,
             actor,
@@ -422,6 +454,7 @@ async fn build_cancel(
         bins,
         outstanding_updates,
         sle_expectations: ledgers.expectations(),
+        replication_device_id: actor.replication_device_id,
         audit: audit_row(
             company_id,
             actor,
@@ -1299,7 +1332,7 @@ fn audit_row(company_id: Uuid, actor: Actor, action: &str, detail: Value) -> Aud
     AuditEntry {
         id: Uuid::new_v4(),
         company_id,
-        user_id: Some(actor.user_id),
+        user_id: actor.user_id,
         device_id: actor.device_id,
         action: action.to_string(),
         detail,

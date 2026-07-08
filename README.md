@@ -19,9 +19,10 @@ Design references (in the `mercantis.hub.flutter` repo):
 - `docs/STOCK_COGS_IMPLEMENTATION_PLAN.md` — §2 target accounting behaviour,
   §4 Track B (this engine), §5 the shared fixture suite.
 
-**Not in this service yet:** webhook signature verification and processing
-(Phase 4; intake here is log-only), POS session close, and the client
-preview-vs-official flow (client-side work).
+**Not in this service yet:** webhook verification/processing for providers
+other than Stripe (their intake is log-only), POS session close, and the
+client preview-vs-official flow (client-side work). Stripe payment webhooks
+are verified and posted officially — see the Payments section.
 
 ## Architecture notes
 
@@ -99,8 +100,9 @@ missing or unknown).
 | POST | `/companies/{id}/sync/ack` | **device token** | `{ids: […]}` → `{acknowledged: n}` |
 | PUT | `/companies/{id}/blobs/{sha256}` | member | Raw bytes body; 201, or **422** if the body's SHA-256 ≠ path |
 | GET / HEAD | `/companies/{id}/blobs/{sha256}` | member | Bytes / existence; 404 when absent |
-| POST | `/webhooks/payments/{provider}` | none (Phase 4 verifies signatures) | Logs raw headers+body to `webhook_events` → `{"logged": true}` |
-| POST | `/webhooks/channels/{connector}` | none (Phase 4 verifies signatures) | Same, `kind = channel` |
+| POST | `/webhooks/payments/{provider}` | none | Logs raw headers+body to `webhook_events` → `{"logged": true}`. `provider = stripe` routes to the signature-verified processor below instead |
+| POST | `/webhooks/payments/stripe` | Stripe signature | Verified intake + official Payment Entry posting (Payments section) |
+| POST | `/webhooks/channels/{connector}` | none (verification is later work) | Same log-only intake, `kind = channel` |
 | GET | `/companies/{id}/audit?limit=n` | **owner, admin or accountant** | Recent audit rows (newest first) |
 | GET / PUT | `/companies/{id}/settings` | member / **owner, admin or accountant** | Company posting settings (merge-patch): `allow_negative_stock`, `books_lock_date`, default posting accounts |
 | POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, *_account overrides}` |
@@ -297,12 +299,57 @@ egress. When `stripe_payment_link_url` is unset the page renders the company's
 `payment_instructions` settings text (bank transfer details etc., also
 whitelisted) instead.
 
+### Stripe webhook processing (`POST /webhooks/payments/stripe`)
+
+The webhook path is frozen under the `/webhooks/...` surface on
+`connect.atlas.neuradix.app` (domain doc §9) — provider registrations never
+change. Every delivery is intake-logged to `webhook_events` first (the durable
+inbox), then:
+
+- **Signature verification** per Stripe's scheme: the
+  `Stripe-Signature: t=...,v1=...` header, where `v1` is the HMAC-SHA256 of
+  `{t}.{raw body}` under the signing secret from the **`STRIPE_WEBHOOK_SECRET`
+  environment variable** (read once at startup). Comparison is constant-time;
+  timestamps skewed more than 5 minutes are rejected with 400. With the
+  variable unset the endpoint **fails closed**: 503 `webhook secret not
+  configured`, logged, and no event is ever processed unverified.
+- **`checkout.session.completed`** (and `payment_link.completed`-style
+  payloads with the same fields): `data.object.client_reference_id` is the pay
+  token, resolved to company + invoice; `amount_total` (cents) becomes
+  `paid_amount`. The handler posts an **official Payment Entry** through the
+  same posting engine as the command API — document id
+  `PAY-STRIPE-{event id}`, `payment_type: Receive`, party = the invoice's
+  customer, one reference allocating `min(paid, outstanding)` against the
+  invoice — so settlement, outstanding maintenance, gap-free `PAY-…` numbering
+  and device replication all come from the one `posting_commit` path; nothing
+  is duplicated. Idempotency key `stripe-{event id}` makes Stripe redeliveries
+  **replays**: the original response returns, nothing posts twice, no number
+  is burnt.
+- The posting is authored by the **payments system actor**: audit rows carry a
+  null user (like portal-authored actions), and the replicated mutations carry
+  device id **`atlas-payments`** (`src/pay.rs::PAYMENTS_DEVICE_ID`), alongside
+  `atlas-backend` (posting replication) and `atlas-portal` (portal decisions).
+- Business-level rejections — unknown/expired/revoked token, an invoice that
+  is not an officially posted Sales Invoice, or zero outstanding — return
+  **200 `{"handled": false, "reason": ...}`** so Stripe does not retry
+  forever; the intake log row is kept and an audit row
+  (`pay.webhook.rejected`) is written whenever a company is attributable.
+  Other event types are logged and answered `handled: false` too.
+
+**Why no outbound HTTP:** the whole payment loop is webhook-driven — the
+backend publishes a static Payment Link URL and consumes signed callbacks. No
+Stripe API key is stored, no egress is required (the deployment can keep a
+deny-all outbound policy), there is no retry/timeout state against a third
+party, and the only secret is the webhook signing secret, whose compromise
+cannot move money — a forged event can at worst mark an invoice paid, and the
+signature + idempotency + outstanding guards bound even that.
+
 ## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 49 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 52 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx

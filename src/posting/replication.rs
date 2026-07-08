@@ -47,6 +47,10 @@ pub struct ReplicationSources<'a> {
     pub outstanding_documents: &'a [PostedDocument],
     /// The acting user (from the commit's audit row).
     pub user_id: Option<Uuid>,
+    /// Device id stamped on the replicated mutations ([`SYSTEM_DEVICE_ID`]
+    /// unless the commit came from a system actor with its own, e.g. the
+    /// payments webhook's `atlas-payments`).
+    pub device_id: &'a str,
 }
 
 /// Renders one posting commit as the mutation records to append to the
@@ -72,7 +76,7 @@ pub fn replication_mutations(
         doc_type: doc_type.to_string(),
         document_id: document_id.to_string(),
         payload,
-        device_id: SYSTEM_DEVICE_ID.to_string(),
+        device_id: src.device_id.to_string(),
         user_id: user_id.clone(),
         local_timestamp: now_ms,
         sync_version: None,

@@ -486,12 +486,14 @@ async fn blob_put_get_head_roundtrip_and_hash_check() {
 
 #[tokio::test]
 async fn webhooks_are_logged_without_auth() {
+    // The generic intake routes stay log-only; `/webhooks/payments/stripe`
+    // is now the signature-verified processing endpoint (tests/payments.rs).
     let app = App::new();
     let payload = json!({ "type": "payment_intent.succeeded", "id": "pi_123" });
     let (status, body) = app
         .json(
             Method::POST,
-            "/webhooks/payments/stripe",
+            "/webhooks/payments/paypal",
             None,
             payload.clone(),
         )
@@ -512,7 +514,7 @@ async fn webhooks_are_logged_without_auth() {
     let events = app.store.webhook_events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].kind.as_str(), "payment");
-    assert_eq!(events[0].provider, "stripe");
+    assert_eq!(events[0].provider, "paypal");
     let stored: Value = serde_json::from_slice(&events[0].body).unwrap();
     assert_eq!(stored, payload);
     assert_eq!(events[0].headers["content-type"], json!("application/json"));

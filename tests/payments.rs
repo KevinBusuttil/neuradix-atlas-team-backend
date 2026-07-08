@@ -17,7 +17,8 @@ use uuid::Uuid;
 use atlas_team_backend::auth::{generate_token, hash_token};
 use atlas_team_backend::model::PayLink;
 use atlas_team_backend::store::Store;
-use support::TestApp;
+use hmac::{Hmac, Mac};
+use support::{approx, TestApp};
 
 /// A raw request with optional Accept header; returns status/headers/bytes.
 async fn raw(
@@ -377,4 +378,271 @@ async fn pay_page_renders_json_and_escaped_html_with_payment_handoff() {
     );
     assert!(!html.contains("Pay by card"));
     assert!(!html.contains("Awaiting payment"));
+}
+
+// ---------------------------------------------------------------------------
+// Stripe webhook processing
+// ---------------------------------------------------------------------------
+
+const WEBHOOK_SECRET: &str = "whsec_test_secret";
+
+/// Signs a body the way Stripe does: `v1` = HMAC-SHA256 over `{t}.{body}`.
+fn stripe_signature(secret: &str, t: i64, body: &str) -> String {
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{t}.{body}").as_bytes());
+    format!("t={t},v1={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+async fn post_webhook(app: &TestApp, body: &str, signature: Option<&str>) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/webhooks/payments/stripe")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(signature) = signature {
+        builder = builder.header("stripe-signature", signature);
+    }
+    let request = builder.body(Body::from(body.to_string())).unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+fn checkout_event(event_id: &str, token: &str, amount_cents: i64) -> String {
+    json!({
+        "id": event_id,
+        "type": "checkout.session.completed",
+        "created": Utc::now().timestamp(),
+        "data": { "object": {
+            "client_reference_id": token,
+            "amount_total": amount_cents,
+            "currency": "eur"
+        }}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn webhook_without_configured_secret_fails_closed() {
+    // No STRIPE_WEBHOOK_SECRET: verification is required to fail closed.
+    let app = TestApp::new().await;
+    let body = checkout_event("evt_nosecret", "sometoken", 1000);
+    let signature = stripe_signature("whsec_anything", Utc::now().timestamp(), &body);
+    let (status, response) = post_webhook(&app, &body, Some(&signature)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(
+        response["error"],
+        json!("webhook secret not configured"),
+        "{response}"
+    );
+    // The intake log still recorded the delivery.
+    assert_eq!(app.store.webhook_events().len(), 1);
+}
+
+#[tokio::test]
+async fn webhook_rejects_bad_signatures_and_stale_timestamps() {
+    let app = TestApp::with_stripe_secret(Some(WEBHOOK_SECRET)).await;
+    let body = checkout_event("evt_sig", "sometoken", 1000);
+    let now = Utc::now().timestamp();
+
+    // Missing header.
+    let (status, response) = post_webhook(&app, &body, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+
+    // Garbage v1.
+    let (status, response) = post_webhook(&app, &body, Some(&format!("t={now},v1=deadbeef"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+
+    // Signed with the wrong secret.
+    let wrong = stripe_signature("whsec_other", now, &body);
+    let (status, _) = post_webhook(&app, &body, Some(&wrong)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Valid signature over a *different* body (tampering).
+    let other = stripe_signature(WEBHOOK_SECRET, now, "{}");
+    let (status, _) = post_webhook(&app, &body, Some(&other)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Correctly signed but stale (> 5 minutes skew).
+    let stale = stripe_signature(WEBHOOK_SECRET, now - 4000, &body);
+    let (status, response) = post_webhook(&app, &body, Some(&stale)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert!(
+        response["error"].as_str().unwrap().contains("stale"),
+        "{response}"
+    );
+
+    // A valid signature passes the gate; the unknown token is then a
+    // handled:false 200, never a retry-provoking error.
+    let valid = stripe_signature(WEBHOOK_SECRET, now, &body);
+    let (status, response) = post_webhook(&app, &body, Some(&valid)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["handled"], json!(false));
+    assert_eq!(response["reason"], json!("unknown payment link"));
+
+    // Unhandled event types stay log-only.
+    let other_type = json!({
+        "id": "evt_other",
+        "type": "invoice.finalized",
+        "data": { "object": {} }
+    })
+    .to_string();
+    let signature = stripe_signature(WEBHOOK_SECRET, now, &other_type);
+    let (status, response) = post_webhook(&app, &other_type, Some(&signature)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["handled"], json!(false));
+
+    // Nothing was ever posted.
+    assert_eq!(app.store.all_gl_entries(app.company_uuid()).len(), 0);
+}
+
+#[tokio::test]
+async fn webhook_posts_official_payment_entry_and_replays_idempotently() {
+    let mut app = TestApp::with_stripe_secret(Some(WEBHOOK_SECRET)).await;
+    submit_invoice(&mut app, "SINV-W1", "CUST-1", 150.0).await;
+    let (_, token) = create_pay_link(&app, "SINV-W1").await;
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-W1").unwrap(),
+        150.0
+    ));
+
+    // Happy path: checkout.session.completed for the full amount.
+    let body = checkout_event("evt_W1", &token, 15000);
+    let signature = stripe_signature(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let (status, response) = post_webhook(&app, &body, Some(&signature)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["handled"], json!(true));
+    assert_eq!(response["document_id"], json!("PAY-STRIPE-evt_W1"));
+    assert_eq!(response["number"], json!("PAY-00001"));
+    assert_eq!(response["replayed"], json!(false));
+
+    // The engine settled the invoice: outstanding dropped, the settlement
+    // exists, the official number was allocated.
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-W1").unwrap(),
+        0.0
+    ));
+    assert_eq!(app.settlement_count("PAY-STRIPE-evt_W1"), 1);
+    let payment = app
+        .store
+        .document(app.company_uuid(), "Payment Entry", "PAY-STRIPE-evt_W1")
+        .expect("payment entry not posted");
+    assert_eq!(payment.docstatus, 1);
+    assert_eq!(payment.official_number.as_deref(), Some("PAY-00001"));
+    assert_eq!(payment.payload["payment_type"], json!("Receive"));
+    assert_eq!(payment.payload["party"], json!("CUST-1"));
+    assert_eq!(payment.payload["paid_amount"], json!(150.0));
+
+    // The posting replicated to the mutation log under the payments device.
+    let device = app.device_token("owner").await;
+    let (status, pulled) = app
+        .request(
+            Method::GET,
+            &format!("/companies/{}/sync/pull?after=0", app.company_id),
+            Some(&device),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let mutations = pulled["mutations"].as_array().unwrap();
+    let doc_mutation = mutations
+        .iter()
+        .find(|m| m["id"] == json!("postmut-PAY-STRIPE-evt_W1-doc"))
+        .expect("payment document mutation missing");
+    assert_eq!(doc_mutation["deviceId"], json!("atlas-payments"));
+    assert_eq!(doc_mutation["type"], json!("submitDocument"));
+    assert!(
+        mutations.iter().any(
+            |m| m["docType"] == json!("Settlement") && m["deviceId"] == json!("atlas-payments")
+        ),
+        "settlement mutation missing"
+    );
+    // The invoice submitted through the command API still replicates under
+    // the default backend device id.
+    assert!(mutations
+        .iter()
+        .any(|m| m["deviceId"] == json!("atlas-backend")));
+    let mutation_count = mutations.len();
+
+    // Redelivery of the same event id replays: nothing double-posts.
+    let signature = stripe_signature(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let (status, response) = post_webhook(&app, &body, Some(&signature)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["handled"], json!(true));
+    assert_eq!(response["number"], json!("PAY-00001"));
+    assert_eq!(response["replayed"], json!(true));
+    assert_eq!(app.settlement_count("PAY-STRIPE-evt_W1"), 1);
+    assert_eq!(app.gl_count("PAY-STRIPE-evt_W1"), 2);
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-W1").unwrap(),
+        0.0
+    ));
+    let (_, pulled) = app
+        .request(
+            Method::GET,
+            &format!("/companies/{}/sync/pull?after=0", app.company_id),
+            Some(&device),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        pulled["mutations"].as_array().unwrap().len(),
+        mutation_count,
+        "replay appended mutations"
+    );
+
+    // A *new* event against the now-settled invoice is refused politely.
+    let body = checkout_event("evt_W2", &token, 15000);
+    let signature = stripe_signature(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let (status, response) = post_webhook(&app, &body, Some(&signature)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["handled"], json!(false));
+    assert_eq!(
+        response["reason"],
+        json!("invoice has no outstanding amount")
+    );
+
+    // The replay burnt no number: the next payment takes PAY-00002.
+    submit_invoice(&mut app, "SINV-W3", "CUST-2", 80.0).await;
+    let (_, token3) = create_pay_link(&app, "SINV-W3").await;
+    let body = checkout_event("evt_W3", &token3, 8000);
+    let signature = stripe_signature(WEBHOOK_SECRET, Utc::now().timestamp(), &body);
+    let (status, response) = post_webhook(&app, &body, Some(&signature)).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["number"], json!("PAY-00002"));
+
+    // Audit trail: the processed payments and the rejected redelivery.
+    let (status, audit) = app
+        .request(
+            Method::GET,
+            &format!("/companies/{}/audit?limit=200", app.company_id),
+            Some(&app.owner_token.clone()),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = audit["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e["action"] == json!("pay.webhook.payment"))
+            .count(),
+        3, // evt_W1, its replay, evt_W3
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e["action"] == json!("pay.webhook.rejected"))
+            .count(),
+        1, // evt_W2 against the settled invoice
+    );
+    // The system-posted command audit row carries no user (system actor).
+    let posting = entries
+        .iter()
+        .find(|e| {
+            e["action"] == json!("command.submit-document")
+                && e["detail"]["documentId"] == json!("PAY-STRIPE-evt_W1")
+        })
+        .expect("posting audit row missing");
+    assert!(posting["userId"].is_null(), "{posting}");
 }

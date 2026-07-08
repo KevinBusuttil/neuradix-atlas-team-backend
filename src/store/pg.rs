@@ -15,7 +15,7 @@ use crate::posting::model::{
     format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit,
     Settlement, StockLedgerEntry,
 };
-use crate::posting::replication::{replication_mutations, ReplicationSources};
+use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
 
 use super::{Store, StoreError};
@@ -1088,6 +1088,7 @@ impl Store for PgStore {
             bins: &commit.bins,
             outstanding_documents: &outstanding_docs,
             user_id: commit.audit.user_id,
+            device_id: commit.replication_device_id.unwrap_or(SYSTEM_DEVICE_ID),
         })?;
         append_mutations(&mut tx, company, records).await?;
 

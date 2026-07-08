@@ -23,6 +23,10 @@ pub enum ApiError {
     Gone(String),
     #[error("{0}")]
     Unprocessable(String),
+    /// 503 — a required piece of configuration is missing (e.g. the Stripe
+    /// webhook secret); the request may succeed once the operator fixes it.
+    #[error("{0}")]
+    Unavailable(String),
     #[error("internal error")]
     Internal(#[source] anyhow::Error),
 }
@@ -37,6 +41,7 @@ impl ApiError {
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Gone(_) => StatusCode::GONE,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
