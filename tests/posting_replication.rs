@@ -272,6 +272,49 @@ async fn submit_and_cancel_replicate_subledger_rows_in_dart_envelopes() {
 }
 
 #[tokio::test]
+async fn base_stamped_gl_and_party_fields_replicate() {
+    let mut app = TestApp::new().await;
+    app.upsert_item(json!({ "id": "SVC-1", "item_type": "Service" }))
+        .await;
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            json!({
+                "doctype": "Sales Invoice",
+                "document_id": "SINV-FX-R1",
+                "payload": {
+                    "customer": "CUST-1",
+                    "posting_date": "2026-07-01",
+                    "currency": "USD",
+                    "conversion_rate": 0.9
+                },
+                "items": [{ "item": "SVC-1", "qty": 1, "rate": 100 }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "submit failed: {body}");
+
+    let mutations = pull(&mut app, 0).await;
+
+    // GL leg with the Dart `_stampBaseAmounts` fields.
+    let gl = find(&mutations, "postmut-GL-SINV-FX-R1-debit");
+    let fields = envelope_fields(gl);
+    assert!(approx(fields["debit"].as_f64().unwrap(), 100.0));
+    assert!(approx(fields["base_debit"].as_f64().unwrap(), 90.0));
+    assert!(approx(fields["base_credit"].as_f64().unwrap(), 0.0));
+    assert!(approx(fields["conversion_rate"].as_f64().unwrap(), 0.9));
+    assert_eq!(fields["currency"], json!("USD"));
+
+    // Customer Transaction with base_amount + conversion_rate + currency.
+    let ct = find(&mutations, "postmut-CT-SINV-FX-R1");
+    let fields = envelope_fields(ct);
+    assert!(approx(fields["amount"].as_f64().unwrap(), 100.0));
+    assert!(approx(fields["base_amount"].as_f64().unwrap(), 90.0));
+    assert!(approx(fields["conversion_rate"].as_f64().unwrap(), 0.9));
+    assert_eq!(fields["currency"], json!("USD"));
+}
+
+#[tokio::test]
 async fn payment_replicates_supplier_transaction_row() {
     let mut app = TestApp::new().await;
     let (status, body) = app

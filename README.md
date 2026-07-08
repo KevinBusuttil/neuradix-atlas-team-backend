@@ -106,7 +106,7 @@ missing or unknown).
 | GET | `/companies/{id}/audit?limit=n` | **owner, admin or accountant** | Recent audit rows (newest first) |
 | GET / PUT | `/companies/{id}/settings` | member / **owner, admin or accountant** | Company posting settings (merge-patch): `allow_negative_stock`, `books_lock_date`, default posting accounts |
 | POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}` |
-| POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, bins, settlements}` |
+| POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, party_transactions, tax_transactions, bins, settlements}` |
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 
 Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
@@ -260,12 +260,31 @@ UOMs, unregistered items and missing `stock_uom` all default to factor 1.
 Cancellation mirrors the stored (already converted) rows and never
 re-converts. Fixture `0011-uom-conversion.json` pins the behaviour.
 
-Deliberate Phase 3 MVP bounds (deviations from the full Dart engine, all
-flagged in the plan as later refinements): no multi-currency base-amount
-stamping (company-currency postings only), and no receipt↔invoice
-line-linkage variance posting (the two-document flow clears GRNI at matching
-values). POS *session close* remains Phase 6 client-side work — the POS
-Invoice posting itself is supported here.
+### Multi-currency base stamping
+
+Documents may carry `currency` + `conversion_rate` (absent/non-positive ⇒ 1).
+The Dart `_baseStampDocTypes` set applies — Sales Invoice, Purchase Invoice
+and Payment Entry (Journal Entry is not a posted doctype here yet): every
+transaction-currency GL leg is stamped with `conversion_rate`,
+`base_debit`/`base_credit` = amount × rate and `currency`; customer /
+supplier subledger rows get `conversion_rate` + `base_amount`. Base amounts
+are kept at **full precision** (never rounded per leg) so the base ledger
+balances exactly like the transaction ledger. Tax and settlement rows stay in
+transaction currency, and the invoice `outstanding_amount` is maintained in
+transaction currency — both per the Dart engine. Stock valuation stays base
+currency: stock GL legs always carry rate 1 with base == amount, and —
+mirroring the Dart runtime, which does **not** convert incoming valuation —
+a foreign-currency `update_stock` purchase costs its stock at the raw line
+rate (the GRNI split leg is stamped at the document rate, exactly like the
+Dart `_splitGrniFromExpense`). Reversals swap base columns with their
+transaction columns. Fixture `0012-multicurrency-base-stamping.json` pins the
+numbers; `tests/posting_replication.rs` pins the wire fields.
+
+The one remaining deliberate Phase 3 bound (flagged in the plan as a later
+refinement): no receipt↔invoice line-linkage variance posting (the
+two-document flow clears GRNI at matching values). POS *session close*
+remains Phase 6 client-side work — the POS Invoice posting itself is
+supported here.
 
 ## Portal — customer / accountant links
 
@@ -415,7 +434,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 58 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 60 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
@@ -426,5 +445,6 @@ gl_entries, stock_ledger_entries, bins, settlements, posting_batches, items,
 company_settings, idempotency_keys), `0003_portal.sql` for the portal
 (portal_links, the company_documents read model), `0004_payments.sql` for
 the payment plane (pay_links), `0005_subledgers.sql` for the customer /
-supplier / tax subledger rows (party_transactions, tax_transactions) and
-`0006_sle_uom.sql` for the stock ledger's transaction-UOM column.
+supplier / tax subledger rows (party_transactions, tax_transactions),
+`0006_sle_uom.sql` for the stock ledger's transaction-UOM column and
+`0007_base_stamping.sql` for the GL multi-currency base columns.

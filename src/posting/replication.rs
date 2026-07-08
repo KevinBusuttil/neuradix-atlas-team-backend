@@ -125,6 +125,20 @@ pub fn replication_mutations(
         }
         fields.insert("voucher_type".into(), json!(entry.voucher_type));
         fields.insert("voucher_no".into(), json!(entry.voucher_no));
+        // Multi-currency base stamping (the Dart `_stampBaseAmounts` /
+        // `_stockGl` fields), present on stamped vouchers and stock legs.
+        if let Some(currency) = &entry.currency {
+            fields.insert("currency".into(), json!(currency));
+        }
+        if let Some(rate) = entry.conversion_rate {
+            fields.insert("conversion_rate".into(), json!(rate));
+        }
+        if let Some(base_debit) = entry.base_debit {
+            fields.insert("base_debit".into(), json!(base_debit));
+        }
+        if let Some(base_credit) = entry.base_credit {
+            fields.insert("base_credit".into(), json!(base_credit));
+        }
         fields.insert("is_reversal".into(), json!(entry.is_reversal));
         out.push(record(
             format!("postmut-{}", entry.id),

@@ -263,7 +263,13 @@ async fn build_submit(
     };
     let mut gl = derive_monetary_gl(&ctx, &payload);
     let mut sles = derive_stock_rows(&ctx, &payload);
-    let (party_transactions, tax_transactions) = derive_subledger_rows(&ctx, &payload);
+    let (mut party_transactions, tax_transactions) = derive_subledger_rows(&ctx, &payload);
+    // Multi-currency: base-stamp the transaction-currency rows before the
+    // stock GL legs join (those are already base currency, rate 1) — the
+    // Dart `derive()` → `_stockGlLegs` ordering.
+    if is_base_stamped(doctype) {
+        stamp_base_amounts(&mut gl, &mut party_transactions, &payload);
+    }
 
     // Item registry: drop service-item movements before costing (they never
     // touch stock), then cost issues from the authoritative ledger.
@@ -387,6 +393,9 @@ async fn build_cancel(
             id: format!("{}{REVERSAL_SUFFIX}", entry.id),
             debit: entry.credit,
             credit: entry.debit,
+            // Base amounts mirror their transaction columns' swap.
+            base_debit: entry.base_credit,
+            base_credit: entry.base_debit,
             is_reversal: true,
             batch_id: batch_id.clone(),
             ..entry
@@ -552,6 +561,10 @@ impl RowContext<'_> {
             voucher_type: self.doctype.to_string(),
             voucher_no: self.document_id.to_string(),
             posting_date: self.posting_date.to_string(),
+            currency: None,
+            conversion_rate: None,
+            base_debit: None,
+            base_credit: None,
             is_reversal: false,
             batch_id: self.batch_id.to_string(),
         }
@@ -816,6 +829,62 @@ fn tax_legs(ctx: &RowContext<'_>, payload: &Map<String, Value>, is_output: bool)
         ));
     }
     out
+}
+
+/// Vouchers whose monetary rows are denominated in the document's
+/// transaction `currency`, so base-currency amounts get stamped onto them —
+/// the Dart `_baseStampDocTypes` minus Journal Entry (not a posted doctype
+/// here yet). Stock vouchers (POS / Delivery / Receipt / Stock Entry) carry
+/// their cost on SLEs at valuation cost — already base currency — so they
+/// are excluded; their GL legs are emitted after costing with rate 1.
+fn is_base_stamped(doctype: &str) -> bool {
+    matches!(
+        doctype,
+        "Sales Invoice" | "Purchase Invoice" | "Payment Entry"
+    )
+}
+
+/// The document's exchange rate to the company/base currency
+/// (`conversion_rate`), defaulting to 1 when absent or non-positive — so a
+/// same-currency voucher posts base == transaction (Dart `conversionRate`).
+fn conversion_rate_of(payload: &Map<String, Value>) -> f64 {
+    let rate = as_num(payload.get("conversion_rate"));
+    if rate > 0.0 {
+        rate
+    } else {
+        1.0
+    }
+}
+
+/// Stamps base-currency amounts onto a base-stamped voucher's
+/// transaction-currency rows (the Dart `_stampBaseAmounts`): GL legs get
+/// `conversion_rate` + `base_debit`/`base_credit` + `currency`; customer /
+/// supplier subledger rows get `conversion_rate` + `base_amount`. Base
+/// amounts are kept at full precision (NOT rounded per leg): the transaction
+/// ledger balances, so unrounded products keep the base ledger balanced too.
+/// Tax / settlement / stock rows deliberately stay in transaction currency.
+fn stamp_base_amounts(
+    gl: &mut [GlEntry],
+    party_transactions: &mut [PartyTransaction],
+    payload: &Map<String, Value>,
+) {
+    let rate = conversion_rate_of(payload);
+    let currency = as_non_empty(payload.get("currency"));
+    for entry in gl.iter_mut() {
+        entry.conversion_rate = Some(rate);
+        entry.base_debit = Some(entry.debit * rate);
+        entry.base_credit = Some(entry.credit * rate);
+        if let Some(currency) = &currency {
+            entry.currency = Some(currency.clone());
+        }
+    }
+    for txn in party_transactions.iter_mut() {
+        txn.conversion_rate = rate;
+        txn.base_amount = txn.amount * rate;
+        if txn.currency.is_none() {
+            txn.currency = currency.clone();
+        }
+    }
 }
 
 /// Customer / supplier / tax subledger rows, ported from the Dart
@@ -1420,22 +1489,31 @@ fn stock_gl_legs(
         } else {
             (counter, inventory)
         };
-        legs.push(ctx.gl(
+        let mut debit_leg = ctx.gl(
             format!("{}-gl-d", sle.id),
             dr.to_string(),
             amount,
             0.0,
             None,
             None,
-        ));
-        legs.push(ctx.gl(
+        );
+        let mut credit_leg = ctx.gl(
             format!("{}-gl-c", sle.id),
             cr.to_string(),
             0.0,
             amount,
             None,
             None,
-        ));
+        );
+        // Valuation cost is already company/base currency — the legs carry
+        // conversion_rate 1 and base == amount (the Dart `_stockGl` builder).
+        for leg in [&mut debit_leg, &mut credit_leg] {
+            leg.conversion_rate = Some(1.0);
+            leg.base_debit = Some(leg.debit);
+            leg.base_credit = Some(leg.credit);
+        }
+        legs.push(debit_leg);
+        legs.push(credit_leg);
     }
     legs
 }
@@ -1466,21 +1544,32 @@ fn split_grni_from_expense(
         return;
     }
 
+    let rate = conversion_rate_of(payload);
     let expense_id = format!("GL-{}-debit", ctx.document_id);
     if let Some(pos) = gl.iter().position(|entry| entry.id == expense_id) {
         gl[pos].debit -= stock_net;
+        // Keep the stamped base in step with the reduced transaction amount
+        // (the Dart `_splitGrniFromExpense` restamps the moved column).
+        if gl[pos].base_debit.is_some() {
+            gl[pos].base_debit = Some(gl[pos].debit * rate);
+        }
         if gl[pos].debit.abs() < EPS && gl[pos].credit.abs() < EPS {
             gl.remove(pos);
         }
     }
-    gl.push(ctx.gl(
+    let mut grni = ctx.gl(
         format!("GL-{}-grni", ctx.document_id),
         settings.default_grni_account.clone(),
         stock_net,
         0.0,
         None,
         None,
-    ));
+    );
+    grni.currency = as_non_empty(payload.get("currency"));
+    grni.conversion_rate = Some(rate);
+    grni.base_debit = Some(stock_net * rate);
+    grni.base_credit = Some(0.0);
+    gl.push(grni);
 }
 
 // ---------------------------------------------------------------------------

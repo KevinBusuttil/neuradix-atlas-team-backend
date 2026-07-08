@@ -1,0 +1,246 @@
+{
+  "name": "Multi-currency base stamping: Sales/Purchase Invoice + Payment Entry GL legs carry base_debit/base_credit = amount x conversion_rate; customer/supplier rows carry base_amount; stock valuation stays base at rate 1 (Dart _stampBaseAmounts parity)",
+  "setup": {
+    "items": [
+      { "id": "ITEM-F", "item_type": "Stock", "valuation_method": "Moving Average" },
+      { "id": "SVC-F", "item_type": "Service" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "USD sale at rate 0.9: Dr Debtors 100 (base 90) / Cr Sales 100 (base 90); CT row books amount 100, base_amount 90; outstanding stays transaction currency",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-FX1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-01",
+          "currency": "USD",
+          "conversion_rate": 0.9
+        },
+        "items": [{ "item": "SVC-F", "qty": 1, "rate": 100 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "gl_rows": [
+          {
+            "id": "GL-SINV-FX1-debit",
+            "account": "Debtors",
+            "debit": 100,
+            "credit": 0,
+            "base_debit": 90,
+            "base_credit": 0,
+            "conversion_rate": 0.9,
+            "currency": "USD"
+          },
+          {
+            "id": "GL-SINV-FX1-credit",
+            "account": "Sales",
+            "debit": 0,
+            "credit": 100,
+            "base_debit": 0,
+            "base_credit": 90,
+            "conversion_rate": 0.9,
+            "currency": "USD"
+          }
+        ],
+        "party_rows": [
+          {
+            "id": "CT-SINV-FX1",
+            "doctype": "Customer Transaction",
+            "trans_type": "Invoice",
+            "party": "CUST-1",
+            "amount": 100,
+            "base_amount": 90
+          }
+        ],
+        "outstanding": { "Sales Invoice/SINV-FX1": 100 }
+      }
+    },
+    {
+      "comment": "USD receipt payment at rate 0.88: both legs stamped at the payment's own rate; CT row amount −100, base −88; settlement/outstanding stay transaction currency",
+      "as_role": "accountant",
+      "submit": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-FX1",
+        "payload": {
+          "payment_type": "Receive",
+          "party": "CUST-1",
+          "paid_amount": 100,
+          "posting_date": "2026-07-02",
+          "currency": "USD",
+          "conversion_rate": 0.88,
+          "references": [
+            { "reference_doctype": "Sales Invoice", "reference_name": "SINV-FX1", "allocated_amount": 100 }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "gl_rows": [
+          {
+            "id": "GL-PAY-FX1-from",
+            "account": "Debtors",
+            "debit": 0,
+            "credit": 100,
+            "base_credit": 88,
+            "conversion_rate": 0.88,
+            "currency": "USD"
+          },
+          {
+            "id": "GL-PAY-FX1-to",
+            "account": "Cash",
+            "debit": 100,
+            "credit": 0,
+            "base_debit": 88,
+            "conversion_rate": 0.88,
+            "currency": "USD"
+          }
+        ],
+        "party_rows": [
+          {
+            "id": "CT-PAY-FX1",
+            "doctype": "Customer Transaction",
+            "trans_type": "Payment",
+            "party": "CUST-1",
+            "amount": -100,
+            "base_amount": -88
+          }
+        ],
+        "outstanding": { "Sales Invoice/SINV-FX1": 0 }
+      }
+    },
+    {
+      "comment": "USD update_stock purchase at rate 2: AP and the GRNI split stamp at the doc rate (50 → base 100); the stock valuation legs stay base currency at rate 1 (base == transaction value, mirroring the Dart runtime which does not convert incoming valuation)",
+      "as_role": "purchasing",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-FX1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-03",
+          "currency": "USD",
+          "conversion_rate": 2,
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-F", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "gl_rows": [
+          {
+            "id": "GL-PINV-FX1-credit",
+            "account": "Creditors",
+            "debit": 0,
+            "credit": 50,
+            "base_credit": 100,
+            "conversion_rate": 2,
+            "currency": "USD"
+          },
+          {
+            "id": "GL-PINV-FX1-grni",
+            "account": "GRNI",
+            "debit": 50,
+            "credit": 0,
+            "base_debit": 100,
+            "conversion_rate": 2,
+            "currency": "USD"
+          },
+          {
+            "id": "SLE-PINV-FX1-0-gl-d",
+            "account": "Stock",
+            "debit": 50,
+            "credit": 0,
+            "base_debit": 50,
+            "conversion_rate": 1
+          },
+          {
+            "id": "SLE-PINV-FX1-0-gl-c",
+            "account": "GRNI",
+            "debit": 0,
+            "credit": 50,
+            "base_credit": 50,
+            "conversion_rate": 1
+          }
+        ],
+        "party_rows": [
+          {
+            "id": "VT-PINV-FX1",
+            "doctype": "Supplier Transaction",
+            "trans_type": "Invoice",
+            "party": "SUPP-1",
+            "amount": 50,
+            "base_amount": 100
+          }
+        ],
+        "bins": { "ITEM-F@WH": { "qty": 10, "value": 50, "rate": 5 } },
+        "account_balances": { "GRNI": 0 }
+      }
+    },
+    {
+      "comment": "Cancel the USD sale: the reversal swaps the base columns with the transaction columns and negates the CT base",
+      "cancel": { "doctype": "Sales Invoice", "document_id": "SINV-FX1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "gl_rows": [
+          {
+            "id": "GL-SINV-FX1-debit-reversal",
+            "account": "Debtors",
+            "debit": 0,
+            "credit": 100,
+            "base_debit": 0,
+            "base_credit": 90,
+            "conversion_rate": 0.9,
+            "currency": "USD"
+          }
+        ],
+        "party_rows": [
+          {
+            "id": "CT-SINV-FX1-reversal",
+            "doctype": "Customer Transaction",
+            "trans_type": "CreditNote",
+            "party": "CUST-1",
+            "amount": -100,
+            "base_amount": -90,
+            "is_reversal": true
+          }
+        ]
+      }
+    },
+    {
+      "comment": "A same-currency voucher stamps rate 1 with base == transaction, so single-currency postings keep the same numbers",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-FX2",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-07-04" },
+        "items": [{ "item": "SVC-F", "qty": 1, "rate": 40 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "gl_rows": [
+          {
+            "id": "GL-SINV-FX2-debit",
+            "account": "Debtors",
+            "debit": 40,
+            "credit": 0,
+            "base_debit": 40,
+            "conversion_rate": 1
+          }
+        ],
+        "party_rows": [
+          {
+            "id": "CT-SINV-FX2",
+            "doctype": "Customer Transaction",
+            "trans_type": "Invoice",
+            "party": "CUST-1",
+            "amount": 40,
+            "base_amount": 40
+          }
+        ]
+      }
+    }
+  ]
+}

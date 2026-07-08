@@ -72,6 +72,10 @@ struct Checks {
     sle_count: HashMap<String, usize>,
     #[serde(default)]
     settlement_count: HashMap<String, usize>,
+    /// GL rows checked by deterministic id (incl. multi-currency base
+    /// stamping fields).
+    #[serde(default)]
+    gl_rows: Vec<GlRowCheck>,
     /// Stock ledger rows checked by deterministic id (qty/rate in stock
     /// units; `uom` is the transaction UOM the line was entered in).
     #[serde(default)]
@@ -114,6 +118,23 @@ struct BinCheck {
     value: f64,
     #[serde(default)]
     rate: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct GlRowCheck {
+    id: String,
+    #[serde(default)]
+    account: Option<String>,
+    debit: f64,
+    credit: f64,
+    #[serde(default)]
+    base_debit: Option<f64>,
+    #[serde(default)]
+    base_credit: Option<f64>,
+    #[serde(default)]
+    conversion_rate: Option<f64>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +297,66 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
     for (payment, expected) in &checks.settlement_count {
         let actual = app.settlement_count(payment);
         assert_eq!(actual, *expected, "{step}: settlement count for {payment}");
+    }
+    for check in &checks.gl_rows {
+        let row = app
+            .gl_entry(&check.id)
+            .unwrap_or_else(|| panic!("{step}: missing GL entry {}", check.id));
+        if let Some(account) = &check.account {
+            assert_eq!(&row.account, account, "{step}: account for {}", check.id);
+        }
+        assert!(
+            approx(row.debit, check.debit),
+            "{step}: debit for {} is {}, expected {}",
+            check.id,
+            row.debit,
+            check.debit
+        );
+        assert!(
+            approx(row.credit, check.credit),
+            "{step}: credit for {} is {}, expected {}",
+            check.id,
+            row.credit,
+            check.credit
+        );
+        if let Some(expected) = check.base_debit {
+            let actual = row
+                .base_debit
+                .unwrap_or_else(|| panic!("{step}: {} has no base_debit", check.id));
+            assert!(
+                approx(actual, expected),
+                "{step}: base_debit for {} is {actual}, expected {expected}",
+                check.id
+            );
+        }
+        if let Some(expected) = check.base_credit {
+            let actual = row
+                .base_credit
+                .unwrap_or_else(|| panic!("{step}: {} has no base_credit", check.id));
+            assert!(
+                approx(actual, expected),
+                "{step}: base_credit for {} is {actual}, expected {expected}",
+                check.id
+            );
+        }
+        if let Some(expected) = check.conversion_rate {
+            let actual = row
+                .conversion_rate
+                .unwrap_or_else(|| panic!("{step}: {} has no conversion_rate", check.id));
+            assert!(
+                approx(actual, expected),
+                "{step}: conversion_rate for {} is {actual}, expected {expected}",
+                check.id
+            );
+        }
+        if let Some(expected) = &check.currency {
+            assert_eq!(
+                row.currency.as_deref(),
+                Some(expected.as_str()),
+                "{step}: currency for {}",
+                check.id
+            );
+        }
     }
     for check in &checks.sle_rows {
         let row = app
@@ -494,6 +575,10 @@ fixture_test!(
 fixture_test!(fixture_0009_subledger_rows, "0009-subledger-rows.json");
 fixture_test!(fixture_0010_pos_and_delivery, "0010-pos-and-delivery.json");
 fixture_test!(fixture_0011_uom_conversion, "0011-uom-conversion.json");
+fixture_test!(
+    fixture_0012_multicurrency_base_stamping,
+    "0012-multicurrency-base-stamping.json"
+);
 
 /// Every fixture file on disk must be wired to a test above — a new fixture
 /// that nobody runs is a silent hole in the contract.
@@ -511,6 +596,7 @@ fn every_fixture_file_is_covered() {
         "0009-subledger-rows.json",
         "0010-pos-and-delivery.json",
         "0011-uom-conversion.json",
+        "0012-multicurrency-base-stamping.json",
     ];
     let mut on_disk: Vec<String> = std::fs::read_dir(fixtures_dir())
         .expect("fixtures dir")

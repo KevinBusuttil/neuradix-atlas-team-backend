@@ -56,6 +56,10 @@ fn gl_from_row(row: &PgRow) -> Result<GlEntry, StoreError> {
         voucher_type: row.try_get("voucher_type")?,
         voucher_no: row.try_get("voucher_no")?,
         posting_date: row.try_get("posting_date")?,
+        currency: row.try_get("currency")?,
+        conversion_rate: row.try_get("conversion_rate")?,
+        base_debit: row.try_get("base_debit")?,
+        base_credit: row.try_get("base_credit")?,
         is_reversal: row.try_get("is_reversal")?,
         batch_id: row.try_get("batch_id")?,
     })
@@ -797,7 +801,8 @@ impl Store for PgStore {
     ) -> Result<Vec<GlEntry>, StoreError> {
         let rows = sqlx::query(
             "select company_id, id, account, debit, credit, party_type, party, voucher_type, \
-             voucher_no, posting_date, is_reversal, batch_id \
+             voucher_no, posting_date, currency, conversion_rate, base_debit, base_credit, \
+             is_reversal, batch_id \
              from gl_entries where company_id = $1 and voucher_no = $2 order by id",
         )
         .bind(company_id)
@@ -1036,8 +1041,9 @@ impl Store for PgStore {
             sqlx::query(
                 "insert into gl_entries \
                  (company_id, id, account, debit, credit, party_type, party, voucher_type, \
-                  voucher_no, posting_date, is_reversal, batch_id) \
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  voucher_no, posting_date, currency, conversion_rate, base_debit, base_credit, \
+                  is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
             )
             .bind(company)
             .bind(&entry.id)
@@ -1049,6 +1055,10 @@ impl Store for PgStore {
             .bind(&entry.voucher_type)
             .bind(&entry.voucher_no)
             .bind(&entry.posting_date)
+            .bind(&entry.currency)
+            .bind(entry.conversion_rate)
+            .bind(entry.base_debit)
+            .bind(entry.base_credit)
             .bind(entry.is_reversal)
             .bind(&entry.batch_id)
             .execute(&mut *tx)
@@ -1475,7 +1485,8 @@ impl Store for PgStore {
     async fn gl_entries_ordered(&self, company_id: Uuid) -> Result<Vec<GlEntry>, StoreError> {
         let rows = sqlx::query(
             "select company_id, id, account, debit, credit, party_type, party, voucher_type, \
-             voucher_no, posting_date, is_reversal, batch_id \
+             voucher_no, posting_date, currency, conversion_rate, base_debit, base_credit, \
+             is_reversal, batch_id \
              from gl_entries where company_id = $1 \
              order by posting_date, voucher_no, id",
         )

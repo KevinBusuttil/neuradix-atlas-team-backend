@@ -71,6 +71,20 @@ pub struct GlEntry {
     pub voucher_type: String,
     pub voucher_no: String,
     pub posting_date: String,
+    /// Transaction currency of the voucher (base-stamped vouchers only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Exchange rate to the company/base currency; stock valuation legs
+    /// always carry 1 (valuation cost is already base currency).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversion_rate: Option<f64>,
+    /// `debit × conversion_rate`, kept at full precision (not rounded per
+    /// leg) so the base ledger balances — the Dart `_stampBaseAmounts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_debit: Option<f64>,
+    /// `credit × conversion_rate`, full precision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_credit: Option<f64>,
     pub is_reversal: bool,
     pub batch_id: String,
 }
