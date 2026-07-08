@@ -1,0 +1,219 @@
+{
+  "name": "Customer / Supplier / Tax subledger rows on the mandatory scenario docs (Dart ledger_derivation parity: CT-/VT-/TT- ids, negate-on-reversal)",
+  "setup": {
+    "items": [
+      { "id": "ITEM-A", "item_type": "Stock", "valuation_method": "Moving Average" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Taxed update_stock purchase: VT-PINV-1 books the gross owed (+59); TT-PINV-1-0 books the taxable base + input VAT; GL splits net to Inventory/GRNI and VAT to the input account",
+      "submit": {
+        "doctype": "Purchase Invoice",
+        "document_id": "PINV-1",
+        "payload": {
+          "supplier": "SUPP-1",
+          "posting_date": "2026-07-01",
+          "due_date": "2026-07-31",
+          "update_stock": 1,
+          "set_warehouse": "WH",
+          "taxes": [
+            { "tax_type": "VAT", "tax_code": "VAT-18", "tax_account": "VAT Input", "taxable_amount": 50, "tax_amount": 9, "rate": 18 }
+          ]
+        },
+        "items": [{ "item": "ITEM-A", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "party_rows": [
+          {
+            "id": "VT-PINV-1",
+            "doctype": "Supplier Transaction",
+            "trans_type": "Invoice",
+            "party": "SUPP-1",
+            "amount": 59,
+            "base_amount": 59,
+            "due_date": "2026-07-31",
+            "is_reversal": false
+          }
+        ],
+        "tax_rows": [
+          {
+            "id": "TT-PINV-1-0",
+            "base_amount": 50,
+            "tax_amount": 9,
+            "rate": 18,
+            "tax_type": "VAT",
+            "tax": "VAT-18",
+            "party_type": "Supplier",
+            "party": "SUPP-1"
+          }
+        ],
+        "party_count": { "PINV-1": 1 },
+        "tax_count": { "PINV-1": 1 },
+        "account_balances": { "VAT Input": 9, "Stock": 50, "GRNI": 0 },
+        "voucher_accounts": [
+          { "account": "Creditors", "voucher": "PINV-1", "balance": -59 }
+        ]
+      }
+    },
+    {
+      "comment": "Taxed sale: CT-SINV-1 books the gross receivable (+69) with the due date; TT-SINV-1-0 books base 60 + output VAT 9",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-02",
+          "due_date": "2026-08-01",
+          "taxes": [
+            { "tax_type": "VAT", "tax_code": "VAT-15", "tax_account": "VAT Output", "taxable_amount": 60, "tax_amount": 9, "rate": 15 }
+          ]
+        },
+        "items": [{ "item": "ITEM-A", "qty": 3, "rate": 20 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "party_rows": [
+          {
+            "id": "CT-SINV-1",
+            "doctype": "Customer Transaction",
+            "trans_type": "Invoice",
+            "party": "CUST-1",
+            "amount": 69,
+            "base_amount": 69,
+            "due_date": "2026-08-01",
+            "is_reversal": false
+          }
+        ],
+        "tax_rows": [
+          {
+            "id": "TT-SINV-1-0",
+            "base_amount": 60,
+            "tax_amount": 9,
+            "rate": 15,
+            "party_type": "Customer",
+            "party": "CUST-1"
+          }
+        ],
+        "account_balances": { "VAT Output": -9 },
+        "voucher_accounts": [
+          { "account": "Debtors", "voucher": "SINV-1", "balance": 69 },
+          { "account": "Sales", "voucher": "SINV-1", "balance": -60 }
+        ],
+        "outstanding": { "Sales Invoice/SINV-1": 69 }
+      }
+    },
+    {
+      "comment": "Receipt payment: CT-PAY-1 reduces what the customer owes (−69, trans_type Payment); the settlement clears the invoice",
+      "as_role": "accountant",
+      "submit": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-1",
+        "payload": {
+          "payment_type": "Receive",
+          "party": "CUST-1",
+          "paid_amount": 69,
+          "posting_date": "2026-07-03",
+          "references": [
+            { "reference_doctype": "Sales Invoice", "reference_name": "SINV-1", "allocated_amount": 69 }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "party_rows": [
+          {
+            "id": "CT-PAY-1",
+            "doctype": "Customer Transaction",
+            "trans_type": "Payment",
+            "party": "CUST-1",
+            "amount": -69,
+            "is_reversal": false
+          }
+        ],
+        "tax_count": { "PAY-1": 0 },
+        "settlement_count": { "PAY-1": 1 },
+        "outstanding": { "Sales Invoice/SINV-1": 0 }
+      }
+    },
+    {
+      "comment": "Cancel the payment: CT-PAY-1-reversal is an Adjustment for +69 and the outstanding is restored",
+      "as_role": "accountant",
+      "cancel": { "doctype": "Payment Entry", "document_id": "PAY-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "party_rows": [
+          {
+            "id": "CT-PAY-1-reversal",
+            "doctype": "Customer Transaction",
+            "trans_type": "Adjustment",
+            "party": "CUST-1",
+            "amount": 69,
+            "is_reversal": true
+          }
+        ],
+        "party_count": { "PAY-1": 2 },
+        "outstanding": { "Sales Invoice/SINV-1": 69 }
+      }
+    },
+    {
+      "comment": "Cancel the sale: CT-SINV-1-reversal is a CreditNote for −69 and the tax reversal negates base + VAT so the return nets out",
+      "cancel": { "doctype": "Sales Invoice", "document_id": "SINV-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "party_rows": [
+          {
+            "id": "CT-SINV-1-reversal",
+            "doctype": "Customer Transaction",
+            "trans_type": "CreditNote",
+            "party": "CUST-1",
+            "amount": -69,
+            "base_amount": -69,
+            "is_reversal": true
+          }
+        ],
+        "tax_rows": [
+          { "id": "TT-SINV-1-0-reversal", "base_amount": -60, "tax_amount": -9, "rate": 15 }
+        ],
+        "party_count": { "SINV-1": 2 },
+        "tax_count": { "SINV-1": 2 },
+        "account_balances": { "VAT Output": 0 },
+        "voucher_accounts": [
+          { "account": "Debtors", "voucher": "SINV-1", "balance": 0 },
+          { "account": "Sales", "voucher": "SINV-1", "balance": 0 }
+        ]
+      }
+    },
+    {
+      "comment": "Cancel the purchase: VT-PINV-1-reversal is a CreditNote for −59, the input-VAT subledger nets to zero and the stock reversal restores the bin",
+      "as_role": "purchasing",
+      "cancel": { "doctype": "Purchase Invoice", "document_id": "PINV-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "party_rows": [
+          {
+            "id": "VT-PINV-1-reversal",
+            "doctype": "Supplier Transaction",
+            "trans_type": "CreditNote",
+            "party": "SUPP-1",
+            "amount": -59,
+            "is_reversal": true
+          }
+        ],
+        "tax_rows": [
+          { "id": "TT-PINV-1-0-reversal", "base_amount": -50, "tax_amount": -9 }
+        ],
+        "account_balances": { "VAT Input": 0, "Stock": 0, "GRNI": 0 },
+        "bins": { "ITEM-A@WH": { "qty": 0, "value": 0 } }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "VAT Input": 0, "VAT Output": 0, "Stock": 0, "GRNI": 0 }
+  }
+}

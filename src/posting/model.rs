@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::model::AuditEntry;
@@ -102,6 +102,150 @@ pub struct Bin {
     pub actual_qty: f64,
     pub valuation_rate: f64,
     pub stock_value: f64,
+}
+
+/// Which party subledger a [`PartyTransaction`] belongs to. Picks both the
+/// derived doctype and the wire field the party id is stored under, matching
+/// the Dart `Customer Transaction` / `Supplier Transaction` row shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum PartyKind {
+    Customer,
+    Supplier,
+}
+
+impl PartyKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PartyKind::Customer => "Customer",
+            PartyKind::Supplier => "Supplier",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "Customer" => Some(PartyKind::Customer),
+            "Supplier" => Some(PartyKind::Supplier),
+            _ => None,
+        }
+    }
+
+    /// The derived doctype the row replicates as.
+    pub fn doctype(&self) -> &'static str {
+        match self {
+            PartyKind::Customer => "Customer Transaction",
+            PartyKind::Supplier => "Supplier Transaction",
+        }
+    }
+
+    /// The payload key the party id is stored under (Dart uses `customer` /
+    /// `supplier`, not a generic `party` field).
+    pub fn party_field(&self) -> &'static str {
+        match self {
+            PartyKind::Customer => "customer",
+            PartyKind::Supplier => "supplier",
+        }
+    }
+}
+
+/// Customer / supplier subledger row, ported from the Dart derivation:
+/// `CT-{doc id}` (Customer Transaction) and `VT-{doc id}` (Supplier
+/// Transaction), positive = the party owes / is owed more, payments negative,
+/// reversals negated with a `-reversal` id.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartyTransaction {
+    pub id: String,
+    pub company_id: Uuid,
+    pub kind: PartyKind,
+    /// Invoice / CreditNote / Payment / Adjustment.
+    pub trans_type: String,
+    pub party: String,
+    pub posting_date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<String>,
+    pub amount: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Exchange rate to the company/base currency (1 for same-currency).
+    pub conversion_rate: f64,
+    /// `amount × conversion_rate`, kept at full precision like the Dart
+    /// `_stampBaseAmounts`.
+    pub base_amount: f64,
+    pub voucher_type: String,
+    pub voucher_no: String,
+    pub is_reversal: bool,
+    pub batch_id: String,
+}
+
+impl PartyTransaction {
+    /// The row's payload fields with the exact Dart derivation field names —
+    /// what replicates to client devices and what the command response
+    /// carries.
+    pub fn row_fields(&self) -> Map<String, Value> {
+        let mut fields = Map::new();
+        fields.insert("trans_type".into(), json!(self.trans_type));
+        fields.insert(self.kind.party_field().into(), json!(self.party));
+        fields.insert("posting_date".into(), json!(self.posting_date));
+        if let Some(due_date) = &self.due_date {
+            fields.insert("due_date".into(), json!(due_date));
+        }
+        fields.insert("amount".into(), json!(self.amount));
+        if let Some(currency) = &self.currency {
+            fields.insert("currency".into(), json!(currency));
+        }
+        fields.insert("conversion_rate".into(), json!(self.conversion_rate));
+        fields.insert("base_amount".into(), json!(self.base_amount));
+        fields.insert("voucher_type".into(), json!(self.voucher_type));
+        fields.insert("voucher_no".into(), json!(self.voucher_no));
+        fields.insert("is_reversal".into(), json!(self.is_reversal));
+        fields
+    }
+}
+
+/// VAT subledger row (`TT-{doc id}-{i}`), one per invoice tax row — the VAT
+/// return reads these. A zero-amount tax row still records its taxable base.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaxTransaction {
+    pub id: String,
+    pub company_id: Uuid,
+    pub tax_type: String,
+    /// Tax code (the Dart row's `tax` field, from the line's `tax_code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tax: Option<String>,
+    pub posting_date: String,
+    /// Taxable base (signed; negated on reversal).
+    pub base_amount: f64,
+    pub tax_amount: f64,
+    pub rate: f64,
+    pub party_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<String>,
+    pub voucher_type: String,
+    pub voucher_no: String,
+    pub is_reversal: bool,
+    pub batch_id: String,
+}
+
+impl TaxTransaction {
+    /// The row's payload fields with the exact Dart derivation field names.
+    pub fn row_fields(&self) -> Map<String, Value> {
+        let mut fields = Map::new();
+        fields.insert("tax_type".into(), json!(self.tax_type));
+        if let Some(tax) = &self.tax {
+            fields.insert("tax".into(), json!(tax));
+        }
+        fields.insert("posting_date".into(), json!(self.posting_date));
+        fields.insert("base_amount".into(), json!(self.base_amount));
+        fields.insert("tax_amount".into(), json!(self.tax_amount));
+        fields.insert("rate".into(), json!(self.rate));
+        fields.insert("party_type".into(), json!(self.party_type));
+        if let Some(party) = &self.party {
+            fields.insert("party".into(), json!(party));
+        }
+        fields.insert("voucher_type".into(), json!(self.voucher_type));
+        fields.insert("voucher_no".into(), json!(self.voucher_no));
+        fields.insert("is_reversal".into(), json!(self.is_reversal));
+        fields
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,6 +375,8 @@ pub struct PostingCommit {
     pub series_key: Option<String>,
     pub gl_entries: Vec<GlEntry>,
     pub stock_ledger_entries: Vec<StockLedgerEntry>,
+    pub party_transactions: Vec<PartyTransaction>,
+    pub tax_transactions: Vec<TaxTransaction>,
     pub settlements: Vec<Settlement>,
     pub bins: Vec<Bin>,
     /// (doctype, document_id, outstanding_amount) payload maintenance for

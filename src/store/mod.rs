@@ -14,8 +14,8 @@ use crate::model::{
     TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
-    CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit, Settlement,
-    StockLedgerEntry,
+    CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction, PostedDocument, PostingCommit,
+    Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::projection::CompanyDocument;
 
@@ -164,6 +164,19 @@ pub trait Store: Send + Sync {
         company_id: Uuid,
         voucher_no: &str,
     ) -> Result<Vec<GlEntry>, StoreError>;
+    /// All customer/supplier subledger rows a voucher produced (submit and
+    /// reversal rows).
+    async fn party_transactions_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<PartyTransaction>, StoreError>;
+    /// All tax subledger rows a voucher produced (submit and reversal rows).
+    async fn tax_transactions_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<TaxTransaction>, StoreError>;
     /// All settlements allocated against an invoice (signed; reversals net).
     async fn settlements_for_invoice(
         &self,

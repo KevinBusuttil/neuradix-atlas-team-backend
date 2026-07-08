@@ -20,8 +20,8 @@ use uuid::Uuid;
 
 use crate::model::AuditEntry;
 use crate::posting::model::{
-    series_key, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PostingBatch, PostingCommit,
-    Settlement, StockLedgerEntry, POSTED_DOCTYPES,
+    series_key, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
+    PostingBatch, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction, POSTED_DOCTYPES,
 };
 use crate::posting::stock::{compute_balance, issue_rate, LedgerRow};
 use crate::posting::values::{
@@ -257,6 +257,7 @@ async fn build_submit(
     };
     let mut gl = derive_monetary_gl(&ctx, &payload);
     let mut sles = derive_stock_rows(&ctx, &payload);
+    let (party_transactions, tax_transactions) = derive_subledger_rows(&ctx, &payload);
 
     // Item registry: drop service-item movements before costing (they never
     // touch stock), then cost issues from the authoritative ledger.
@@ -293,12 +294,15 @@ async fn build_submit(
         official_number: None, // allocated inside the commit
         created_at: Utc::now(),
     };
+    let (party_rows, tax_rows) = subledger_response_rows(&party_transactions, &tax_transactions);
     let response = json!({
         "document_id": document_id,
         "number": Value::Null, // stamped by the store after allocation
         "docstatus": 1,
         "gl_entries": &gl,
         "stock_ledger_entries": &sles,
+        "party_transactions": party_rows,
+        "tax_transactions": tax_rows,
         "bins": &bins,
         "settlements": &settlements,
     });
@@ -312,6 +316,8 @@ async fn build_submit(
         series_key: series_key(doctype).map(str::to_string),
         gl_entries: gl,
         stock_ledger_entries: sles,
+        party_transactions,
+        tax_transactions,
         settlements,
         bins,
         outstanding_updates,
@@ -407,6 +413,42 @@ async fn build_cancel(
             ..s
         })
         .collect();
+    // Party subledger reversals negate the stored amounts and take the Dart
+    // cancel trans_types: an Invoice reverses as a CreditNote, a Payment as
+    // an Adjustment.
+    let party_transactions: Vec<PartyTransaction> = store
+        .party_transactions_for_voucher(company_id, document_id)
+        .await?
+        .into_iter()
+        .filter(|t| !t.is_reversal)
+        .map(|t| PartyTransaction {
+            id: format!("{}{REVERSAL_SUFFIX}", t.id),
+            trans_type: if t.trans_type == "Invoice" {
+                "CreditNote".to_string()
+            } else {
+                "Adjustment".to_string()
+            },
+            amount: -t.amount,
+            base_amount: -t.base_amount,
+            is_reversal: true,
+            batch_id: batch_id.clone(),
+            ..t
+        })
+        .collect();
+    let tax_transactions: Vec<TaxTransaction> = store
+        .tax_transactions_for_voucher(company_id, document_id)
+        .await?
+        .into_iter()
+        .filter(|t| !t.is_reversal)
+        .map(|t| TaxTransaction {
+            id: format!("{}{REVERSAL_SUFFIX}", t.id),
+            base_amount: -t.base_amount,
+            tax_amount: -t.tax_amount,
+            is_reversal: true,
+            batch_id: batch_id.clone(),
+            ..t
+        })
+        .collect();
 
     // Replay the reversal rows onto the current ledger for the negative-stock
     // guard and the bin recompute (e.g. cancelling a receipt whose goods were
@@ -431,12 +473,15 @@ async fn build_cancel(
     };
 
     document.docstatus = 2;
+    let (party_rows, tax_rows) = subledger_response_rows(&party_transactions, &tax_transactions);
     let response = json!({
         "document_id": document_id,
         "number": &document.official_number,
         "docstatus": 2,
         "gl_entries": &gl,
         "stock_ledger_entries": &sles,
+        "party_transactions": party_rows,
+        "tax_transactions": tax_rows,
         "bins": &bins,
         "settlements": &settlements,
     });
@@ -450,6 +495,8 @@ async fn build_cancel(
         series_key: None, // cancellation never consumes a number
         gl_entries: gl,
         stock_ledger_entries: sles,
+        party_transactions,
+        tax_transactions,
         settlements,
         bins,
         outstanding_updates,
@@ -727,6 +774,156 @@ fn tax_legs(ctx: &RowContext<'_>, payload: &Map<String, Value>, is_output: bool)
         ));
     }
     out
+}
+
+/// Customer / supplier / tax subledger rows, ported from the Dart
+/// `ledger_derivation.dart`: a Sales Invoice books `CT-{id}` (Invoice,
+/// +grand), a Purchase Invoice `VT-{id}` (Invoice, +grand — positive = we
+/// owe), a Payment Entry `CT-{id}` / `VT-{id}` (Payment, −paid), and each
+/// invoice tax row books `TT-{id}-{i}` with its taxable base + tax + rate so
+/// the VAT return can be built from the subledger alone.
+fn derive_subledger_rows(
+    ctx: &RowContext<'_>,
+    payload: &Map<String, Value>,
+) -> (Vec<PartyTransaction>, Vec<TaxTransaction>) {
+    let id = ctx.document_id;
+    let mut party_rows = Vec::new();
+    let mut tax_rows = Vec::new();
+    let party_txn = |kind: PartyKind, trans_type: &str, party: String, amount: f64| {
+        PartyTransaction {
+            id: format!(
+                "{}-{id}",
+                if kind == PartyKind::Customer {
+                    "CT"
+                } else {
+                    "VT"
+                }
+            ),
+            company_id: ctx.company_id,
+            kind,
+            trans_type: trans_type.to_string(),
+            party,
+            posting_date: ctx.posting_date.to_string(),
+            due_date: as_non_empty(payload.get("due_date")),
+            amount,
+            currency: as_non_empty(payload.get("currency")),
+            conversion_rate: 1.0, // base stamping adjusts this for FX vouchers
+            base_amount: amount,
+            voucher_type: ctx.doctype.to_string(),
+            voucher_no: id.to_string(),
+            is_reversal: false,
+            batch_id: ctx.batch_id.to_string(),
+        }
+    };
+    match ctx.doctype {
+        "Sales Invoice" => {
+            let customer = as_non_empty(payload.get("customer"));
+            if let Some(customer) = &customer {
+                let grand = as_num(payload.get("grand_total"));
+                party_rows.push(party_txn(
+                    PartyKind::Customer,
+                    "Invoice",
+                    customer.clone(),
+                    grand,
+                ));
+            }
+            tax_rows = tax_transactions(ctx, payload, "Customer", customer);
+        }
+        "Purchase Invoice" => {
+            let supplier = as_non_empty(payload.get("supplier"));
+            if let Some(supplier) = &supplier {
+                let grand = as_num(payload.get("grand_total"));
+                party_rows.push(party_txn(
+                    PartyKind::Supplier,
+                    "Invoice",
+                    supplier.clone(),
+                    grand,
+                ));
+            }
+            tax_rows = tax_transactions(ctx, payload, "Supplier", supplier);
+        }
+        "Payment Entry" => {
+            // Payment reduces what is owed: negative on submit.
+            if let Some(party) = as_non_empty(payload.get("party")) {
+                let paid = as_num(payload.get("paid_amount"));
+                match as_non_empty(payload.get("payment_type")).as_deref() {
+                    Some("Receive") => {
+                        party_rows.push(party_txn(PartyKind::Customer, "Payment", party, -paid));
+                    }
+                    Some("Pay") => {
+                        party_rows.push(party_txn(PartyKind::Supplier, "Payment", party, -paid));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    (party_rows, tax_rows)
+}
+
+/// One `TT-{id}-{i}` subledger row per invoice tax row — including
+/// zero-amount rows, whose taxable base still belongs in the VAT return
+/// (mirrors the Dart `_taxLegs`, which gates only the GL leg on the amount).
+fn tax_transactions(
+    ctx: &RowContext<'_>,
+    payload: &Map<String, Value>,
+    party_type: &str,
+    party: Option<String>,
+) -> Vec<TaxTransaction> {
+    let rows = match payload.get("taxes") {
+        Some(Value::Array(rows)) => rows.as_slice(),
+        _ => &[],
+    };
+    let id = ctx.document_id;
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let Some(row) = row.as_object() else { continue };
+        out.push(TaxTransaction {
+            id: format!("TT-{id}-{i}"),
+            company_id: ctx.company_id,
+            tax_type: as_non_empty(row.get("tax_type")).unwrap_or_else(|| "VAT".to_string()),
+            tax: as_non_empty(row.get("tax_code")),
+            posting_date: ctx.posting_date.to_string(),
+            base_amount: as_num(row.get("taxable_amount")),
+            tax_amount: as_num(row.get("tax_amount")),
+            rate: as_num(row.get("rate")),
+            party_type: party_type.to_string(),
+            party: party.clone(),
+            voucher_type: ctx.doctype.to_string(),
+            voucher_no: id.to_string(),
+            is_reversal: false,
+            batch_id: ctx.batch_id.to_string(),
+        });
+    }
+    out
+}
+
+/// The subledger rows as they appear in the command response: the Dart wire
+/// fields plus `id` and `doctype`, so a client can persist them verbatim.
+fn subledger_response_rows(
+    party_transactions: &[PartyTransaction],
+    tax_transactions: &[TaxTransaction],
+) -> (Vec<Value>, Vec<Value>) {
+    let party = party_transactions
+        .iter()
+        .map(|t| {
+            let mut fields = t.row_fields();
+            fields.insert("id".into(), json!(t.id));
+            fields.insert("doctype".into(), json!(t.kind.doctype()));
+            Value::Object(fields)
+        })
+        .collect();
+    let tax = tax_transactions
+        .iter()
+        .map(|t| {
+            let mut fields = t.row_fields();
+            fields.insert("id".into(), json!(t.id));
+            fields.insert("doctype".into(), json!("Tax Transaction"));
+            Value::Object(fields)
+        })
+        .collect();
+    (party, tax)
 }
 
 /// Raw (uncosted) stock ledger rows per doctype: `SLE-{id}-{i}` for item

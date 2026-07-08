@@ -171,6 +171,140 @@ async fn submit_replicates_document_gl_sle_and_bin_mutations() {
 }
 
 #[tokio::test]
+async fn submit_and_cancel_replicate_subledger_rows_in_dart_envelopes() {
+    let mut app = stock_item_app().await;
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            json!({
+                "doctype": "Sales Invoice",
+                "document_id": "SINV-SL1",
+                "payload": {
+                    "customer": "CUST-1",
+                    "posting_date": "2026-07-02",
+                    "due_date": "2026-08-01",
+                    "taxes": [{
+                        "tax_type": "VAT",
+                        "tax_code": "VAT-15",
+                        "tax_account": "VAT Output",
+                        "taxable_amount": 60,
+                        "tax_amount": 9,
+                        "rate": 15
+                    }]
+                },
+                "items": [{ "item": "ITEM-A", "qty": 3, "rate": 20 }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "submit failed: {body}");
+
+    let mutations = pull(&mut app, 0).await;
+
+    // Customer Transaction — `CT-{id}`, party under its `customer` field.
+    let ct = find(&mutations, "postmut-CT-SINV-SL1");
+    assert_eq!(ct["type"], json!("createDocument"));
+    assert_eq!(ct["docType"], json!("Customer Transaction"));
+    assert_eq!(ct["documentId"], json!("CT-SINV-SL1"));
+    assert_eq!(ct["deviceId"], json!("atlas-backend"));
+    assert_eq!(ct["payload"]["doctype"], json!("Customer Transaction"));
+    let fields = envelope_fields(ct);
+    assert_eq!(fields["trans_type"], json!("Invoice"));
+    assert_eq!(fields["customer"], json!("CUST-1"));
+    assert_eq!(fields["posting_date"], json!("2026-07-02"));
+    assert_eq!(fields["due_date"], json!("2026-08-01"));
+    assert!(approx(fields["amount"].as_f64().unwrap(), 69.0));
+    assert!(approx(fields["base_amount"].as_f64().unwrap(), 69.0));
+    assert!(approx(fields["conversion_rate"].as_f64().unwrap(), 1.0));
+    assert_eq!(fields["voucher_type"], json!("Sales Invoice"));
+    assert_eq!(fields["voucher_no"], json!("SINV-SL1"));
+    assert_eq!(fields["is_reversal"], json!(false));
+    assert!(fields.get("party").is_none(), "{fields}");
+
+    // Tax Transaction — `TT-{id}-{i}` with base + tax + rate.
+    let tt = find(&mutations, "postmut-TT-SINV-SL1-0");
+    assert_eq!(tt["docType"], json!("Tax Transaction"));
+    let fields = envelope_fields(tt);
+    assert_eq!(fields["tax_type"], json!("VAT"));
+    assert_eq!(fields["tax"], json!("VAT-15"));
+    assert!(approx(fields["base_amount"].as_f64().unwrap(), 60.0));
+    assert!(approx(fields["tax_amount"].as_f64().unwrap(), 9.0));
+    assert!(approx(fields["rate"].as_f64().unwrap(), 15.0));
+    assert_eq!(fields["party_type"], json!("Customer"));
+    assert_eq!(fields["party"], json!("CUST-1"));
+    assert_eq!(fields["is_reversal"], json!(false));
+
+    // The document's header payload must not carry the `taxes` child table.
+    let doc = find(&mutations, "postmut-SINV-SL1-doc");
+    let fields = envelope_fields(doc);
+    assert!(fields.get("taxes").is_none(), "{fields}");
+    assert!(fields.get("items").is_none(), "{fields}");
+
+    // Cancel: negated subledger rows with `-reversal` ids and the Dart cancel
+    // trans_type (Invoice → CreditNote).
+    let last: i64 = mutations.last().unwrap()["syncVersion"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (status, body) = app
+        .cancel_as(
+            "owner",
+            json!({ "doctype": "Sales Invoice", "document_id": "SINV-SL1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {body}");
+    let mutations = pull(&mut app, last).await;
+
+    let ct = find(&mutations, "postmut-CT-SINV-SL1-reversal");
+    assert_eq!(ct["docType"], json!("Customer Transaction"));
+    let fields = envelope_fields(ct);
+    assert_eq!(fields["trans_type"], json!("CreditNote"));
+    assert!(approx(fields["amount"].as_f64().unwrap(), -69.0));
+    assert!(approx(fields["base_amount"].as_f64().unwrap(), -69.0));
+    assert_eq!(fields["is_reversal"], json!(true));
+
+    let tt = find(&mutations, "postmut-TT-SINV-SL1-0-reversal");
+    let fields = envelope_fields(tt);
+    assert!(approx(fields["base_amount"].as_f64().unwrap(), -60.0));
+    assert!(approx(fields["tax_amount"].as_f64().unwrap(), -9.0));
+    assert!(approx(fields["rate"].as_f64().unwrap(), 15.0));
+    assert_eq!(fields["is_reversal"], json!(true));
+}
+
+#[tokio::test]
+async fn payment_replicates_supplier_transaction_row() {
+    let mut app = TestApp::new().await;
+    let (status, body) = app
+        .submit_as(
+            "accountant",
+            json!({
+                "doctype": "Payment Entry",
+                "document_id": "PAY-SUP-1",
+                "payload": {
+                    "payment_type": "Pay",
+                    "party": "SUPP-1",
+                    "paid_amount": 40,
+                    "posting_date": "2026-07-02"
+                },
+                "items": []
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "payment failed: {body}");
+
+    let mutations = pull(&mut app, 0).await;
+    // Supplier Transaction — the Dart `VT-{id}` id scheme, party under
+    // `supplier`, negative on submit (a payment reduces what we owe).
+    let vt = find(&mutations, "postmut-VT-PAY-SUP-1");
+    assert_eq!(vt["docType"], json!("Supplier Transaction"));
+    let fields = envelope_fields(vt);
+    assert_eq!(fields["trans_type"], json!("Payment"));
+    assert_eq!(fields["supplier"], json!("SUPP-1"));
+    assert!(approx(fields["amount"].as_f64().unwrap(), -40.0));
+    assert_eq!(fields["is_reversal"], json!(false));
+}
+
+#[tokio::test]
 async fn idempotency_replay_appends_no_new_mutations() {
     let mut app = stock_item_app().await;
     let (status, first) = app

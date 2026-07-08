@@ -192,14 +192,43 @@ incl. shortfall fallback, `0003` negative-stock rejection, `0004` adjustment
 up/down, `0005` payment settlement + outstanding, `0006` period lock, `0007`
 role rejection, `0008` value-neutral transfer.
 
+### Customer / Supplier / Tax subledger rows
+
+The engine emits the Dart derivation's subledger rows alongside GL + SLE +
+Settlement, with the exact Dart ids, field names and negate-on-reversal
+semantics (`ledger_derivation.dart`):
+
+- **Customer Transaction** (`CT-{doc id}{-reversal}`) — Sales Invoice books
+  `trans_type Invoice`, `amount = +grand_total` (positive = the customer owes
+  us), plus `customer`, `posting_date`, `due_date`, voucher linkage and
+  `is_reversal`; a Payment Entry (`payment_type Receive`) books
+  `trans_type Payment`, `amount = −paid_amount`.
+- **Supplier Transaction** (`VT-{doc id}{-reversal}` — the Dart id prefix is
+  `VT-`, kept for row-for-row parity) — mirror semantics on Purchase Invoice
+  (positive = we owe) and `payment_type Pay` payments.
+- **Tax Transaction** (`TT-{doc id}-{i}{-reversal}`) — one per invoice `taxes`
+  row (rides in the submit payload's `taxes` array, computed client-side like
+  the Dart `TaxCalculationInterceptor` output): `tax_type`, `tax` (code),
+  `base_amount` (taxable), `tax_amount`, `rate`, `party_type`/`party` and the
+  voucher linkage. A zero-amount tax row posts no GL leg but still records its
+  taxable base — the VAT return is built from this subledger alone.
+
+Cancellation mirrors the stored rows: negated amounts, `-reversal` ids, and
+the Dart cancel trans_types (`Invoice → CreditNote`, `Payment → Adjustment`).
+The rows persist in their own tables (`0005_subledgers.sql`), ride in the
+command response (`party_transactions`, `tax_transactions`) and **replicate
+through the mutation log** as `Customer Transaction` / `Supplier Transaction`
+/ `Tax Transaction` row envelopes, so client devices receive exactly the rows
+the Dart derivation would have produced locally. Fixture
+`0009-subledger-rows.json` pins the amounts; `tests/posting_replication.rs`
+pins the wire envelopes.
+
 Deliberate Phase 3 MVP bounds (deviations from the full Dart engine, all
 flagged in the plan as later refinements): no UOM conversion at posting (line
 qty is taken in stock units), no multi-currency base-amount stamping
-(company-currency postings only), no customer/supplier/tax subledger rows
-(GL + settlements carry party fields; the client derives its subledgers), no
-receipt↔invoice line-linkage variance posting (the two-document flow clears
-GRNI at matching values), and Delivery Note / POS Invoice doctypes arrive with
-POS session close in Phase 6.
+(company-currency postings only), no receipt↔invoice line-linkage variance
+posting (the two-document flow clears GRNI at matching values), and Delivery
+Note / POS Invoice doctypes arrive with POS session close in Phase 6.
 
 ## Portal — customer / accountant links
 
@@ -349,7 +378,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 52 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 55 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
@@ -358,5 +387,6 @@ migrations): `0001_init.sql` for the coordination plane (includes the
 `0002_postings.sql` for the posting authority (documents, numbering_series,
 gl_entries, stock_ledger_entries, bins, settlements, posting_batches, items,
 company_settings, idempotency_keys), `0003_portal.sql` for the portal
-(portal_links, the company_documents read model) and `0004_payments.sql` for
-the payment plane (pay_links).
+(portal_links, the company_documents read model), `0004_payments.sql` for
+the payment plane (pay_links) and `0005_subledgers.sql` for the customer /
+supplier / tax subledger rows (party_transactions, tax_transactions).

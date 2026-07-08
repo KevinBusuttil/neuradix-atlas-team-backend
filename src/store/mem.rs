@@ -14,8 +14,8 @@ use crate::model::{
     TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
-    format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument,
-    PostingBatch, PostingCommit, Settlement, StockLedgerEntry,
+    format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction,
+    PostedDocument, PostingBatch, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
@@ -65,6 +65,8 @@ struct Inner {
     sle_seq: HashMap<Uuid, i64>,
     /// (company_id, item, warehouse) -> derived balance
     bins: HashMap<(Uuid, String, String), Bin>,
+    party_transactions: HashMap<Uuid, Vec<PartyTransaction>>,
+    tax_transactions: HashMap<Uuid, Vec<TaxTransaction>>,
     settlements: HashMap<Uuid, Vec<Settlement>>,
     batches: HashMap<(Uuid, String), PostingBatch>,
     /// (company_id, series key) -> last allocated value (gap-free)
@@ -186,6 +188,29 @@ impl MemStore {
             .filter(|((company, _, _), _)| *company == company_id)
             .map(|(_, bin)| bin.clone())
             .collect()
+    }
+
+    /// Test-inspection helper: every customer/supplier subledger row for a
+    /// company.
+    pub fn all_party_transactions(&self, company_id: Uuid) -> Vec<PartyTransaction> {
+        self.inner
+            .lock()
+            .unwrap()
+            .party_transactions
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Test-inspection helper: every tax subledger row for a company.
+    pub fn all_tax_transactions(&self, company_id: Uuid) -> Vec<TaxTransaction> {
+        self.inner
+            .lock()
+            .unwrap()
+            .tax_transactions
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Test-inspection helper: every settlement for a company.
@@ -545,6 +570,42 @@ impl Store for MemStore {
             .unwrap_or_default())
     }
 
+    async fn party_transactions_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<PartyTransaction>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .party_transactions
+            .get(&company_id)
+            .map(|log| {
+                log.iter()
+                    .filter(|t| t.voucher_no == voucher_no)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn tax_transactions_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<TaxTransaction>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .tax_transactions
+            .get(&company_id)
+            .map(|log| {
+                log.iter()
+                    .filter(|t| t.voucher_no == voucher_no)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn settlements_for_invoice(
         &self,
         company_id: Uuid,
@@ -697,6 +758,8 @@ impl Store for MemStore {
             is_cancel: commit.batch.kind == "cancel",
             gl_entries: &commit.gl_entries,
             stock_ledger_entries: &sequenced,
+            party_transactions: &commit.party_transactions,
+            tax_transactions: &commit.tax_transactions,
             settlements: &commit.settlements,
             bins: &commit.bins,
             outstanding_documents: &outstanding_docs,
@@ -714,6 +777,16 @@ impl Store for MemStore {
             .entry(company)
             .or_default()
             .extend(sequenced);
+        inner
+            .party_transactions
+            .entry(company)
+            .or_default()
+            .extend(commit.party_transactions);
+        inner
+            .tax_transactions
+            .entry(company)
+            .or_default()
+            .extend(commit.tax_transactions);
         inner
             .settlements
             .entry(company)

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use atlas_team_backend::posting::model::Bin;
+use atlas_team_backend::posting::model::{Bin, PartyTransaction, TaxTransaction};
 use atlas_team_backend::store::MemStore;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -223,6 +223,38 @@ impl TestApp {
             .all_stock_ledger_entries(self.company_uuid())
             .iter()
             .filter(|sle| sle.voucher_no == voucher_no)
+            .count()
+    }
+
+    /// A customer/supplier subledger row by its deterministic id.
+    pub fn party_transaction(&self, id: &str) -> Option<PartyTransaction> {
+        self.store
+            .all_party_transactions(self.company_uuid())
+            .into_iter()
+            .find(|t| t.id == id)
+    }
+
+    /// A tax subledger row by its deterministic id.
+    pub fn tax_transaction(&self, id: &str) -> Option<TaxTransaction> {
+        self.store
+            .all_tax_transactions(self.company_uuid())
+            .into_iter()
+            .find(|t| t.id == id)
+    }
+
+    pub fn party_transaction_count(&self, voucher_no: &str) -> usize {
+        self.store
+            .all_party_transactions(self.company_uuid())
+            .iter()
+            .filter(|t| t.voucher_no == voucher_no)
+            .count()
+    }
+
+    pub fn tax_transaction_count(&self, voucher_no: &str) -> usize {
+        self.store
+            .all_tax_transactions(self.company_uuid())
+            .iter()
+            .filter(|t| t.voucher_no == voucher_no)
             .count()
     }
 

@@ -24,7 +24,9 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::model::{MutationRecord, MutationStatus, MutationType};
-use crate::posting::model::{Bin, GlEntry, PostedDocument, Settlement, StockLedgerEntry};
+use crate::posting::model::{
+    Bin, GlEntry, PartyTransaction, PostedDocument, Settlement, StockLedgerEntry, TaxTransaction,
+};
 use crate::posting::values::REVERSAL_SUFFIX;
 
 /// Device id stamped on server-authored mutations. Devices skip only their
@@ -42,6 +44,8 @@ pub struct ReplicationSources<'a> {
     pub is_cancel: bool,
     pub gl_entries: &'a [GlEntry],
     pub stock_ledger_entries: &'a [StockLedgerEntry],
+    pub party_transactions: &'a [PartyTransaction],
+    pub tax_transactions: &'a [TaxTransaction],
     pub settlements: &'a [Settlement],
     pub bins: &'a [Bin],
     pub outstanding_documents: &'a [PostedDocument],
@@ -152,6 +156,30 @@ pub fn replication_mutations(
         ));
     }
 
+    // Customer / supplier subledger rows — the Dart `Customer Transaction` /
+    // `Supplier Transaction` row shapes (`CT-…` / `VT-…` ids, the party under
+    // its `customer` / `supplier` field name).
+    for txn in src.party_transactions {
+        out.push(record(
+            format!("postmut-{}", txn.id),
+            MutationType::CreateDocument,
+            txn.kind.doctype(),
+            &txn.id,
+            row_envelope(&txn.id, txn.kind.doctype(), 0, &txn.row_fields(), now_ms)?,
+        ));
+    }
+
+    // Tax subledger rows — the Dart `Tax Transaction` shape (`TT-…` ids).
+    for txn in src.tax_transactions {
+        out.push(record(
+            format!("postmut-{}", txn.id),
+            MutationType::CreateDocument,
+            "Tax Transaction",
+            &txn.id,
+            row_envelope(&txn.id, "Tax Transaction", 0, &txn.row_fields(), now_ms)?,
+        ));
+    }
+
     // Settlements — field names per the Dart payment-entry derivation.
     for settlement in src.settlements {
         let mut fields = Map::new();
@@ -234,13 +262,16 @@ pub fn replication_mutations(
 }
 
 /// A document's payload as header fields: the stored payload object minus the
-/// `items` child rows (which live in `document_children` client-side).
+/// child-row tables (which live in `document_children` client-side, already
+/// replicated through the client's own draft mutations).
 fn header_fields(payload: &Value) -> Map<String, Value> {
     let mut fields = match payload {
         Value::Object(map) => map.clone(),
         _ => Map::new(),
     };
-    fields.remove("items");
+    for child_table in ["items", "taxes", "references", "tenders", "accounts"] {
+        fields.remove(child_table);
+    }
     fields
 }
 

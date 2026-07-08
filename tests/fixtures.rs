@@ -72,6 +72,18 @@ struct Checks {
     sle_count: HashMap<String, usize>,
     #[serde(default)]
     settlement_count: HashMap<String, usize>,
+    /// Customer/supplier subledger rows checked by deterministic id.
+    #[serde(default)]
+    party_rows: Vec<PartyRowCheck>,
+    /// Tax subledger rows checked by deterministic id.
+    #[serde(default)]
+    tax_rows: Vec<TaxRowCheck>,
+    /// voucher -> expected customer+supplier subledger row count.
+    #[serde(default)]
+    party_count: HashMap<String, usize>,
+    /// voucher -> expected tax subledger row count.
+    #[serde(default)]
+    tax_count: HashMap<String, usize>,
     /// "Doctype/DocumentId" -> outstanding_amount.
     #[serde(default)]
     outstanding: HashMap<String, f64>,
@@ -98,6 +110,38 @@ struct BinCheck {
     value: f64,
     #[serde(default)]
     rate: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct PartyRowCheck {
+    id: String,
+    doctype: String,
+    trans_type: String,
+    party: String,
+    amount: f64,
+    #[serde(default)]
+    base_amount: Option<f64>,
+    #[serde(default)]
+    due_date: Option<String>,
+    #[serde(default)]
+    is_reversal: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct TaxRowCheck {
+    id: String,
+    base_amount: f64,
+    tax_amount: f64,
+    #[serde(default)]
+    rate: Option<f64>,
+    #[serde(default)]
+    tax_type: Option<String>,
+    #[serde(default)]
+    tax: Option<String>,
+    #[serde(default)]
+    party_type: Option<String>,
+    #[serde(default)]
+    party: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -220,6 +264,120 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
         let actual = app.settlement_count(payment);
         assert_eq!(actual, *expected, "{step}: settlement count for {payment}");
     }
+    for check in &checks.party_rows {
+        let row = app
+            .party_transaction(&check.id)
+            .unwrap_or_else(|| panic!("{step}: missing party subledger row {}", check.id));
+        assert_eq!(
+            row.kind.doctype(),
+            check.doctype,
+            "{step}: doctype for {}",
+            check.id
+        );
+        assert_eq!(
+            row.trans_type, check.trans_type,
+            "{step}: trans_type for {}",
+            check.id
+        );
+        assert_eq!(row.party, check.party, "{step}: party for {}", check.id);
+        assert!(
+            approx(row.amount, check.amount),
+            "{step}: amount for {} is {}, expected {}",
+            check.id,
+            row.amount,
+            check.amount
+        );
+        if let Some(expected) = check.base_amount {
+            assert!(
+                approx(row.base_amount, expected),
+                "{step}: base_amount for {} is {}, expected {expected}",
+                check.id,
+                row.base_amount
+            );
+        }
+        if let Some(expected) = &check.due_date {
+            assert_eq!(
+                row.due_date.as_deref(),
+                Some(expected.as_str()),
+                "{step}: due_date for {}",
+                check.id
+            );
+        }
+        if let Some(expected) = check.is_reversal {
+            assert_eq!(
+                row.is_reversal, expected,
+                "{step}: is_reversal for {}",
+                check.id
+            );
+        }
+    }
+    for check in &checks.tax_rows {
+        let row = app
+            .tax_transaction(&check.id)
+            .unwrap_or_else(|| panic!("{step}: missing tax subledger row {}", check.id));
+        assert!(
+            approx(row.base_amount, check.base_amount),
+            "{step}: base_amount for {} is {}, expected {}",
+            check.id,
+            row.base_amount,
+            check.base_amount
+        );
+        assert!(
+            approx(row.tax_amount, check.tax_amount),
+            "{step}: tax_amount for {} is {}, expected {}",
+            check.id,
+            row.tax_amount,
+            check.tax_amount
+        );
+        if let Some(expected) = check.rate {
+            assert!(
+                approx(row.rate, expected),
+                "{step}: rate for {} is {}, expected {expected}",
+                check.id,
+                row.rate
+            );
+        }
+        if let Some(expected) = &check.tax_type {
+            assert_eq!(&row.tax_type, expected, "{step}: tax_type for {}", check.id);
+        }
+        if let Some(expected) = &check.tax {
+            assert_eq!(
+                row.tax.as_deref(),
+                Some(expected.as_str()),
+                "{step}: tax code for {}",
+                check.id
+            );
+        }
+        if let Some(expected) = &check.party_type {
+            assert_eq!(
+                &row.party_type, expected,
+                "{step}: party_type for {}",
+                check.id
+            );
+        }
+        if let Some(expected) = &check.party {
+            assert_eq!(
+                row.party.as_deref(),
+                Some(expected.as_str()),
+                "{step}: party for {}",
+                check.id
+            );
+        }
+    }
+    for (voucher, expected) in &checks.party_count {
+        let actual = app.party_transaction_count(voucher);
+        assert_eq!(
+            actual, *expected,
+            "{step}: party subledger count for {voucher}"
+        );
+    }
+    for (voucher, expected) in &checks.tax_count {
+        let actual = app.tax_transaction_count(voucher);
+        assert_eq!(
+            actual, *expected,
+            "{step}: tax subledger count for {voucher}"
+        );
+    }
     for (key, expected) in &checks.outstanding {
         let (doctype, id) = key
             .split_once('/')
@@ -293,6 +451,7 @@ fixture_test!(
     fixture_0008_transfer_value_neutral,
     "0008-transfer-value-neutral.json"
 );
+fixture_test!(fixture_0009_subledger_rows, "0009-subledger-rows.json");
 
 /// Every fixture file on disk must be wired to a test above — a new fixture
 /// that nobody runs is a silent hole in the contract.
@@ -307,6 +466,7 @@ fn every_fixture_file_is_covered() {
         "0006-period-lock.json",
         "0007-role-rejection.json",
         "0008-transfer-value-neutral.json",
+        "0009-subledger-rows.json",
     ];
     let mut on_disk: Vec<String> = std::fs::read_dir(fixtures_dir())
         .expect("fixtures dir")

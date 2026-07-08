@@ -12,8 +12,8 @@ use crate::model::{
     Role, TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
-    format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit,
-    Settlement, StockLedgerEntry,
+    format_number, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
+    PostedDocument, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
@@ -76,6 +76,47 @@ fn sle_from_row(row: &PgRow) -> Result<StockLedgerEntry, StoreError> {
         is_reversal: row.try_get("is_reversal")?,
         batch_id: row.try_get("batch_id")?,
         seq: row.try_get("seq")?,
+    })
+}
+
+fn party_txn_from_row(row: &PgRow) -> Result<PartyTransaction, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    Ok(PartyTransaction {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        kind: PartyKind::parse(&kind)
+            .ok_or_else(|| StoreError::Internal(format!("unknown party kind in db: {kind}")))?,
+        trans_type: row.try_get("trans_type")?,
+        party: row.try_get("party")?,
+        posting_date: row.try_get("posting_date")?,
+        due_date: row.try_get("due_date")?,
+        amount: row.try_get("amount")?,
+        currency: row.try_get("currency")?,
+        conversion_rate: row.try_get("conversion_rate")?,
+        base_amount: row.try_get("base_amount")?,
+        voucher_type: row.try_get("voucher_type")?,
+        voucher_no: row.try_get("voucher_no")?,
+        is_reversal: row.try_get("is_reversal")?,
+        batch_id: row.try_get("batch_id")?,
+    })
+}
+
+fn tax_txn_from_row(row: &PgRow) -> Result<TaxTransaction, StoreError> {
+    Ok(TaxTransaction {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        tax_type: row.try_get("tax_type")?,
+        tax: row.try_get("tax")?,
+        posting_date: row.try_get("posting_date")?,
+        base_amount: row.try_get("base_amount")?,
+        tax_amount: row.try_get("tax_amount")?,
+        rate: row.try_get("rate")?,
+        party_type: row.try_get("party_type")?,
+        party: row.try_get("party")?,
+        voucher_type: row.try_get("voucher_type")?,
+        voucher_no: row.try_get("voucher_no")?,
+        is_reversal: row.try_get("is_reversal")?,
+        batch_id: row.try_get("batch_id")?,
     })
 }
 
@@ -765,6 +806,41 @@ impl Store for PgStore {
         rows.iter().map(gl_from_row).collect()
     }
 
+    async fn party_transactions_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<PartyTransaction>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, kind, trans_type, party, posting_date, due_date, amount, \
+             currency, conversion_rate, base_amount, voucher_type, voucher_no, is_reversal, \
+             batch_id \
+             from party_transactions where company_id = $1 and voucher_no = $2 order by id",
+        )
+        .bind(company_id)
+        .bind(voucher_no)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(party_txn_from_row).collect()
+    }
+
+    async fn tax_transactions_for_voucher(
+        &self,
+        company_id: Uuid,
+        voucher_no: &str,
+    ) -> Result<Vec<TaxTransaction>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, tax_type, tax, posting_date, base_amount, tax_amount, rate, \
+             party_type, party, voucher_type, voucher_no, is_reversal, batch_id \
+             from tax_transactions where company_id = $1 and voucher_no = $2 order by id",
+        )
+        .bind(company_id)
+        .bind(voucher_no)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(tax_txn_from_row).collect()
+    }
+
     async fn settlements_for_invoice(
         &self,
         company_id: Uuid,
@@ -1001,6 +1077,58 @@ impl Store for PgStore {
             .await?;
         }
 
+        for txn in &commit.party_transactions {
+            sqlx::query(
+                "insert into party_transactions \
+                 (company_id, id, kind, trans_type, party, posting_date, due_date, amount, \
+                  currency, conversion_rate, base_amount, voucher_type, voucher_no, \
+                  is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            )
+            .bind(company)
+            .bind(&txn.id)
+            .bind(txn.kind.as_str())
+            .bind(&txn.trans_type)
+            .bind(&txn.party)
+            .bind(&txn.posting_date)
+            .bind(&txn.due_date)
+            .bind(txn.amount)
+            .bind(&txn.currency)
+            .bind(txn.conversion_rate)
+            .bind(txn.base_amount)
+            .bind(&txn.voucher_type)
+            .bind(&txn.voucher_no)
+            .bind(txn.is_reversal)
+            .bind(&txn.batch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for txn in &commit.tax_transactions {
+            sqlx::query(
+                "insert into tax_transactions \
+                 (company_id, id, tax_type, tax, posting_date, base_amount, tax_amount, rate, \
+                  party_type, party, voucher_type, voucher_no, is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            )
+            .bind(company)
+            .bind(&txn.id)
+            .bind(&txn.tax_type)
+            .bind(&txn.tax)
+            .bind(&txn.posting_date)
+            .bind(txn.base_amount)
+            .bind(txn.tax_amount)
+            .bind(txn.rate)
+            .bind(&txn.party_type)
+            .bind(&txn.party)
+            .bind(&txn.voucher_type)
+            .bind(&txn.voucher_no)
+            .bind(txn.is_reversal)
+            .bind(&txn.batch_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         for settlement in &commit.settlements {
             sqlx::query(
                 "insert into settlements \
@@ -1084,6 +1212,8 @@ impl Store for PgStore {
             is_cancel: commit.batch.kind == "cancel",
             gl_entries: &commit.gl_entries,
             stock_ledger_entries: &commit.stock_ledger_entries,
+            party_transactions: &commit.party_transactions,
+            tax_transactions: &commit.tax_transactions,
             settlements: &commit.settlements,
             bins: &commit.bins,
             outstanding_documents: &outstanding_docs,
