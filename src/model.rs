@@ -156,6 +156,28 @@ pub struct PortalLink {
 }
 
 // ---------------------------------------------------------------------------
+// Pay links (invoice payment plane — pay.atlas.neuradix.app)
+// ---------------------------------------------------------------------------
+
+/// A tokenized invoice payment link. Like portal links, the token is a
+/// distinct token kind: its hash is stored only here, so a pay token can
+/// never authenticate a member/device/portal endpoint and vice versa. A pay
+/// link exposes exactly one submitted Sales Invoice, read-only, plus the
+/// payment handoff (Stripe Payment Link URL or manual instructions).
+#[derive(Debug, Clone)]
+pub struct PayLink {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    /// The Sales Invoice document id the link pays.
+    pub invoice_id: String,
+    pub token_hash: String,
+    pub created_by: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
 // Sync (mirrors the Dart MutationRecord)
 // ---------------------------------------------------------------------------
 

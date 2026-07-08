@@ -181,6 +181,14 @@ pub struct CompanySettings {
     pub default_cogs_account: String,
     pub default_grni_account: String,
     pub default_stock_adjustment_account: String,
+    /// A Stripe Payment Link URL (`https://buy.stripe.com/...`). When set,
+    /// the pay page's "Pay by card" button links here with
+    /// `?client_reference_id={pay token}` appended — the backend itself never
+    /// calls out to Stripe.
+    pub stripe_payment_link_url: Option<String>,
+    /// Manual payment instructions (bank transfer details etc.) rendered on
+    /// the pay page when no Stripe Payment Link is configured.
+    pub payment_instructions: Option<String>,
 }
 
 impl Default for CompanySettings {
@@ -197,6 +205,8 @@ impl Default for CompanySettings {
             default_cogs_account: "COGS".into(),
             default_grni_account: "GRNI".into(),
             default_stock_adjustment_account: "Stock Adjustment".into(),
+            stripe_payment_link_url: None,
+            payment_instructions: None,
         }
     }
 }

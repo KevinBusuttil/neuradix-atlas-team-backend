@@ -8,8 +8,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, PortalLink, PortalLinkKind, Role,
-    TokenIdentity, User, WebhookEvent,
+    AuditEntry, Company, Device, Invitation, MutationRecord, PayLink, PortalLink, PortalLinkKind,
+    Role, TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
     format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit,
@@ -170,6 +170,19 @@ fn portal_link_from_row(row: &PgRow) -> Result<PortalLink, StoreError> {
         })?,
         party: row.try_get("party")?,
         label: row.try_get("label")?,
+        token_hash: row.try_get("token_hash")?,
+        created_by: row.try_get("created_by")?,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
+fn pay_link_from_row(row: &PgRow) -> Result<PayLink, StoreError> {
+    Ok(PayLink {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        invoice_id: row.try_get("invoice_id")?,
         token_hash: row.try_get("token_hash")?,
         created_by: row.try_get("created_by")?,
         created_at: row.try_get("created_at")?,
@@ -1191,6 +1204,65 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| portal_link_from_row(&row)).transpose()
+    }
+
+    // ------------------------------------------------------------------
+    // Pay links (invoice payment plane)
+    // ------------------------------------------------------------------
+
+    async fn create_pay_link(&self, link: PayLink) -> Result<(), StoreError> {
+        sqlx::query(
+            "insert into pay_links \
+             (id, company_id, invoice_id, token_hash, created_by, created_at, \
+              expires_at, revoked_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(link.id)
+        .bind(link.company_id)
+        .bind(&link.invoice_id)
+        .bind(&link.token_hash)
+        .bind(link.created_by)
+        .bind(link.created_at)
+        .bind(link.expires_at)
+        .bind(link.revoked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn pay_links(&self, company_id: Uuid) -> Result<Vec<PayLink>, StoreError> {
+        let rows = sqlx::query(
+            "select id, company_id, invoice_id, token_hash, created_by, created_at, \
+             expires_at, revoked_at from pay_links \
+             where company_id = $1 order by created_at",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(pay_link_from_row).collect()
+    }
+
+    async fn revoke_pay_link(&self, company_id: Uuid, link_id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "update pay_links set revoked_at = coalesce(revoked_at, now()) \
+             where company_id = $1 and id = $2",
+        )
+        .bind(company_id)
+        .bind(link_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn pay_link_by_hash(&self, token_hash: &str) -> Result<Option<PayLink>, StoreError> {
+        let row = sqlx::query(
+            "select id, company_id, invoice_id, token_hash, created_by, created_at, \
+             expires_at, revoked_at from pay_links where token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| pay_link_from_row(&row)).transpose()
     }
 
     async fn company_document(

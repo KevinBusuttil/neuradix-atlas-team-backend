@@ -66,6 +66,8 @@ pub fn router(state: AppState) -> Router {
         )
         // Portal-link management + the token-scoped portal plane.
         .merge(crate::portal::routes())
+        // Pay-link management + the token-scoped pay plane.
+        .merge(crate::pay::routes())
         .with_state(state)
 }
 

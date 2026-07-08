@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, PortalLink, Role, TokenIdentity, User,
-    WebhookEvent,
+    AuditEntry, Company, Device, Invitation, MutationRecord, PayLink, PortalLink, Role,
+    TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
     format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument,
@@ -75,6 +75,8 @@ struct Inner {
     // Portal (links + materialized document read model)
     /// link id -> portal link
     portal_links: HashMap<Uuid, PortalLink>,
+    /// link id -> pay link (invoice payment plane)
+    pay_links: HashMap<Uuid, PayLink>,
     /// (company_id, doctype, document id) -> projected read-model row
     company_documents: HashMap<(Uuid, String, String), CompanyDocument>,
 }
@@ -778,6 +780,48 @@ impl Store for MemStore {
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .portal_links
+            .values()
+            .find(|link| link.token_hash == token_hash)
+            .cloned())
+    }
+
+    // ------------------------------------------------------------------
+    // Pay links (invoice payment plane)
+    // ------------------------------------------------------------------
+
+    async fn create_pay_link(&self, link: PayLink) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pay_links.insert(link.id, link);
+        Ok(())
+    }
+
+    async fn pay_links(&self, company_id: Uuid) -> Result<Vec<PayLink>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut links: Vec<PayLink> = inner
+            .pay_links
+            .values()
+            .filter(|link| link.company_id == company_id)
+            .cloned()
+            .collect();
+        links.sort_by_key(|link| link.created_at);
+        Ok(links)
+    }
+
+    async fn revoke_pay_link(&self, company_id: Uuid, link_id: Uuid) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.pay_links.get_mut(&link_id) {
+            Some(link) if link.company_id == company_id => {
+                link.revoked_at.get_or_insert_with(Utc::now);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn pay_link_by_hash(&self, token_hash: &str) -> Result<Option<PayLink>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .pay_links
             .values()
             .find(|link| link.token_hash == token_hash)
             .cloned())

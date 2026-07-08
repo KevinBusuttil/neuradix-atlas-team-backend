@@ -253,14 +253,56 @@ JSON is the default.
 | GET | `/portal/{token}/audit?limit=n` | accountant | Recent audit rows |
 
 Payments are **not** part of the portal (that is the payment-links item;
-invoice payment hands off to `pay.` later).
+invoice payment hands off to `pay.`, below).
+
+## Payments — invoice pay links + Stripe webhook processing
+
+Payment links (`docs/NEURADIX_DOMAIN_AND_BRAND_ARCHITECTURE.md` §12) are
+served under `pay.atlas.neuradix.app`; the paths are host-agnostic and live in
+this same binary (`src/pay.rs`).
+
+### Pay links (management plane, existing bearer auth)
+
+Pay tokens are a **distinct token kind** (their own `pay_links` table, hashed
+at rest): a pay token never authenticates a member/device/portal endpoint and
+other tokens never resolve on the pay plane.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/companies/{id}/pay-links` | **owner, admin, sales or accountant** | `{invoice_id, expires_days (default 60)}` → `{token, url_path: "/pay/{token}", expiresAt}`. The invoice must exist as a **submitted Sales Invoice** (posted document or read model), 404 otherwise |
+| GET | `/companies/{id}/pay-links` | same roles | Link metadata + revoked state (tokens are never returned) |
+| DELETE | `/companies/{id}/pay-links/{link_id}` | same roles | Revoke |
+
+### Pay page (the token in the path is the credential)
+
+`GET /pay/{token}` — no other auth; unknown, expired and revoked tokens all
+read as **404**. JSON by default; `Accept: text/html` returns a minimal
+server-rendered page (portal renderer pattern: inline styles, no external
+assets, every interpolated value HTML-escaped). Both views carry the company
+name, invoice id + official number, posting date, line items, grand total, the
+**live outstanding amount** (from the posted document's payload, maintained by
+the posting engine on every settlement) and the payment state — outstanding 0
+renders "Paid — thank you".
+
+### Card payments without outbound HTTP
+
+The backend never calls Stripe. The owner creates a **Stripe Payment Link**
+in the Stripe dashboard and stores its URL in the company settings
+(`stripe_payment_link_url`, on the settings GET/PUT whitelist). The pay page's
+"Pay by card" button links there with `?client_reference_id={token}` appended;
+Stripe echoes `client_reference_id` back in its webhook, which is how a
+payment finds its invoice — payment state flows exclusively through the
+already-public webhook intake, so the backend needs no Stripe API key and no
+egress. When `stripe_payment_link_url` is unset the page renders the company's
+`payment_instructions` settings text (bank transfer details etc., also
+whitelisted) instead.
 
 ## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 46 tests over MemStore (unit + API + fixtures + posting + replication + portal); no DB required
+cargo test          # 49 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
@@ -268,5 +310,6 @@ migrations): `0001_init.sql` for the coordination plane (includes the
 `mutations(company_id, sync_version)` index the pull path relies on),
 `0002_postings.sql` for the posting authority (documents, numbering_series,
 gl_entries, stock_ledger_entries, bins, settlements, posting_batches, items,
-company_settings, idempotency_keys) and `0003_portal.sql` for the portal
-(portal_links, the company_documents read model).
+company_settings, idempotency_keys), `0003_portal.sql` for the portal
+(portal_links, the company_documents read model) and `0004_payments.sql` for
+the payment plane (pay_links).

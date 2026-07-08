@@ -13,6 +13,7 @@ pub mod api;
 pub mod auth;
 pub mod error;
 pub mod model;
+pub mod pay;
 pub mod portal;
 pub mod posting;
 pub mod projection;

@@ -10,8 +10,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, PortalLink, Role, TokenIdentity, User,
-    WebhookEvent,
+    AuditEntry, Company, Device, Invitation, MutationRecord, PayLink, PortalLink, Role,
+    TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
     CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit, Settlement,
@@ -207,6 +207,20 @@ pub trait Store: Send + Sync {
     /// device tokens live in different tables and never match here.
     async fn portal_link_by_hash(&self, token_hash: &str)
         -> Result<Option<PortalLink>, StoreError>;
+
+    // ------------------------------------------------------------------
+    // Pay links (invoice payment plane)
+    // ------------------------------------------------------------------
+
+    async fn create_pay_link(&self, link: PayLink) -> Result<(), StoreError>;
+    /// All pay links of a company (metadata; only token hashes are stored).
+    async fn pay_links(&self, company_id: Uuid) -> Result<Vec<PayLink>, StoreError>;
+    /// Marks a pay link revoked; idempotent. Returns false when the link does
+    /// not belong to the company.
+    async fn revoke_pay_link(&self, company_id: Uuid, link_id: Uuid) -> Result<bool, StoreError>;
+    /// Resolves a pay token hash — and only a pay token hash: member /
+    /// device / portal tokens live in different tables and never match here.
+    async fn pay_link_by_hash(&self, token_hash: &str) -> Result<Option<PayLink>, StoreError>;
 
     /// One row of the materialized document read model.
     async fn company_document(
