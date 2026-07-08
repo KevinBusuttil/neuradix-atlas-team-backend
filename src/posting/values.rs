@@ -62,6 +62,29 @@ pub fn is_stock_item_type(item_type: Option<&str>) -> bool {
     }
 }
 
+/// The transaction→stock UOM conversion factor for an item — 1.0 when the
+/// line UOM is the item's stock UOM (or unknown/missing/unregistered). Reads
+/// `Item.uoms` for a matching row with a positive `conversion_factor`,
+/// mirroring the Dart `uomFactor` so both engines agree on how much inventory
+/// a line really moves.
+pub fn uom_factor(item: Option<&crate::posting::model::Item>, line_uom: Option<&str>) -> f64 {
+    let (Some(item), Some(line_uom)) = (item, line_uom) else {
+        return 1.0;
+    };
+    let Some(stock_uom) = item.stock_uom.as_deref() else {
+        return 1.0;
+    };
+    if stock_uom == line_uom {
+        return 1.0;
+    }
+    for row in &item.uoms {
+        if row.uom == line_uom && row.conversion_factor > 0.0 {
+            return row.conversion_factor;
+        }
+    }
+    1.0
+}
+
 /// An invoice's outstanding balance: grand total less everything settled
 /// against it. Allocations are already signed (reversals negative), so a
 /// plain sum nets cancellations correctly (Dart `outstandingAmount`).

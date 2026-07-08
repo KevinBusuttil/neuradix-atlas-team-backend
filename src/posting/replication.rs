@@ -146,6 +146,11 @@ pub fn replication_mutations(
         fields.insert("posting_date".into(), json!(sle.posting_date));
         fields.insert("voucher_type".into(), json!(sle.voucher_type));
         fields.insert("voucher_no".into(), json!(sle.voucher_no));
+        // Transaction UOM (qty/rate are already stock units), like the Dart
+        // `_sle` builder's optional `uom` field.
+        if let Some(uom) = &sle.uom {
+            fields.insert("uom".into(), json!(uom));
+        }
         fields.insert("is_reversal".into(), json!(sle.is_reversal));
         out.push(record(
             format!("postmut-{}", sle.id),

@@ -72,6 +72,10 @@ struct Checks {
     sle_count: HashMap<String, usize>,
     #[serde(default)]
     settlement_count: HashMap<String, usize>,
+    /// Stock ledger rows checked by deterministic id (qty/rate in stock
+    /// units; `uom` is the transaction UOM the line was entered in).
+    #[serde(default)]
+    sle_rows: Vec<SleRowCheck>,
     /// Customer/supplier subledger rows checked by deterministic id.
     #[serde(default)]
     party_rows: Vec<PartyRowCheck>,
@@ -110,6 +114,15 @@ struct BinCheck {
     value: f64,
     #[serde(default)]
     rate: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct SleRowCheck {
+    id: String,
+    qty_change: f64,
+    valuation_rate: f64,
+    #[serde(default)]
+    uom: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -263,6 +276,33 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
     for (payment, expected) in &checks.settlement_count {
         let actual = app.settlement_count(payment);
         assert_eq!(actual, *expected, "{step}: settlement count for {payment}");
+    }
+    for check in &checks.sle_rows {
+        let row = app
+            .stock_ledger_entry(&check.id)
+            .unwrap_or_else(|| panic!("{step}: missing stock ledger entry {}", check.id));
+        assert!(
+            approx(row.qty_change, check.qty_change),
+            "{step}: qty_change for {} is {}, expected {}",
+            check.id,
+            row.qty_change,
+            check.qty_change
+        );
+        assert!(
+            approx(row.valuation_rate, check.valuation_rate),
+            "{step}: valuation_rate for {} is {}, expected {}",
+            check.id,
+            row.valuation_rate,
+            check.valuation_rate
+        );
+        if let Some(expected) = &check.uom {
+            assert_eq!(
+                row.uom.as_deref(),
+                Some(expected.as_str()),
+                "{step}: uom for {}",
+                check.id
+            );
+        }
     }
     for check in &checks.party_rows {
         let row = app
@@ -453,6 +493,7 @@ fixture_test!(
 );
 fixture_test!(fixture_0009_subledger_rows, "0009-subledger-rows.json");
 fixture_test!(fixture_0010_pos_and_delivery, "0010-pos-and-delivery.json");
+fixture_test!(fixture_0011_uom_conversion, "0011-uom-conversion.json");
 
 /// Every fixture file on disk must be wired to a test above — a new fixture
 /// that nobody runs is a silent hole in the contract.
@@ -469,6 +510,7 @@ fn every_fixture_file_is_covered() {
         "0008-transfer-value-neutral.json",
         "0009-subledger-rows.json",
         "0010-pos-and-delivery.json",
+        "0011-uom-conversion.json",
     ];
     let mut on_disk: Vec<String> = std::fs::read_dir(fixtures_dir())
         .expect("fixtures dir")

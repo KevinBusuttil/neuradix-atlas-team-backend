@@ -105,7 +105,7 @@ missing or unknown).
 | POST | `/webhooks/channels/{connector}` | none (verification is later work) | Same log-only intake, `kind = channel` |
 | GET | `/companies/{id}/audit?limit=n` | **owner, admin or accountant** | Recent audit rows (newest first) |
 | GET / PUT | `/companies/{id}/settings` | member / **owner, admin or accountant** | Company posting settings (merge-patch): `allow_negative_stock`, `books_lock_date`, default posting accounts |
-| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, *_account overrides}` |
+| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}` |
 | POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, bins, settlements}` |
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 
@@ -244,13 +244,28 @@ Both cancel through the same exact-reversal path (stored rates reused,
 `-reversal` ids) and both are covered by the sync-plane immutability guard
 (`POSTED_DOCTYPES`). Fixture `0010-pos-and-delivery.json` pins the flows.
 
+### UOM conversion at posting
+
+Items in the registry upsert take an optional `stock_uom` plus a `uoms` list
+(`[{uom, conversion_factor}]`, factor = stock units per one transaction
+unit), matching the Dart `Item.uoms` / `UOM Conversion Detail` child table.
+Submit lines may carry `uom`; when it differs from the item's stock UOM the
+engine mirrors the Dart `uomFactor` + `_costStockMovements` semantics: the
+SLE qty converts to stock units (`qty × factor`) so ledger, bins and the
+negative-stock guard always track stock units, a plain receipt's rate divides
+by the same factor (total stock value is preserved), issues cost in stock
+units, and monetary line amounts stay exactly as sent. The SLE keeps the
+transaction `uom` field (replicated too) for row parity with Dart; unknown
+UOMs, unregistered items and missing `stock_uom` all default to factor 1.
+Cancellation mirrors the stored (already converted) rows and never
+re-converts. Fixture `0011-uom-conversion.json` pins the behaviour.
+
 Deliberate Phase 3 MVP bounds (deviations from the full Dart engine, all
-flagged in the plan as later refinements): no UOM conversion at posting (line
-qty is taken in stock units), no multi-currency base-amount stamping
-(company-currency postings only), and no receipt↔invoice line-linkage
-variance posting (the two-document flow clears GRNI at matching values). POS
-*session close* remains Phase 6 client-side work — the POS Invoice posting
-itself is supported here.
+flagged in the plan as later refinements): no multi-currency base-amount
+stamping (company-currency postings only), and no receipt↔invoice
+line-linkage variance posting (the two-document flow clears GRNI at matching
+values). POS *session close* remains Phase 6 client-side work — the POS
+Invoice posting itself is supported here.
 
 ## Portal — customer / accountant links
 
@@ -400,7 +415,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 57 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 58 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
@@ -410,5 +425,6 @@ migrations): `0001_init.sql` for the coordination plane (includes the
 gl_entries, stock_ledger_entries, bins, settlements, posting_batches, items,
 company_settings, idempotency_keys), `0003_portal.sql` for the portal
 (portal_links, the company_documents read model), `0004_payments.sql` for
-the payment plane (pay_links) and `0005_subledgers.sql` for the customer /
-supplier / tax subledger rows (party_transactions, tax_transactions).
+the payment plane (pay_links), `0005_subledgers.sql` for the customer /
+supplier / tax subledger rows (party_transactions, tax_transactions) and
+`0006_sle_uom.sql` for the stock ledger's transaction-UOM column.

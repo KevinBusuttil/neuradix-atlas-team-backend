@@ -25,7 +25,8 @@ use crate::posting::model::{
 };
 use crate::posting::stock::{compute_balance, issue_rate, LedgerRow};
 use crate::posting::values::{
-    as_non_empty, as_num, is_stock_item_type, is_true, outstanding_amount, REVERSAL_SUFFIX,
+    as_non_empty, as_num, is_stock_item_type, is_true, outstanding_amount, uom_factor,
+    REVERSAL_SUFFIX,
 };
 use crate::store::{Store, StoreError};
 
@@ -556,6 +557,7 @@ impl RowContext<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sle(
         &self,
         id: String,
@@ -564,6 +566,7 @@ impl RowContext<'_> {
         warehouse: String,
         qty_change: f64,
         valuation_rate: f64,
+        uom: Option<String>,
     ) -> StockLedgerEntry {
         StockLedgerEntry {
             id,
@@ -576,6 +579,7 @@ impl RowContext<'_> {
             voucher_type: self.doctype.to_string(),
             voucher_no: self.document_id.to_string(),
             posting_date: self.posting_date.to_string(),
+            uom,
             is_reversal: false,
             batch_id: self.batch_id.to_string(),
             seq: 0, // assigned by the store at commit
@@ -1030,6 +1034,7 @@ fn stock_document_rows(
             warehouse,
             qty_change,
             rate,
+            as_non_empty(line.get("uom")),
         ));
     }
     rows
@@ -1058,6 +1063,7 @@ fn stock_entry_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<S
         };
         let qty = as_num(line.get("qty"));
         let rate = as_num(line.get("valuation_rate"));
+        let uom = as_non_empty(line.get("uom"));
         if let Some(source) = as_non_empty(line.get("source_warehouse")) {
             // Leaves the source on submit.
             rows.push(ctx.sle(
@@ -1067,6 +1073,7 @@ fn stock_entry_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<S
                 source,
                 -qty,
                 rate,
+                uom.clone(),
             ));
         }
         if let Some(target) = as_non_empty(line.get("target_warehouse")) {
@@ -1078,6 +1085,7 @@ fn stock_entry_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<S
                 target,
                 qty,
                 rate,
+                uom,
             ));
         }
     }
@@ -1219,15 +1227,24 @@ async fn cost_stock_movements(
     // ledger cache mutably, which `iter_mut()` + await points can't express.
     #[allow(clippy::needless_range_loop)]
     for index in 0..sles.len() {
-        let (item, warehouse, qty_change, trans_type) = {
+        let (item, warehouse, trans_type, uom) = {
             let sle = &sles[index];
             (
                 sle.item.clone(),
                 sle.warehouse.clone(),
-                sle.qty_change,
                 sle.trans_type.clone(),
+                sle.uom.clone(),
             )
         };
+        // Convert the line qty (in its transaction UOM) to stock units so the
+        // ledger and bins always track the stock UOM; a plain receipt's rate
+        // is divided by the same factor below so total stock value is
+        // preserved across the conversion (Dart `uomFactor` semantics).
+        let factor = uom_factor(items.get(&item), uom.as_deref());
+        if (factor - 1.0).abs() > EPS {
+            sles[index].qty_change *= factor;
+        }
+        let qty_change = sles[index].qty_change;
         if qty_change < 0.0 {
             let method = items.get(&item).and_then(|i| i.valuation_method.as_deref());
             let prior = ledgers
@@ -1259,6 +1276,11 @@ async fn cost_stock_movements(
             } else if trans_type == "Production" {
                 production_legs.push(index);
                 produced_qty += qty_change;
+            } else if (factor - 1.0).abs() > EPS {
+                // Plain receipt in a transaction UOM: the supplied rate is
+                // per transaction unit — divide by the factor so
+                // qty × rate (both now in stock units) preserves the value.
+                sles[index].valuation_rate /= factor;
             }
             // Make sure the pair's prior ledger is loaded (for expectations,
             // the negative-stock guard and the bin recompute).

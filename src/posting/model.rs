@@ -87,6 +87,11 @@ pub struct StockLedgerEntry {
     pub voucher_type: String,
     pub voucher_no: String,
     pub posting_date: String,
+    /// Transaction UOM the line was entered in (`None` = the item's stock
+    /// UOM). `qty_change`/`valuation_rate` are already converted to stock
+    /// units — the UOM rides along for display parity with the Dart rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uom: Option<String>,
     pub is_reversal: bool,
     pub batch_id: String,
     /// Per-company insertion sequence, assigned by the store at commit; the
@@ -286,9 +291,18 @@ pub struct PostingBatch {
     pub created_at: DateTime<Utc>,
 }
 
+/// One row of an item's UOM conversion table (the Dart `Item.uoms` /
+/// `UOM Conversion Detail` child): an alternative unit plus its factor
+/// relative to the item's `stock_uom`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UomConversion {
+    pub uom: String,
+    pub conversion_factor: f64,
+}
+
 /// Per-company item registry entry: the posting engine needs the stock /
-/// service distinction, valuation method and account overrides; everything
-/// else about an item stays on the sync plane.
+/// service distinction, valuation method, UOM conversions and account
+/// overrides; everything else about an item stays on the sync plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
@@ -299,6 +313,14 @@ pub struct Item {
     /// "Moving Average" (default) or "FIFO".
     #[serde(default)]
     pub valuation_method: Option<String>,
+    /// The unit the stock ledger and bins track. Unset ⇒ every line posts in
+    /// stock units (factor 1), matching the Dart `uomFactor` guard.
+    #[serde(default)]
+    pub stock_uom: Option<String>,
+    /// Alternative UOMs: `[{uom, conversion_factor}]`, factor = stock units
+    /// per one of `uom`.
+    #[serde(default)]
+    pub uoms: Vec<UomConversion>,
     #[serde(default)]
     pub inventory_account: Option<String>,
     #[serde(default)]

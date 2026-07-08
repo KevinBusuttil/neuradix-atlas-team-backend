@@ -1,0 +1,128 @@
+{
+  "name": "UOM conversion at posting: line qty converts to stock units by the item's conversion factor, receipt rates divide (value preserved), monetary amounts stay as sent (Dart uomFactor parity)",
+  "setup": {
+    "items": [
+      {
+        "id": "ITEM-U",
+        "item_type": "Stock",
+        "valuation_method": "Moving Average",
+        "stock_uom": "Unit",
+        "uoms": [{ "uom": "Box", "conversion_factor": 12 }]
+      }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Buy 2 Box @ €24/Box: the bin tracks 24 Units @ €2, total value €48 — the €48 line value is preserved across the conversion",
+      "as_role": "purchasing",
+      "submit": {
+        "doctype": "Purchase Receipt",
+        "document_id": "PREC-U1",
+        "payload": { "supplier": "SUPP-1", "posting_date": "2026-07-01", "set_warehouse": "WH" },
+        "items": [{ "item": "ITEM-U", "qty": 2, "rate": 24, "uom": "Box" }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "sle_rows": [
+          { "id": "SLE-PREC-U1-0", "qty_change": 24, "valuation_rate": 2, "uom": "Box" }
+        ],
+        "bins": { "ITEM-U@WH": { "qty": 24, "value": 48, "rate": 2 } },
+        "account_balances": { "Stock": 48, "GRNI": -48 }
+      }
+    },
+    {
+      "comment": "Sell 1 Box @ €36 (update_stock): 12 Units issue at the €2 cost → COGS €24; the monetary side stays in the transaction terms (Debtors €36)",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-U1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-02",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-U", "qty": 1, "rate": 36, "uom": "Box" }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "sle_rows": [
+          { "id": "SLE-SINV-U1-0", "qty_change": -12, "valuation_rate": 2, "uom": "Box" }
+        ],
+        "bins": { "ITEM-U@WH": { "qty": 12, "value": 24 } },
+        "account_balances": { "Stock": 24, "COGS": 24 },
+        "voucher_accounts": [
+          { "account": "Debtors", "voucher": "SINV-U1", "balance": 36 },
+          { "account": "Sales", "voucher": "SINV-U1", "balance": -36 }
+        ],
+        "party_rows": [
+          {
+            "id": "CT-SINV-U1",
+            "doctype": "Customer Transaction",
+            "trans_type": "Invoice",
+            "party": "CUST-1",
+            "amount": 36
+          }
+        ]
+      }
+    },
+    {
+      "comment": "A line without a uom (or in the stock UOM) posts factor-1: 6 Units at the €2 cost",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-U2",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-03",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-U", "qty": 6, "rate": 3, "uom": "Unit" }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "sle_rows": [
+          { "id": "SLE-SINV-U2-0", "qty_change": -6, "valuation_rate": 2, "uom": "Unit" }
+        ],
+        "bins": { "ITEM-U@WH": { "qty": 6, "value": 12 } },
+        "account_balances": { "COGS": 36 }
+      }
+    },
+    {
+      "comment": "The negative-stock guard sees converted quantities: selling 1 more Box (12 Units) with only 6 Units on hand is rejected",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-U3",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-07-04",
+          "update_stock": 1,
+          "set_warehouse": "WH"
+        },
+        "items": [{ "item": "ITEM-U", "qty": 1, "rate": 36, "uom": "Box" }]
+      },
+      "expect_status": 422,
+      "error_contains": "insufficient stock",
+      "expect": {
+        "sle_count": { "SINV-U3": 0 },
+        "bins": { "ITEM-U@WH": { "qty": 6, "value": 12 } }
+      }
+    },
+    {
+      "comment": "Cancel the Box sale: the reversal mirrors the converted stock-unit row (+12 @ €2), never re-converting",
+      "cancel": { "doctype": "Sales Invoice", "document_id": "SINV-U1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "sle_rows": [
+          { "id": "SLE-SINV-U1-0-reversal", "qty_change": 12, "valuation_rate": 2, "uom": "Box" }
+        ],
+        "bins": { "ITEM-U@WH": { "qty": 18, "value": 36 } },
+        "account_balances": { "COGS": 12, "Stock": 36 }
+      }
+    }
+  ],
+  "expect": {
+    "bins": { "ITEM-U@WH": { "qty": 18, "value": 36, "rate": 2 } },
+    "account_balances": { "Stock": 36, "COGS": 12, "GRNI": -48 }
+  }
+}

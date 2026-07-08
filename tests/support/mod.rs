@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use atlas_team_backend::posting::model::{Bin, PartyTransaction, TaxTransaction};
+use atlas_team_backend::posting::model::{Bin, PartyTransaction, StockLedgerEntry, TaxTransaction};
 use atlas_team_backend::store::MemStore;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
@@ -224,6 +224,14 @@ impl TestApp {
             .iter()
             .filter(|sle| sle.voucher_no == voucher_no)
             .count()
+    }
+
+    /// A stock ledger entry by its deterministic id.
+    pub fn stock_ledger_entry(&self, id: &str) -> Option<StockLedgerEntry> {
+        self.store
+            .all_stock_ledger_entries(self.company_uuid())
+            .into_iter()
+            .find(|sle| sle.id == id)
     }
 
     /// A customer/supplier subledger row by its deterministic id.

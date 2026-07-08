@@ -73,6 +73,7 @@ fn sle_from_row(row: &PgRow) -> Result<StockLedgerEntry, StoreError> {
         voucher_type: row.try_get("voucher_type")?,
         voucher_no: row.try_get("voucher_no")?,
         posting_date: row.try_get("posting_date")?,
+        uom: row.try_get("uom")?,
         is_reversal: row.try_get("is_reversal")?,
         batch_id: row.try_get("batch_id")?,
         seq: row.try_get("seq")?,
@@ -759,7 +760,7 @@ impl Store for PgStore {
     ) -> Result<Vec<StockLedgerEntry>, StoreError> {
         let rows = sqlx::query(
             "select seq, company_id, id, trans_type, item, warehouse, qty_change, \
-             valuation_rate, voucher_type, voucher_no, posting_date, is_reversal, batch_id \
+             valuation_rate, voucher_type, voucher_no, posting_date, uom, is_reversal, batch_id \
              from stock_ledger_entries \
              where company_id = $1 and item = $2 and warehouse = $3 order by seq",
         )
@@ -778,7 +779,7 @@ impl Store for PgStore {
     ) -> Result<Vec<StockLedgerEntry>, StoreError> {
         let rows = sqlx::query(
             "select seq, company_id, id, trans_type, item, warehouse, qty_change, \
-             valuation_rate, voucher_type, voucher_no, posting_date, is_reversal, batch_id \
+             valuation_rate, voucher_type, voucher_no, posting_date, uom, is_reversal, batch_id \
              from stock_ledger_entries \
              where company_id = $1 and voucher_no = $2 order by seq",
         )
@@ -1058,8 +1059,8 @@ impl Store for PgStore {
             sqlx::query(
                 "insert into stock_ledger_entries \
                  (company_id, id, trans_type, item, warehouse, qty_change, valuation_rate, \
-                  voucher_type, voucher_no, posting_date, is_reversal, batch_id) \
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  voucher_type, voucher_no, posting_date, uom, is_reversal, batch_id) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             )
             .bind(company)
             .bind(&sle.id)
@@ -1071,6 +1072,7 @@ impl Store for PgStore {
             .bind(&sle.voucher_type)
             .bind(&sle.voucher_no)
             .bind(&sle.posting_date)
+            .bind(&sle.uom)
             .bind(sle.is_reversal)
             .bind(&sle.batch_id)
             .execute(&mut *tx)
