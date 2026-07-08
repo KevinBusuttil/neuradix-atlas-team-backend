@@ -64,6 +64,8 @@ pub fn router(state: AppState) -> Router {
             "/companies/{company_id}/commands/cancel-document",
             post(cancel_document),
         )
+        // Portal-link management + the token-scoped portal plane.
+        .merge(crate::portal::routes())
         .with_state(state)
 }
 

@@ -199,17 +199,74 @@ receipt↔invoice line-linkage variance posting (the two-document flow clears
 GRNI at matching values), and Delivery Note / POS Invoice doctypes arrive with
 POS session close in Phase 6.
 
+## Portal — customer / accountant links
+
+The portal (`docs/NEURADIX_DOMAIN_AND_BRAND_ARCHITECTURE.md` §11) is served
+under `portal.atlas.neuradix.app`; the paths below are host-agnostic and live
+in this same binary (`src/portal.rs`).
+
+### The `company_documents` read model
+
+Drafts (quotations, unpaid-invoice metadata, customers, …) exist only as
+mutations in the company log, so the portal renders from a **materialized
+projection**: `(company_id, doctype, document_id)` → latest inner payload (the
+row envelope's `payload`), child rows (`__children` → the `children` column),
+docstatus and update time (`src/projection.rs`, table in `0003_portal.sql`).
+Mutations fold in sync-version order with the client's semantics —
+`createDocument`/`updateDocument`/`submitDocument`/`cancelDocument` upsert,
+`deleteDocument` removes, a mutation without `__children` leaves stored
+children intact. The projection is maintained **inside the same atomic step as
+every log append** (client `sync/push` and the posting-commit replication path
+share the stores' append), and `Store::rebuild_projection(company_id)` refolds
+a company from scratch as a recovery/verification tool.
+
+### Portal links (management plane, existing bearer auth)
+
+Portal tokens are a **distinct token kind**: generated and stored hashed like
+every other token but in their own `portal_links` table, so a portal token
+never authenticates a member/device endpoint and member/device tokens 404 on
+the portal plane.
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/companies/{id}/portal-links` | **owner or admin** | `{kind: "customer"\|"accountant", party (required for customer), label, expires_days (default 90)}` → `{token, url_path, expiresAt}` |
+| GET | `/companies/{id}/portal-links` | **owner or admin** | Link metadata + revoked state (tokens are never returned) |
+| DELETE | `/companies/{id}/portal-links/{link_id}` | **owner or admin** | Revoke |
+
+### Portal plane (the token in the path is the credential)
+
+Unknown, expired and revoked tokens all read as **404**. Customer links are
+scoped **strictly** to their customer: a document whose `customer` payload
+field differs is a 404, never a 403 leak. `GET` endpoints on customer links
+content-negotiate — `Accept: text/html` returns minimal server-rendered pages
+(inline styles, no external assets, every interpolated value HTML-escaped);
+JSON is the default.
+
+| Method | Path | Link kind | Purpose |
+|---|---|---|---|
+| GET | `/portal/{token}` | customer | Summary: company name, customer id, open quotations (docstatus 0), unpaid invoices (submitted Sales Invoices with `outstanding_amount > 0`) |
+| GET | `/portal/{token}/documents/{doctype}/{id}` | customer | Document payload + children (Quotation and Sales Invoice only) |
+| POST | `/portal/{token}/quotations/{id}/accept` | customer | Appends a system mutation (device id `atlas-portal`, `updateDocument` row envelope) setting `accepted_on` to today; audit `portal.quote.accept`. Idempotent (repeat → 200, no new mutation); reject-after-accept → 409. HTML form posts redirect back to the document page |
+| POST | `/portal/{token}/quotations/{id}/reject` | customer | Same, setting `rejected_on`; audit `portal.quote.reject`; accept-after-reject → 409 |
+| GET | `/portal/{token}` | accountant | Summary: posted-document counts by doctype + GL entry count |
+| GET | `/portal/{token}/gl.csv` | accountant | GL entries as CSV (`posting_date, voucher_type, voucher_no, account, debit, credit, party_type, party, is_reversal`), ordered by posting date then voucher |
+| GET | `/portal/{token}/audit?limit=n` | accountant | Recent audit rows |
+
+Payments are **not** part of the portal (that is the payment-links item;
+invoice payment hands off to `pay.` later).
+
 ## Development
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 38 tests over MemStore (unit + API + fixtures + posting + replication); no DB required
+cargo test          # 46 tests over MemStore (unit + API + fixtures + posting + replication + portal); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
 migrations): `0001_init.sql` for the coordination plane (includes the
-`mutations(company_id, sync_version)` index the pull path relies on) and
+`mutations(company_id, sync_version)` index the pull path relies on),
 `0002_postings.sql` for the posting authority (documents, numbering_series,
 gl_entries, stock_ledger_entries, bins, settlements, posting_batches, items,
-company_settings, idempotency_keys).
+company_settings, idempotency_keys) and `0003_portal.sql` for the portal
+(portal_links, the company_documents read model).

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, Role, TokenIdentity, User,
+    AuditEntry, Company, Device, Invitation, MutationRecord, PortalLink, Role, TokenIdentity, User,
     WebhookEvent,
 };
 use crate::posting::model::{
@@ -18,6 +18,7 @@ use crate::posting::model::{
     PostingBatch, PostingCommit, Settlement, StockLedgerEntry,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources};
+use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
 
 use super::{Store, StoreError};
 
@@ -70,6 +71,12 @@ struct Inner {
     series: HashMap<(Uuid, String), i64>,
     /// (company_id, idempotency key) -> committed response
     idempotency: HashMap<(Uuid, String), Value>,
+
+    // Portal (links + materialized document read model)
+    /// link id -> portal link
+    portal_links: HashMap<Uuid, PortalLink>,
+    /// (company_id, doctype, document id) -> projected read-model row
+    company_documents: HashMap<(Uuid, String, String), CompanyDocument>,
 }
 
 impl Inner {
@@ -95,6 +102,9 @@ impl Inner {
             let version = *next;
             self.mutation_versions.insert(key, version);
             versions.push((record.id.clone(), version));
+            // The materialized document read model follows the log inside
+            // the same mutex hold (same atomicity as the log write).
+            self.apply_projection(company_id, &record);
             self.mutations
                 .entry(company_id)
                 .or_default()
@@ -105,6 +115,26 @@ impl Inner {
                 });
         }
         versions
+    }
+
+    /// Folds one just-appended mutation into the `company_documents` read
+    /// model.
+    fn apply_projection(&mut self, company_id: Uuid, record: &MutationRecord) {
+        let key = (
+            company_id,
+            record.doc_type.clone(),
+            record.document_id.clone(),
+        );
+        let existing = self.company_documents.get(&key);
+        match fold_mutation(existing, record, company_id, Utc::now()) {
+            ProjectionAction::Upsert(doc) => {
+                self.company_documents.insert(key, doc);
+            }
+            ProjectionAction::Delete => {
+                self.company_documents.remove(&key);
+            }
+            ProjectionAction::Keep => {}
+        }
     }
 }
 
@@ -189,6 +219,11 @@ impl Store for MemStore {
         let mut inner = self.inner.lock().unwrap();
         inner.companies.insert(company.id, company.clone());
         Ok(company)
+    }
+
+    async fn company(&self, company_id: Uuid) -> Result<Option<Company>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.companies.get(&company_id).cloned())
     }
 
     async fn upsert_user(&self, email: &str, display_name: &str) -> Result<User, StoreError> {
@@ -697,5 +732,129 @@ impl Store for MemStore {
             response,
             replayed: false,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Portal (links + materialized document read model)
+    // ------------------------------------------------------------------
+
+    async fn create_portal_link(&self, link: PortalLink) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.portal_links.insert(link.id, link);
+        Ok(())
+    }
+
+    async fn portal_links(&self, company_id: Uuid) -> Result<Vec<PortalLink>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut links: Vec<PortalLink> = inner
+            .portal_links
+            .values()
+            .filter(|link| link.company_id == company_id)
+            .cloned()
+            .collect();
+        links.sort_by_key(|link| link.created_at);
+        Ok(links)
+    }
+
+    async fn revoke_portal_link(
+        &self,
+        company_id: Uuid,
+        link_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.portal_links.get_mut(&link_id) {
+            Some(link) if link.company_id == company_id => {
+                link.revoked_at.get_or_insert_with(Utc::now);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn portal_link_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PortalLink>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .portal_links
+            .values()
+            .find(|link| link.token_hash == token_hash)
+            .cloned())
+    }
+
+    async fn company_document(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+        document_id: &str,
+    ) -> Result<Option<CompanyDocument>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .company_documents
+            .get(&(company_id, doctype.to_string(), document_id.to_string()))
+            .cloned())
+    }
+
+    async fn company_documents(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+    ) -> Result<Vec<CompanyDocument>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut docs: Vec<CompanyDocument> = inner
+            .company_documents
+            .iter()
+            .filter(|((company, dt, _), _)| *company == company_id && dt == doctype)
+            .map(|(_, doc)| doc.clone())
+            .collect();
+        docs.sort_by(|a, b| a.document_id.cmp(&b.document_id));
+        Ok(docs)
+    }
+
+    async fn rebuild_projection(&self, company_id: Uuid) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .company_documents
+            .retain(|(company, _, _), _| *company != company_id);
+        let mut records: Vec<(i64, MutationRecord)> = inner
+            .mutations
+            .get(&company_id)
+            .map(|log| log.iter().map(|m| (m.version, m.record.clone())).collect())
+            .unwrap_or_default();
+        records.sort_by_key(|(version, _)| *version);
+        for (_, record) in records {
+            inner.apply_projection(company_id, &record);
+        }
+        Ok(())
+    }
+
+    async fn posted_document_counts(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut counts: HashMap<String, i64> = HashMap::new();
+        for (company, doctype, _) in inner.documents.keys() {
+            if *company == company_id {
+                *counts.entry(doctype.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<(String, i64)> = counts.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn gl_entries_ordered(&self, company_id: Uuid) -> Result<Vec<GlEntry>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut entries = inner
+            .gl_entries
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default();
+        entries.sort_by(|a, b| {
+            (&a.posting_date, &a.voucher_no, &a.id).cmp(&(&b.posting_date, &b.voucher_no, &b.id))
+        });
+        Ok(entries)
     }
 }

@@ -10,13 +10,14 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, Role, TokenIdentity, User,
+    AuditEntry, Company, Device, Invitation, MutationRecord, PortalLink, Role, TokenIdentity, User,
     WebhookEvent,
 };
 use crate::posting::model::{
     CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit, Settlement,
     StockLedgerEntry,
 };
+use crate::projection::CompanyDocument;
 
 pub use mem::MemStore;
 pub use pg::PgStore;
@@ -42,6 +43,7 @@ pub enum StoreError {
 pub trait Store: Send + Sync {
     // Identity
     async fn create_company(&self, name: &str) -> Result<Company, StoreError>;
+    async fn company(&self, company_id: Uuid) -> Result<Option<Company>, StoreError>;
     /// Get-or-create by unique email. An existing user's display name is kept.
     async fn upsert_user(&self, email: &str, display_name: &str) -> Result<User, StoreError>;
     /// Idempotent: an existing membership keeps its original role.
@@ -189,4 +191,47 @@ pub trait Store: Send + Sync {
     /// settlement appends, bin upserts, invoice outstanding maintenance, the
     /// posting batch and the audit row — all or nothing.
     async fn posting_commit(&self, commit: PostingCommit) -> Result<CommitOutcome, StoreError>;
+
+    // ------------------------------------------------------------------
+    // Portal (links + materialized document read model)
+    // ------------------------------------------------------------------
+
+    async fn create_portal_link(&self, link: PortalLink) -> Result<(), StoreError>;
+    /// All links of a company (metadata; only token hashes are stored).
+    async fn portal_links(&self, company_id: Uuid) -> Result<Vec<PortalLink>, StoreError>;
+    /// Marks a link revoked; idempotent. Returns false when the link does not
+    /// belong to the company.
+    async fn revoke_portal_link(&self, company_id: Uuid, link_id: Uuid)
+        -> Result<bool, StoreError>;
+    /// Resolves a portal token hash — and only a portal token hash: member /
+    /// device tokens live in different tables and never match here.
+    async fn portal_link_by_hash(&self, token_hash: &str)
+        -> Result<Option<PortalLink>, StoreError>;
+
+    /// One row of the materialized document read model.
+    async fn company_document(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+        document_id: &str,
+    ) -> Result<Option<CompanyDocument>, StoreError>;
+    /// All read-model rows of a doctype, ordered by document id.
+    async fn company_documents(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+    ) -> Result<Vec<CompanyDocument>, StoreError>;
+    /// Recovery / verification tool: drops the company's projection and
+    /// refolds it from the mutation log in sync-version order.
+    async fn rebuild_projection(&self, company_id: Uuid) -> Result<(), StoreError>;
+
+    /// Posted (official) document counts per doctype, for the accountant
+    /// portal summary.
+    async fn posted_document_counts(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<(String, i64)>, StoreError>;
+    /// Every GL entry of the company, ordered by posting date then voucher
+    /// (then row id) — the accountant portal's GL export order.
+    async fn gl_entries_ordered(&self, company_id: Uuid) -> Result<Vec<GlEntry>, StoreError>;
 }

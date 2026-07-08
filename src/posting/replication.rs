@@ -99,7 +99,7 @@ pub fn replication_mutations(
         mutation_type,
         &doc.doctype,
         &doc.id,
-        envelope(&doc.id, &doc.doctype, doc.docstatus, &fields, now_ms)?,
+        row_envelope(&doc.id, &doc.doctype, doc.docstatus, &fields, now_ms)?,
     ));
 
     // GL entries — field names per the Dart `_gl` builder.
@@ -123,7 +123,7 @@ pub fn replication_mutations(
             MutationType::CreateDocument,
             "GL Entry",
             &entry.id,
-            envelope(&entry.id, "GL Entry", 0, &fields, now_ms)?,
+            row_envelope(&entry.id, "GL Entry", 0, &fields, now_ms)?,
         ));
     }
 
@@ -144,7 +144,7 @@ pub fn replication_mutations(
             MutationType::CreateDocument,
             "Stock Ledger Entry",
             &sle.id,
-            envelope(&sle.id, "Stock Ledger Entry", 0, &fields, now_ms)?,
+            row_envelope(&sle.id, "Stock Ledger Entry", 0, &fields, now_ms)?,
         ));
     }
 
@@ -180,7 +180,7 @@ pub fn replication_mutations(
             MutationType::CreateDocument,
             "Settlement",
             &settlement.id,
-            envelope(&settlement.id, "Settlement", 0, &fields, now_ms)?,
+            row_envelope(&settlement.id, "Settlement", 0, &fields, now_ms)?,
         ));
     }
 
@@ -199,7 +199,7 @@ pub fn replication_mutations(
             MutationType::UpdateDocument,
             "Bin",
             &bin_id,
-            envelope(&bin_id, "Bin", 0, &fields, now_ms)?,
+            row_envelope(&bin_id, "Bin", 0, &fields, now_ms)?,
         ));
     }
 
@@ -216,7 +216,7 @@ pub fn replication_mutations(
             MutationType::UpdateDocument,
             &invoice.doctype,
             &invoice.id,
-            envelope(
+            row_envelope(
                 &invoice.id,
                 &invoice.doctype,
                 invoice.docstatus,
@@ -242,8 +242,10 @@ fn header_fields(payload: &Value) -> Map<String, Value> {
 
 /// The Dart sync engine's row envelope — what `_applyMutation` writes into
 /// the client `documents` table. The inner `payload` is a JSON-encoded
-/// *string* of the row's fields, exactly as the client stores it.
-fn envelope(
+/// *string* of the row's fields, exactly as the client stores it. Public so
+/// other system authors (the portal's quotation accept/reject) render the
+/// same wire shape.
+pub fn row_envelope(
     id: &str,
     doctype: &str,
     docstatus: i16,

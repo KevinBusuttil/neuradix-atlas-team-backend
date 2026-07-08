@@ -13,7 +13,9 @@ pub mod api;
 pub mod auth;
 pub mod error;
 pub mod model;
+pub mod portal;
 pub mod posting;
+pub mod projection;
 pub mod store;
 
 use std::sync::Arc;

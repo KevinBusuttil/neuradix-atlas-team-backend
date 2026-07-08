@@ -8,14 +8,15 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, Role, TokenIdentity, User,
-    WebhookEvent,
+    AuditEntry, Company, Device, Invitation, MutationRecord, PortalLink, PortalLinkKind, Role,
+    TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
     format_number, CommitOutcome, CompanySettings, GlEntry, Item, PostedDocument, PostingCommit,
     Settlement, StockLedgerEntry,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources};
+use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
 
 use super::{Store, StoreError};
 
@@ -146,6 +147,9 @@ async fn append_mutations(
         .bind(json)
         .execute(&mut *conn)
         .await?;
+        // The materialized document read model follows the log inside the
+        // same transaction (same atomicity as the log write).
+        apply_projection(&mut *conn, company_id, &record).await?;
         versions.push((record.id, last));
     }
     sqlx::query("update sync_counters set last_version = $2 where company_id = $1")
@@ -154,6 +158,91 @@ async fn append_mutations(
         .execute(&mut *conn)
         .await?;
     Ok(versions)
+}
+
+fn portal_link_from_row(row: &PgRow) -> Result<PortalLink, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    Ok(PortalLink {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        kind: PortalLinkKind::parse(&kind).ok_or_else(|| {
+            StoreError::Internal(format!("unknown portal link kind in db: {kind}"))
+        })?,
+        party: row.try_get("party")?,
+        label: row.try_get("label")?,
+        token_hash: row.try_get("token_hash")?,
+        created_by: row.try_get("created_by")?,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+    })
+}
+
+fn company_document_from_row(row: &PgRow) -> Result<CompanyDocument, StoreError> {
+    Ok(CompanyDocument {
+        company_id: row.try_get("company_id")?,
+        doctype: row.try_get("doctype")?,
+        document_id: row.try_get("document_id")?,
+        payload: row.try_get("payload")?,
+        children: row.try_get("children")?,
+        docstatus: row.try_get("docstatus")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+/// Folds one just-appended mutation into the `company_documents` read model,
+/// over the caller's connection so the projection update shares the log
+/// write's transaction.
+async fn apply_projection(
+    conn: &mut sqlx::PgConnection,
+    company_id: Uuid,
+    record: &MutationRecord,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "select company_id, doctype, document_id, payload, children, docstatus, updated_at \
+         from company_documents \
+         where company_id = $1 and doctype = $2 and document_id = $3",
+    )
+    .bind(company_id)
+    .bind(&record.doc_type)
+    .bind(&record.document_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let existing = row.map(|row| company_document_from_row(&row)).transpose()?;
+    match fold_mutation(existing.as_ref(), record, company_id, chrono::Utc::now()) {
+        ProjectionAction::Upsert(doc) => {
+            sqlx::query(
+                "insert into company_documents \
+                 (company_id, doctype, document_id, payload, children, docstatus, updated_at) \
+                 values ($1, $2, $3, $4, $5, $6, $7) \
+                 on conflict (company_id, doctype, document_id) do update set \
+                 payload = excluded.payload, children = excluded.children, \
+                 docstatus = excluded.docstatus, updated_at = excluded.updated_at",
+            )
+            .bind(company_id)
+            .bind(&doc.doctype)
+            .bind(&doc.document_id)
+            .bind(&doc.payload)
+            .bind(&doc.children)
+            .bind(doc.docstatus)
+            .bind(doc.updated_at)
+            .execute(&mut *conn)
+            .await?;
+        }
+        ProjectionAction::Delete => {
+            sqlx::query(
+                "delete from company_documents \
+                 where company_id = $1 and doctype = $2 and document_id = $3",
+            )
+            .bind(company_id)
+            .bind(&record.doc_type)
+            .bind(&record.document_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        ProjectionAction::Keep => {}
+    }
+    Ok(())
 }
 
 fn document_from_row(row: &PgRow) -> Result<PostedDocument, StoreError> {
@@ -182,6 +271,21 @@ impl Store for PgStore {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    async fn company(&self, company_id: Uuid) -> Result<Option<Company>, StoreError> {
+        let row = sqlx::query("select id, name, created_at from companies where id = $1")
+            .bind(company_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => Some(Company {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                created_at: row.try_get("created_at")?,
+            }),
+            None => None,
         })
     }
 
@@ -1019,5 +1123,160 @@ impl Store for PgStore {
             response,
             replayed: false,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Portal (links + materialized document read model)
+    // ------------------------------------------------------------------
+
+    async fn create_portal_link(&self, link: PortalLink) -> Result<(), StoreError> {
+        sqlx::query(
+            "insert into portal_links \
+             (id, company_id, kind, party, label, token_hash, created_by, created_at, \
+              expires_at, revoked_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(link.id)
+        .bind(link.company_id)
+        .bind(link.kind.as_str())
+        .bind(&link.party)
+        .bind(&link.label)
+        .bind(&link.token_hash)
+        .bind(link.created_by)
+        .bind(link.created_at)
+        .bind(link.expires_at)
+        .bind(link.revoked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn portal_links(&self, company_id: Uuid) -> Result<Vec<PortalLink>, StoreError> {
+        let rows = sqlx::query(
+            "select id, company_id, kind, party, label, token_hash, created_by, created_at, \
+             expires_at, revoked_at from portal_links \
+             where company_id = $1 order by created_at",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(portal_link_from_row).collect()
+    }
+
+    async fn revoke_portal_link(
+        &self,
+        company_id: Uuid,
+        link_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "update portal_links set revoked_at = coalesce(revoked_at, now()) \
+             where company_id = $1 and id = $2",
+        )
+        .bind(company_id)
+        .bind(link_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn portal_link_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<PortalLink>, StoreError> {
+        let row = sqlx::query(
+            "select id, company_id, kind, party, label, token_hash, created_by, created_at, \
+             expires_at, revoked_at from portal_links where token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| portal_link_from_row(&row)).transpose()
+    }
+
+    async fn company_document(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+        document_id: &str,
+    ) -> Result<Option<CompanyDocument>, StoreError> {
+        let row = sqlx::query(
+            "select company_id, doctype, document_id, payload, children, docstatus, updated_at \
+             from company_documents \
+             where company_id = $1 and doctype = $2 and document_id = $3",
+        )
+        .bind(company_id)
+        .bind(doctype)
+        .bind(document_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| company_document_from_row(&row)).transpose()
+    }
+
+    async fn company_documents(
+        &self,
+        company_id: Uuid,
+        doctype: &str,
+    ) -> Result<Vec<CompanyDocument>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, doctype, document_id, payload, children, docstatus, updated_at \
+             from company_documents \
+             where company_id = $1 and doctype = $2 order by document_id",
+        )
+        .bind(company_id)
+        .bind(doctype)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(company_document_from_row).collect()
+    }
+
+    async fn rebuild_projection(&self, company_id: Uuid) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("delete from company_documents where company_id = $1")
+            .bind(company_id)
+            .execute(&mut *tx)
+            .await?;
+        let rows =
+            sqlx::query("select record from mutations where company_id = $1 order by sync_version")
+                .bind(company_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for row in rows {
+            let json: Value = row.try_get("record")?;
+            let record: MutationRecord = serde_json::from_value(json)?;
+            apply_projection(&mut tx, company_id, &record).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn posted_document_counts(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        let rows = sqlx::query(
+            "select doctype, count(*) as n from documents \
+             where company_id = $1 group by doctype order by doctype",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push((row.try_get("doctype")?, row.try_get("n")?));
+        }
+        Ok(out)
+    }
+
+    async fn gl_entries_ordered(&self, company_id: Uuid) -> Result<Vec<GlEntry>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, account, debit, credit, party_type, party, voucher_type, \
+             voucher_no, posting_date, is_reversal, batch_id \
+             from gl_entries where company_id = $1 \
+             order by posting_date, voucher_no, id",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(gl_from_row).collect()
     }
 }

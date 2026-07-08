@@ -108,6 +108,54 @@ pub struct TokenIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// Portal links (customer / accountant portal plane)
+// ---------------------------------------------------------------------------
+
+/// What a portal link exposes: a single customer's documents, or the whole
+/// company read-only for an accountant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortalLinkKind {
+    Customer,
+    Accountant,
+}
+
+impl PortalLinkKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortalLinkKind::Customer => "customer",
+            PortalLinkKind::Accountant => "accountant",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PortalLinkKind> {
+        Some(match s {
+            "customer" => PortalLinkKind::Customer,
+            "accountant" => PortalLinkKind::Accountant,
+            _ => return None,
+        })
+    }
+}
+
+/// A tokenized portal grant. The token itself is a distinct token kind: it is
+/// stored (hashed) only here, never in `user_tokens`/`devices`, so a portal
+/// token can never authenticate a member/device endpoint and vice versa.
+#[derive(Debug, Clone)]
+pub struct PortalLink {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    pub kind: PortalLinkKind,
+    /// The customer id the link is scoped to (customer kind only).
+    pub party: Option<String>,
+    pub label: Option<String>,
+    pub token_hash: String,
+    pub created_by: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
 // Sync (mirrors the Dart MutationRecord)
 // ---------------------------------------------------------------------------
 
