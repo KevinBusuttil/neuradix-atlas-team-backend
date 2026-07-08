@@ -1,0 +1,145 @@
+{
+  "name": "POS Invoice (cash sale, always-on stock issue) and Delivery Note (stock issue at cost, no receivable) — Dart _posInvoice / _deliveryNote parity",
+  "setup": {
+    "items": [
+      { "id": "ITEM-A", "item_type": "Stock", "valuation_method": "Moving Average" }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Stock in: 10 × €5 via Purchase Receipt",
+      "as_role": "purchasing",
+      "submit": {
+        "doctype": "Purchase Receipt",
+        "document_id": "PREC-1",
+        "payload": { "supplier": "SUPP-1", "posting_date": "2026-07-01", "set_warehouse": "WH" },
+        "items": [{ "item": "ITEM-A", "qty": 10, "rate": 5 }]
+      },
+      "expect_status": 200,
+      "expect": { "bins": { "ITEM-A@WH": { "qty": 10, "value": 50, "rate": 5 } } }
+    },
+    {
+      "comment": "Delivery Note: 4 out at €5 cost — Dr COGS / Cr Inventory only, no receivable, no party subledger, the €12 selling rate never posts",
+      "as_role": "stock",
+      "submit": {
+        "doctype": "Delivery Note",
+        "document_id": "DN-1",
+        "payload": { "customer": "CUST-1", "posting_date": "2026-07-02", "set_warehouse": "WH" },
+        "items": [{ "item": "ITEM-A", "qty": 4, "rate": 12 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "DN-00001",
+        "docstatus": 1,
+        "gl_count": { "DN-1": 2 },
+        "sle_count": { "DN-1": 1 },
+        "party_count": { "DN-1": 0 },
+        "bins": { "ITEM-A@WH": { "qty": 6, "value": 30 } },
+        "account_balances": { "COGS": 20, "Stock": 30, "Debtors": 0, "Sales": 0 },
+        "voucher_accounts": [
+          { "account": "COGS", "voucher": "DN-1", "balance": 20 }
+        ]
+      }
+    },
+    {
+      "comment": "POS cash sale: 2 × €12 + 15% VAT — Dr Cash 27.60 / Cr Income 24 / Cr Output VAT 3.60, stock issued at €5 cost, tenders never post, no party subledger",
+      "as_role": "pos",
+      "submit": {
+        "doctype": "POS Invoice",
+        "document_id": "POS-1",
+        "payload": {
+          "customer": "WALK-IN",
+          "posting_date": "2026-07-03",
+          "set_warehouse": "WH",
+          "taxes": [
+            { "tax_type": "VAT", "tax_code": "VAT-15", "tax_account": "VAT Output", "taxable_amount": 24, "tax_amount": 3.6, "rate": 15 }
+          ],
+          "tenders": [{ "mode_of_payment": "Cash", "amount": 27.6 }]
+        },
+        "items": [{ "item": "ITEM-A", "qty": 2, "rate": 12 }]
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "POS-00001",
+        "gl_count": { "POS-1": 5 },
+        "sle_count": { "POS-1": 1 },
+        "party_count": { "POS-1": 0 },
+        "tax_count": { "POS-1": 1 },
+        "tax_rows": [
+          {
+            "id": "TT-POS-1-0",
+            "base_amount": 24,
+            "tax_amount": 3.6,
+            "rate": 15,
+            "party_type": "Customer",
+            "party": "WALK-IN"
+          }
+        ],
+        "bins": { "ITEM-A@WH": { "qty": 4, "value": 20 } },
+        "account_balances": { "Cash": 27.6, "Sales": -24, "VAT Output": -3.6, "COGS": 30, "Debtors": 0 },
+        "voucher_accounts": [
+          { "account": "Cash", "voucher": "POS-1", "balance": 27.6 },
+          { "account": "Sales", "voucher": "POS-1", "balance": -24 },
+          { "account": "COGS", "voucher": "POS-1", "balance": 10 }
+        ]
+      }
+    },
+    {
+      "comment": "Role gate: a sales user may not post a POS Invoice (pos/owner/admin only)",
+      "as_role": "sales",
+      "submit": {
+        "doctype": "POS Invoice",
+        "document_id": "POS-R1",
+        "payload": { "posting_date": "2026-07-03", "set_warehouse": "WH" },
+        "items": [{ "item": "ITEM-A", "qty": 1, "rate": 12 }]
+      },
+      "expect_status": 403,
+      "expect": { "gl_count": { "POS-R1": 0 } }
+    },
+    {
+      "comment": "Role gate: a pos user may not post a Delivery Note (stock/sales/owner/admin)",
+      "as_role": "pos",
+      "submit": {
+        "doctype": "Delivery Note",
+        "document_id": "DN-R1",
+        "payload": { "posting_date": "2026-07-03", "set_warehouse": "WH" },
+        "items": [{ "item": "ITEM-A", "qty": 1, "rate": 12 }]
+      },
+      "expect_status": 403
+    },
+    {
+      "comment": "Cancel the POS sale: exact reversal — cash, income and VAT back out, stock restored at the €5 cost, VAT subledger nets to zero",
+      "as_role": "pos",
+      "cancel": { "doctype": "POS Invoice", "document_id": "POS-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "gl_count": { "POS-1": 10 },
+        "tax_rows": [
+          { "id": "TT-POS-1-0-reversal", "base_amount": -24, "tax_amount": -3.6 }
+        ],
+        "bins": { "ITEM-A@WH": { "qty": 6, "value": 30 } },
+        "account_balances": { "Cash": 0, "VAT Output": 0, "COGS": 20 },
+        "voucher_accounts": [
+          { "account": "Cash", "voucher": "POS-1", "balance": 0 },
+          { "account": "Sales", "voucher": "POS-1", "balance": 0 }
+        ]
+      }
+    },
+    {
+      "comment": "Cancel the Delivery Note as a sales user (sales is in the DN role gate): stock and COGS fully restored",
+      "as_role": "sales",
+      "cancel": { "doctype": "Delivery Note", "document_id": "DN-1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "bins": { "ITEM-A@WH": { "qty": 10, "value": 50, "rate": 5 } },
+        "account_balances": { "COGS": 0, "Stock": 50 }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": { "Cash": 0, "Sales": 0, "VAT Output": 0, "COGS": 0, "Stock": 50, "Debtors": 0 },
+    "bins": { "ITEM-A@WH": { "qty": 10, "value": 50, "rate": 5 } }
+  }
+}

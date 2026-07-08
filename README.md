@@ -111,9 +111,10 @@ missing or unknown).
 
 Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
 Command-role gates: Sales Invoice → sales/owner/admin · Purchase
-Invoice/Receipt → purchasing/owner/admin · Stock Entry → stock/owner/admin ·
-Payment Entry → accountant/owner/admin (cancel requires the same role as
-submit).
+Invoice/Receipt → purchasing/owner/admin · Delivery Note →
+stock/sales/owner/admin · POS Invoice → pos/owner/admin · Stock Entry →
+stock/owner/admin · Payment Entry → accountant/owner/admin (cancel requires
+the same role as submit).
 
 ## ROADMAP_V2 §6 — [P2] acceptance criteria coverage
 
@@ -223,12 +224,33 @@ the Dart derivation would have produced locally. Fixture
 `0009-subledger-rows.json` pins the amounts; `tests/posting_replication.rs`
 pins the wire envelopes.
 
+### POS Invoice + Delivery Note
+
+The command API's doctype surface covers the full Dart sale-side stock flow:
+
+- **POS Invoice** (series `POS-`, role gate pos/owner/admin) — a cash sale
+  with the Dart `_posInvoice` semantics: stock issue is always on (per-line
+  `warehouse` or the document `set_warehouse`), Dr `cash_account` (gross) /
+  Cr `income_account` (net of tax) + output-VAT legs and `TT-…` tax subledger
+  rows. No receivable and no party subledger — payment is inline; the
+  `tenders` child table never posts. Blank `cash_account`/`income_account`
+  resolve from the company defaults.
+- **Delivery Note** (series `DN-`, role gate stock/sales/owner/admin) — the
+  pure stock-issue document (`_deliveryNote`): SLE at −qty costed by the
+  item's valuation method plus the perpetual-inventory Dr COGS / Cr Inventory
+  legs, and nothing else — no receivable, no income, no subledger rows.
+
+Both cancel through the same exact-reversal path (stored rates reused,
+`-reversal` ids) and both are covered by the sync-plane immutability guard
+(`POSTED_DOCTYPES`). Fixture `0010-pos-and-delivery.json` pins the flows.
+
 Deliberate Phase 3 MVP bounds (deviations from the full Dart engine, all
 flagged in the plan as later refinements): no UOM conversion at posting (line
 qty is taken in stock units), no multi-currency base-amount stamping
-(company-currency postings only), no receipt↔invoice line-linkage variance
-posting (the two-document flow clears GRNI at matching values), and Delivery
-Note / POS Invoice doctypes arrive with POS session close in Phase 6.
+(company-currency postings only), and no receipt↔invoice line-linkage
+variance posting (the two-document flow clears GRNI at matching values). POS
+*session close* remains Phase 6 client-side work — the POS Invoice posting
+itself is supported here.
 
 ## Portal — customer / accountant links
 
@@ -378,7 +400,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 55 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 57 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx

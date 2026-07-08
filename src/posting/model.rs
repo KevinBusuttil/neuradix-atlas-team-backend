@@ -11,10 +11,12 @@ use crate::model::AuditEntry;
 
 /// Doctypes the posting authority accepts. Everything else stays on the
 /// draft/sync plane.
-pub const POSTED_DOCTYPES: [&str; 5] = [
+pub const POSTED_DOCTYPES: [&str; 7] = [
     "Sales Invoice",
     "Purchase Invoice",
     "Purchase Receipt",
+    "Delivery Note",
+    "POS Invoice",
     "Payment Entry",
     "Stock Entry",
 ];
@@ -27,6 +29,8 @@ pub fn series_key(doctype: &str) -> Option<&'static str> {
         "Sales Invoice" => "SINV",
         "Purchase Invoice" => "PINV",
         "Purchase Receipt" => "PREC",
+        "Delivery Note" => "DN",
+        "POS Invoice" => "POS",
         "Payment Entry" => "PAY",
         "Stock Entry" => "STE",
         _ => return None,

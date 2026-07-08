@@ -111,10 +111,12 @@ pub struct CancelCommand {
 
 /// Roles allowed to submit/cancel each official doctype (server-enforced).
 pub fn allowed_roles(doctype: &str) -> Option<&'static [crate::model::Role]> {
-    use crate::model::Role::{Accountant, Admin, Owner, Purchasing, Sales, Stock};
+    use crate::model::Role::{Accountant, Admin, Owner, Pos, Purchasing, Sales, Stock};
     Some(match doctype {
         "Sales Invoice" => &[Owner, Admin, Sales],
         "Purchase Invoice" | "Purchase Receipt" => &[Owner, Admin, Purchasing],
+        "Delivery Note" => &[Owner, Admin, Stock, Sales],
+        "POS Invoice" => &[Owner, Admin, Pos],
         "Stock Entry" => &[Owner, Admin, Stock],
         "Payment Entry" => &[Owner, Admin, Accountant],
         _ => return None,
@@ -233,7 +235,10 @@ async fn build_submit(
 
     resolve_account_fallbacks(doctype, &mut payload, &settings);
     if matches!(doctype, "Sales Invoice" | "Purchase Invoice") {
-        ensure_invoice_totals(&mut payload);
+        ensure_invoice_totals(&mut payload, true);
+    } else if doctype == "POS Invoice" {
+        // Payment is captured inline via `tenders` — no outstanding to track.
+        ensure_invoice_totals(&mut payload, false);
     }
 
     let batch_id = format!("PB-{document_id}");
@@ -614,6 +619,7 @@ fn resolve_account_fallbacks(
     let fallbacks: &[(&str, &str)] = match doctype {
         "Sales Invoice" => &[("debit_to", "receivable"), ("income_account", "income")],
         "Purchase Invoice" => &[("credit_to", "payable"), ("expense_account", "expense")],
+        "POS Invoice" => &[("cash_account", "cash"), ("income_account", "income")],
         "Payment Entry" => match as_non_empty(payload.get("payment_type")).as_deref() {
             Some("Receive") => &[("paid_from", "receivable"), ("paid_to", "cash")],
             Some("Pay") => &[("paid_from", "cash"), ("paid_to", "payable")],
@@ -636,8 +642,9 @@ fn resolve_account_fallbacks(
 }
 
 /// Backend-computed invoice totals: `grand_total` = Σ line amounts + Σ tax
-/// rows when the client did not supply it, and the initial outstanding.
-fn ensure_invoice_totals(payload: &mut Map<String, Value>) {
+/// rows when the client did not supply it, and (for invoices settled through
+/// payments, not a POS cash sale) the initial outstanding.
+fn ensure_invoice_totals(payload: &mut Map<String, Value>, track_outstanding: bool) {
     if as_non_empty(payload.get("grand_total")).is_none()
         && !matches!(payload.get("grand_total"), Some(Value::Number(_)))
     {
@@ -649,8 +656,10 @@ fn ensure_invoice_totals(payload: &mut Map<String, Value>) {
         let grand = net + total_tax(payload);
         payload.insert("grand_total".into(), json!(grand));
     }
-    let grand = as_num(payload.get("grand_total"));
-    payload.insert("outstanding_amount".into(), json!(grand));
+    if track_outstanding {
+        let grand = as_num(payload.get("grand_total"));
+        payload.insert("outstanding_amount".into(), json!(grand));
+    }
 }
 
 /// Monetary GL legs per doctype (receivable/payable, income/expense, VAT,
@@ -710,6 +719,35 @@ fn derive_monetary_gl(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec
                 ),
             ];
             gl.extend(tax_legs(ctx, payload, false));
+            gl
+        }
+        // Cash sale: Dr Cash / Cr Income (net) + output VAT. No receivable and
+        // no party GL fields — payment is captured inline; `tenders` never
+        // post (the Dart `_posInvoice`).
+        "POS Invoice" => {
+            let grand = as_num(payload.get("grand_total"));
+            let net = grand - total_tax(payload);
+            let mut gl = vec![
+                // Dr Cash / Bank — gross received.
+                ctx.gl(
+                    format!("GL-{id}-cash"),
+                    as_non_empty(payload.get("cash_account")).unwrap_or_default(),
+                    grand,
+                    0.0,
+                    None,
+                    None,
+                ),
+                // Cr Income — net of tax.
+                ctx.gl(
+                    format!("GL-{id}-income"),
+                    as_non_empty(payload.get("income_account")).unwrap_or_default(),
+                    0.0,
+                    net,
+                    None,
+                    None,
+                ),
+            ];
+            gl.extend(tax_legs(ctx, payload, true));
             gl
         }
         "Payment Entry" => {
@@ -842,6 +880,16 @@ fn derive_subledger_rows(
             }
             tax_rows = tax_transactions(ctx, payload, "Supplier", supplier);
         }
+        // A POS cash sale books no party row (payment is inline) but its
+        // output VAT still lands in the tax subledger (Dart `_posInvoice`).
+        "POS Invoice" => {
+            tax_rows = tax_transactions(
+                ctx,
+                payload,
+                "Customer",
+                as_non_empty(payload.get("customer")),
+            );
+        }
         "Payment Entry" => {
             // Payment reduces what is owed: negative on submit.
             if let Some(party) = as_non_empty(payload.get("party")) {
@@ -939,6 +987,9 @@ fn derive_stock_rows(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec<
             stock_document_rows(ctx, payload, true, "Receipt")
         }
         "Purchase Receipt" => stock_document_rows(ctx, payload, true, "Receipt"),
+        // A POS sale always issues stock (update_stock semantics are
+        // built-in); a Delivery Note is the pure stock-issue document.
+        "POS Invoice" | "Delivery Note" => stock_document_rows(ctx, payload, false, "Issue"),
         "Stock Entry" => stock_entry_rows(ctx, payload),
         _ => Vec::new(),
     }

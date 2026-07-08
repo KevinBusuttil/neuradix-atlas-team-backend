@@ -343,3 +343,83 @@ async fn commands_require_device_tokens_and_write_audit_rows() {
         assert_eq!(row["detail"]["documentId"], json!("SINV-D2"));
     }
 }
+
+#[tokio::test]
+async fn pos_invoice_and_delivery_note_are_official_and_sync_immutable() {
+    let mut app = TestApp::new().await;
+    app.upsert_item(json!({ "id": "ITEM-A", "item_type": "Stock" }))
+        .await;
+    let (status, body) = app
+        .submit_as(
+            "purchasing",
+            json!({
+                "doctype": "Purchase Receipt",
+                "document_id": "PREC-IM1",
+                "payload": { "posting_date": "2026-07-01", "set_warehouse": "WH" },
+                "items": [{ "item": "ITEM-A", "qty": 5, "rate": 4 }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "receipt failed: {body}");
+
+    let (status, body) = app
+        .submit_as(
+            "pos",
+            json!({
+                "doctype": "POS Invoice",
+                "document_id": "POS-IM1",
+                "payload": { "posting_date": "2026-07-02", "set_warehouse": "WH" },
+                "items": [{ "item": "ITEM-A", "qty": 1, "rate": 9 }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "pos submit failed: {body}");
+    assert_eq!(body["number"], json!("POS-00001"));
+
+    let (status, body) = app
+        .submit_as(
+            "stock",
+            json!({
+                "doctype": "Delivery Note",
+                "document_id": "DN-IM1",
+                "payload": { "posting_date": "2026-07-02", "set_warehouse": "WH" },
+                "items": [{ "item": "ITEM-A", "qty": 1, "rate": 9 }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "dn submit failed: {body}");
+    assert_eq!(body["number"], json!("DN-00001"));
+
+    // Both new doctypes are covered by the sync-plane immutability guard.
+    let token = app.device_token("owner").await;
+    for (doctype, document_id) in [("POS Invoice", "POS-IM1"), ("Delivery Note", "DN-IM1")] {
+        let (status, body) = app
+            .request(
+                Method::POST,
+                &format!("/companies/{}/sync/push", app.company_id),
+                Some(&token),
+                json!({ "mutations": [{
+                    "id": format!("m-{document_id}"),
+                    "type": "updateDocument",
+                    "docType": doctype,
+                    "documentId": document_id,
+                    "payload": { "grand_total": 999999 },
+                    "deviceId": "dev",
+                    "userId": "user",
+                    "localTimestamp": 1751791234567i64,
+                    "syncVersion": null,
+                    "status": "pending"
+                }]}),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{doctype} must be immutable via sync push: {body}"
+        );
+        assert!(
+            body["error"].as_str().unwrap().contains("immutable"),
+            "unexpected error: {body}"
+        );
+    }
+}

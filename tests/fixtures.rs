@@ -452,6 +452,7 @@ fixture_test!(
     "0008-transfer-value-neutral.json"
 );
 fixture_test!(fixture_0009_subledger_rows, "0009-subledger-rows.json");
+fixture_test!(fixture_0010_pos_and_delivery, "0010-pos-and-delivery.json");
 
 /// Every fixture file on disk must be wired to a test above — a new fixture
 /// that nobody runs is a silent hole in the contract.
@@ -467,6 +468,7 @@ fn every_fixture_file_is_covered() {
         "0007-role-rejection.json",
         "0008-transfer-value-neutral.json",
         "0009-subledger-rows.json",
+        "0010-pos-and-delivery.json",
     ];
     let mut on_disk: Vec<String> = std::fs::read_dir(fixtures_dir())
         .expect("fixtures dir")
