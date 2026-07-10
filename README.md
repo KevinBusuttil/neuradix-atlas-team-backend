@@ -286,6 +286,55 @@ two-document flow clears GRNI at matching values). POS *session close*
 remains Phase 6 client-side work — the POS Invoice posting itself is
 supported here.
 
+## Validation — the posting authority never trusts client money
+
+Every submit is recomputed and cross-checked server-side before anything
+reaches the official ledger; the engine fails **closed** (422/409, nothing
+posted, no official number burnt). Enforced invariants
+(`src/posting/engine.rs`, pinned by `tests/validation.rs` + the fixtures):
+
+* **`posting_date`** (submit *and* cancel): strict `YYYY-MM-DD`, a real
+  calendar date, year 1900–2100. Absent/blank defaults to today; anything
+  else — `"9999"`, `"zzz"`, `"2026-02-30"`, a number — is a 422 naming the
+  field. The period-lock comparison therefore only ever sees validated ISO
+  dates.
+* **Invoice totals** (Sales / Purchase / POS Invoice, `EPS = 0.005`):
+  * per line, `|amount − round2(qty × rate)| ≤ EPS` when `amount` is sent
+    (derived when absent);
+  * Σ line amounts must match `total` (exclusive pricing) or `grand_total`
+    (inclusive, `prices_include_tax` truthy — the tax is contained in the
+    line amounts) within `EPS × lines`;
+  * `grand_total = total + tax_total` within EPS,
+    `tax_total` = round2(Σ tax row amounts) within EPS;
+  * sent `total`/`tax_total`/`grand_total` must match the recomputation
+    (422 quoting expected vs sent); absent fields are derived — the Dart
+    `LineItemTotalsInterceptor`/`TaxCalculationInterceptor` maths exactly;
+  * `outstanding_amount` is always re-initialised from the **validated**
+    grand total; a client-sent outstanding is discarded.
+* **Tax rows** (`taxes`): every row satisfies
+  `|tax_amount − round2(taxable_amount × rate / 100)| ≤ 0.01` (withholding
+  rows carry the negated magnitude; the identity holds in inclusive mode too
+  because extraction sets `taxable = gross − tax`). Rates must be
+  non-negative — a zero-rate (exempt) row keeps its taxable base for the VAT
+  return but can never carry a tax amount. `taxable_amount ≥ 0` on normal
+  documents, `≤ 0` on returns (`is_return`), mirroring negated return lines.
+* **Payment Entry settlements** (submit only; reversals are exempt):
+  `paid_amount > 0`; every allocation non-negative and against an officially
+  posted (docstatus 1) Sales/Purchase Invoice; Σ `allocated_amount` ≤
+  `paid_amount` + EPS; each invoice's allocation ≤ its **current**
+  outstanding (grand total − stored settlements) + EPS, 422 naming the
+  invoice. The Stripe webhook's server-built Payment Entry (clamped to the
+  live outstanding) passes these by construction.
+* **Cancel order**: cancelling an invoice whose settlements do not net to
+  zero is a 409 telling the caller to cancel the payment entries first;
+  cancelling the payment restores the outstanding, after which the invoice
+  cancels cleanly.
+
+Tolerances: `MONEY_EPS = 0.005` (half a cent — per line, per stated total,
+per settlement guard; the same tolerance as the GL balance guard) and
+`TAX_ROW_EPS = 0.01` (one cent per tax row, absorbing the client's per-code
+rounding).
+
 ## Portal — customer / accountant links
 
 The portal (`docs/NEURADIX_DOMAIN_AND_BRAND_ARCHITECTURE.md` §11) is served
