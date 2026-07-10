@@ -90,10 +90,15 @@ pub trait Store: Send + Sync {
     /// expired user tokens do not resolve.
     async fn resolve_token(&self, token_hash: &str) -> Result<Option<TokenIdentity>, StoreError>;
 
-    // Invitations
+    // Invitations (tokens stored hashed, like every other credential)
     async fn create_invitation(&self, invitation: Invitation) -> Result<(), StoreError>;
-    async fn invitation(&self, token: &str) -> Result<Option<Invitation>, StoreError>;
-    async fn mark_invitation_accepted(&self, token: &str, user_id: Uuid) -> Result<(), StoreError>;
+    /// Looks an invitation up by the SHA-256 hex hash of its token.
+    async fn invitation_by_hash(&self, token_hash: &str) -> Result<Option<Invitation>, StoreError>;
+    async fn mark_invitation_accepted(
+        &self,
+        invitation_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), StoreError>;
 
     // Devices
     async fn create_device(&self, device: Device) -> Result<(), StoreError>;

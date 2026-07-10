@@ -88,9 +88,12 @@ pub struct Member {
     pub created_at: DateTime<Utc>,
 }
 
+/// A pending (or accepted) invitation. Like every other credential, the
+/// invitation token itself is never stored — only its SHA-256 hex hash.
 #[derive(Debug, Clone)]
 pub struct Invitation {
-    pub token: String,
+    pub id: Uuid,
+    pub token_hash: String,
     pub company_id: Uuid,
     pub email: String,
     pub role: Role,

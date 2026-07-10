@@ -1180,3 +1180,61 @@ async fn expired_user_token_is_rejected_and_legacy_null_expiry_still_works() {
     let (status, _) = app.get(&uri, Some(fresh_token)).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// Credential lifecycle (increment 0.5): hashed invitation tokens
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn invitation_tokens_are_stored_hashed_and_wrong_tokens_401() {
+    use atlas_team_backend::store::Store;
+
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/invitations", boot.company_id),
+            Some(&boot.owner_token),
+            json!({ "email": "hashed@example.com", "role": "sales" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "invite failed: {body}");
+    let token = body["token"].as_str().unwrap().to_string();
+
+    // The store holds only the SHA-256 hash of the token — looking up by the
+    // plaintext finds nothing, looking up by the hash finds the invitation.
+    assert!(app
+        .store
+        .invitation_by_hash(&token)
+        .await
+        .unwrap()
+        .is_none());
+    let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let stored = app.store.invitation_by_hash(&hash).await.unwrap().unwrap();
+    assert_eq!(stored.email, "hashed@example.com");
+    assert_eq!(stored.token_hash, hash);
+
+    // A wrong token is a 401.
+    let (status, _) = app
+        .json(
+            Method::POST,
+            "/invitations/not-the-real-token/accept",
+            None,
+            json!({ "display_name": "Impostor" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The real token still accepts (hashed lookup end to end).
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!("/invitations/{token}/accept"),
+            None,
+            json!({ "display_name": "Hasheen Joiner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "accept failed: {body}");
+    assert_eq!(body["role"].as_str().unwrap(), "sales");
+}

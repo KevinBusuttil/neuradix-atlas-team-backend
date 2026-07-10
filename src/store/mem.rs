@@ -38,7 +38,8 @@ struct Inner {
     memberships: HashMap<(Uuid, Uuid), (Role, chrono::DateTime<Utc>)>,
     /// token hash -> (user_id, company_id, expires_at; None = non-expiring)
     user_tokens: HashMap<String, (Uuid, Uuid, Option<chrono::DateTime<Utc>>)>,
-    invitations: HashMap<String, Invitation>,
+    /// invitation id -> invitation (tokens live here only as hashes)
+    invitations: HashMap<Uuid, Invitation>,
     devices: HashMap<Uuid, Device>,
     /// token hash -> device id
     device_tokens: HashMap<String, Uuid>,
@@ -402,23 +403,33 @@ impl Store for MemStore {
 
     async fn create_invitation(&self, invitation: Invitation) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.invitations.contains_key(&invitation.token) {
+        if inner
+            .invitations
+            .values()
+            .any(|existing| existing.token_hash == invitation.token_hash)
+        {
             return Err(StoreError::Conflict("invitation token exists".into()));
         }
-        inner
-            .invitations
-            .insert(invitation.token.clone(), invitation);
+        inner.invitations.insert(invitation.id, invitation);
         Ok(())
     }
 
-    async fn invitation(&self, token: &str) -> Result<Option<Invitation>, StoreError> {
+    async fn invitation_by_hash(&self, token_hash: &str) -> Result<Option<Invitation>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.invitations.get(token).cloned())
+        Ok(inner
+            .invitations
+            .values()
+            .find(|invitation| invitation.token_hash == token_hash)
+            .cloned())
     }
 
-    async fn mark_invitation_accepted(&self, token: &str, user_id: Uuid) -> Result<(), StoreError> {
+    async fn mark_invitation_accepted(
+        &self,
+        invitation_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
-        match inner.invitations.get_mut(token) {
+        match inner.invitations.get_mut(&invitation_id) {
             Some(invitation) => {
                 invitation.accepted_by = Some(user_id);
                 Ok(())

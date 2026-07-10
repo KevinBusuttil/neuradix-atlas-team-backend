@@ -542,10 +542,12 @@ impl Store for PgStore {
     async fn create_invitation(&self, invitation: Invitation) -> Result<(), StoreError> {
         sqlx::query(
             "insert into invitations \
-             (token, company_id, email, role, created_by, accepted_by, created_at, expires_at) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (id, token_hash, company_id, email, role, created_by, accepted_by, created_at, \
+              expires_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
-        .bind(&invitation.token)
+        .bind(invitation.id)
+        .bind(&invitation.token_hash)
         .bind(invitation.company_id)
         .bind(&invitation.email)
         .bind(invitation.role.as_str())
@@ -558,17 +560,18 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn invitation(&self, token: &str) -> Result<Option<Invitation>, StoreError> {
+    async fn invitation_by_hash(&self, token_hash: &str) -> Result<Option<Invitation>, StoreError> {
         let row = sqlx::query(
-            "select token, company_id, email, role, created_by, accepted_by, created_at, \
-             expires_at from invitations where token = $1",
+            "select id, token_hash, company_id, email, role, created_by, accepted_by, \
+             created_at, expires_at from invitations where token_hash = $1",
         )
-        .bind(token)
+        .bind(token_hash)
         .fetch_optional(&self.pool)
         .await?;
         match row {
             Some(row) => Ok(Some(Invitation {
-                token: row.try_get("token")?,
+                id: row.try_get("id")?,
+                token_hash: row.try_get("token_hash")?,
                 company_id: row.try_get("company_id")?,
                 email: row.try_get("email")?,
                 role: parse_role(row.try_get::<String, _>("role")?.as_str())?,
@@ -581,9 +584,13 @@ impl Store for PgStore {
         }
     }
 
-    async fn mark_invitation_accepted(&self, token: &str, user_id: Uuid) -> Result<(), StoreError> {
-        sqlx::query("update invitations set accepted_by = $2 where token = $1")
-            .bind(token)
+    async fn mark_invitation_accepted(
+        &self,
+        invitation_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query("update invitations set accepted_by = $2 where id = $1")
+            .bind(invitation_id)
             .bind(user_id)
             .execute(&self.pool)
             .await?;

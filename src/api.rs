@@ -213,12 +213,14 @@ async fn create_invitation(
     if req.email.trim().is_empty() {
         return Err(ApiError::BadRequest("email is required".into()));
     }
+    // The plaintext token is returned exactly once; only its hash is stored.
     let token = generate_token();
     let expires_at = Utc::now() + Duration::days(INVITATION_TTL_DAYS);
     state
         .store
         .create_invitation(Invitation {
-            token: token.clone(),
+            id: Uuid::new_v4(),
+            token_hash: hash_token(&token),
             company_id,
             email: req.email.trim().to_string(),
             role: req.role,
@@ -255,11 +257,13 @@ async fn accept_invitation(
     Path(token): Path<String>,
     Json(req): Json<AcceptInvitationRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // The presented token is a credential: hash it before lookup (only
+    // hashes are stored) and answer 401, not 404, when it matches nothing.
     let invitation = state
         .store
-        .invitation(&token)
+        .invitation_by_hash(&hash_token(&token))
         .await?
-        .ok_or(ApiError::NotFound)?;
+        .ok_or(ApiError::Unauthorized)?;
     if invitation.accepted_by.is_some() {
         return Err(ApiError::Conflict("invitation already accepted".into()));
     }
@@ -276,7 +280,7 @@ async fn accept_invitation(
         .await?;
     state
         .store
-        .mark_invitation_accepted(&token, user.id)
+        .mark_invitation_accepted(invitation.id, user.id)
         .await?;
     let user_token = generate_token();
     state
