@@ -7,7 +7,7 @@ mod support;
 
 use axum::http::StatusCode;
 use serde_json::{json, Value};
-use support::TestApp;
+use support::{approx, TestApp};
 
 /// Submits and asserts a 422 whose error message contains `needle`.
 async fn expect_422(app: &mut TestApp, role: &str, body: Value, needle: &str) {
@@ -106,6 +106,195 @@ async fn junk_posting_dates_are_rejected_with_422() {
         .await;
     assert_eq!(status, StatusCode::OK, "valid submit failed: {body}");
     assert_eq!(body["number"], json!("SINV-00001"));
+}
+
+// ---------------------------------------------------------------------------
+// Totals cross-check (Sales / Purchase / POS Invoice)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tampered_grand_total_is_rejected_with_expected_vs_sent() {
+    let mut app = app_with_service_item().await;
+    // A €10 line with a claimed €999 grand total: the classic client tamper.
+    let (status, response) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                "SINV-T1",
+                json!({ "grand_total": 999 }),
+                json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    let error = response["error"].as_str().unwrap();
+    assert!(error.contains("999"), "sent value missing: {error}");
+    assert!(error.contains("10"), "expected value missing: {error}");
+
+    // Tampered per-line amount (amount ≠ qty × rate).
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-T2",
+            json!({}),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10, "amount": 500 }]),
+        ),
+        "amount 500",
+    )
+    .await;
+
+    // Tampered total / tax_total.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-T3",
+            json!({ "total": 42 }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+        ),
+        "total: sent 42",
+    )
+    .await;
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-T4",
+            json!({ "tax_total": 3 }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+        ),
+        "tax_total: sent 3",
+    )
+    .await;
+
+    // POS Invoices are covered by the same cross-check.
+    let (status, response) = app
+        .submit_as(
+            "pos",
+            json!({
+                "doctype": "POS Invoice",
+                "document_id": "POS-T1",
+                "payload": { "posting_date": "2026-07-06", "grand_total": 999 },
+                "items": [{ "item": "SVC-1", "qty": 1, "rate": 10 }]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+
+    // Nothing reached the ledger.
+    for voucher in ["SINV-T1", "SINV-T2", "SINV-T3", "SINV-T4", "POS-T1"] {
+        assert_eq!(app.gl_count(voucher), 0, "GL leaked for {voucher}");
+    }
+}
+
+#[tokio::test]
+async fn consistent_client_totals_pass_and_client_outstanding_is_ignored() {
+    let mut app = app_with_service_item().await;
+    // Exactly what the Dart interceptors compute for 2 × €per-unit 10.55 with
+    // 18% exclusive VAT — plus a hostile outstanding_amount that must be
+    // ignored in favour of the validated grand total.
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                "SINV-OK1",
+                json!({
+                    "total": 21.10,
+                    "tax_total": 3.80,
+                    "grand_total": 24.90,
+                    "outstanding_amount": 0.01,
+                    "taxes": [{
+                        "tax_type": "VAT",
+                        "tax_code": "VAT-18",
+                        "tax_account": "VAT Output",
+                        "rate": 18,
+                        "taxable_amount": 21.10,
+                        "tax_amount": 3.80
+                    }]
+                }),
+                json!([{ "item": "SVC-1", "qty": 2, "rate": 10.55, "amount": 21.10 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "consistent submit failed: {body}");
+    assert!(
+        approx(app.outstanding("Sales Invoice", "SINV-OK1").unwrap(), 24.90),
+        "outstanding must be the validated grand total, not the client's"
+    );
+}
+
+#[tokio::test]
+async fn inclusive_pricing_invoice_computed_the_dart_way_passes() {
+    let mut app = app_with_service_item().await;
+    // Retail pricing: 3 × 9.99 + 1 × 20.03 = €50.00 gross, 18% contained VAT.
+    // HubTaxEngine (inclusive): magnitude = round2(50 × 18 / 118) = 7.63,
+    // taxable = 42.37, net = 42.37, tax = 7.63, grand = 50.00 = Σ lines.
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                "SINV-INC1",
+                json!({
+                    "prices_include_tax": true,
+                    "total": 42.37,
+                    "tax_total": 7.63,
+                    "grand_total": 50.00,
+                    "taxes": [{
+                        "tax_type": "VAT",
+                        "tax_code": "VAT-18",
+                        "tax_account": "VAT Output",
+                        "rate": 18,
+                        "taxable_amount": 42.37,
+                        "tax_amount": 7.63
+                    }]
+                }),
+                json!([
+                    { "item": "SVC-1", "qty": 3, "rate": 9.99, "amount": 29.97 },
+                    { "item": "SVC-1", "qty": 1, "rate": 20.03, "amount": 20.03 }
+                ]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "inclusive submit failed: {body}");
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-INC1").unwrap(),
+        50.0
+    ));
+    // The GL books net revenue + output VAT, receivable gross.
+    assert!(approx(app.voucher_account("Debtors", "SINV-INC1"), 50.0));
+    assert!(approx(app.voucher_account("Sales", "SINV-INC1"), -42.37));
+    assert!(approx(
+        app.voucher_account("VAT Output", "SINV-INC1"),
+        -7.63
+    ));
+
+    // The same document claiming exclusive maths (grand = lines + tax) fails:
+    // in inclusive mode the tax is already inside the line amounts.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-INC2",
+            json!({
+                "prices_include_tax": true,
+                "grand_total": 57.63,
+                "taxes": [{
+                    "tax_type": "VAT",
+                    "rate": 18,
+                    "tax_account": "VAT Output",
+                    "taxable_amount": 42.37,
+                    "tax_amount": 7.63
+                }]
+            }),
+            json!([
+                { "item": "SVC-1", "qty": 3, "rate": 9.99 },
+                { "item": "SVC-1", "qty": 1, "rate": 20.03 }
+            ]),
+        ),
+        "grand_total: sent 57.63",
+    )
+    .await;
 }
 
 #[tokio::test]

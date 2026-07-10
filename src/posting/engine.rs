@@ -25,15 +25,23 @@ use crate::posting::model::{
 };
 use crate::posting::stock::{compute_balance, issue_rate, LedgerRow};
 use crate::posting::values::{
-    as_non_empty, as_num, is_stock_item_type, is_true, outstanding_amount, uom_factor,
+    as_non_empty, as_num, is_stock_item_type, is_true, outstanding_amount, round2, uom_factor,
     REVERSAL_SUFFIX,
 };
 use crate::store::{Store, StoreError};
 
 /// Amounts below this are treated as zero (mirrors the Dart 1e-7 epsilon).
 const EPS: f64 = 1e-7;
+/// Half-cent tolerance for the money cross-checks (per line / per stated
+/// total) — the same sub-cent tolerance as the JE balance guard and the
+/// settlement paid-epsilon.
+const MONEY_EPS: f64 = 0.005;
 /// JE-style balance guard tolerance on the generated GL.
 const BALANCE_TOLERANCE: f64 = 0.005;
+/// `tax_type` of a withholding tax row: deducted from the document total
+/// (carried with a negative `tax_amount`), mirroring the Dart
+/// `HubTaxEngine.withholdingType`.
+const WITHHOLDING_TAX_TYPE: &str = "Withholding";
 /// Stale-state retries before giving up under pathological contention.
 const MAX_RETRIES: usize = 16;
 
@@ -284,10 +292,10 @@ async fn build_submit(
 
     resolve_account_fallbacks(doctype, &mut payload, &settings);
     if matches!(doctype, "Sales Invoice" | "Purchase Invoice") {
-        ensure_invoice_totals(&mut payload, true);
+        validate_invoice_totals(&mut payload, true)?;
     } else if doctype == "POS Invoice" {
         // Payment is captured inline via `tenders` — no outstanding to track.
-        ensure_invoice_totals(&mut payload, false);
+        validate_invoice_totals(&mut payload, false)?;
     }
 
     let batch_id = format!("PB-{document_id}");
@@ -661,11 +669,14 @@ fn items_of(payload: &Map<String, Value>) -> &[Value] {
     }
 }
 
+/// The line's monetary amount: the sent `amount` when present (a null reads
+/// as absent), else `round2(qty × rate)` — the Dart client computes
+/// `amount = qty * rate` per line. Sent amounts are cross-checked against
+/// the recomputation in [`validate_invoice_totals`] before this is trusted.
 fn line_amount(line: &Map<String, Value>) -> f64 {
-    if line.contains_key("amount") {
-        as_num(line.get("amount"))
-    } else {
-        as_num(line.get("qty")) * as_num(line.get("rate"))
+    match line.get("amount") {
+        Some(v) if !v.is_null() => as_num(Some(v)),
+        _ => round2(as_num(line.get("qty")) * as_num(line.get("rate"))),
     }
 }
 
@@ -712,25 +723,136 @@ fn resolve_account_fallbacks(
     }
 }
 
-/// Backend-computed invoice totals: `grand_total` = Σ line amounts + Σ tax
-/// rows when the client did not supply it, and (for invoices settled through
-/// payments, not a POS cash sale) the initial outstanding.
-fn ensure_invoice_totals(payload: &mut Map<String, Value>, track_outstanding: bool) {
-    if as_non_empty(payload.get("grand_total")).is_none()
-        && !matches!(payload.get("grand_total"), Some(Value::Number(_)))
-    {
-        let net: f64 = items_of(payload)
-            .iter()
-            .filter_map(Value::as_object)
-            .map(line_amount)
-            .sum();
-        let grand = net + total_tax(payload);
-        payload.insert("grand_total".into(), json!(grand));
+/// A payload money field the client actually sent: absent, null and blank
+/// read as "not sent" (the server derives); anything else is coerced through
+/// [`as_num`] — the same coercion every downstream reader applies — so the
+/// value that gets validated is exactly the value that would post.
+fn sent_number(payload: &Map<String, Value>, field: &str) -> Option<f64> {
+    match payload.get(field) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.trim().is_empty() => None,
+        Some(v) => Some(as_num(Some(v))),
     }
+}
+
+/// Server-side recomputation of the invoice totals, mirroring the Dart
+/// `LineItemTotalsInterceptor` + `TaxCalculationInterceptor` /
+/// `HubTaxEngine.compute` exactly, so a well-behaved client always passes:
+///
+/// * each line: `amount = round2(qty × rate)` — a sent `amount` must match
+///   within [`MONEY_EPS`], an absent one is derived;
+/// * exclusive pricing: `total` = round2(Σ line amounts); inclusive pricing
+///   (`prices_include_tax` truthy): the line amounts are gross, the tax rows
+///   carry the extracted tax, so `total` = round2(Σ lines − Σ extracted) and
+///   Σ line amounts == `grand_total`;
+/// * `tax_total` = round2(Σ tax row amounts) (withholding rows negative);
+/// * `grand_total` = round2(total + tax_total).
+///
+/// Sent `total` / `tax_total` / `grand_total` must match the recomputation
+/// (422 quoting expected vs sent); absent ones keep the derive-when-missing
+/// behaviour. `outstanding_amount` is always re-initialised from the
+/// validated grand total — a client-sent outstanding is never trusted.
+fn validate_invoice_totals(
+    payload: &mut Map<String, Value>,
+    track_outstanding: bool,
+) -> Result<(), PostingError> {
+    let inclusive = is_true(payload.get("prices_include_tax"));
+    let mut lines_sum = 0.0;
+    let mut line_count: usize = 0;
+    for (index, line) in items_of(payload).iter().enumerate() {
+        let Some(line) = line.as_object() else {
+            continue;
+        };
+        let derived = round2(as_num(line.get("qty")) * as_num(line.get("rate")));
+        let amount = match line.get("amount") {
+            None | Some(Value::Null) => derived,
+            Some(v) => {
+                let sent = as_num(Some(v));
+                if (sent - derived).abs() > MONEY_EPS {
+                    return Err(PostingError::Validation(format!(
+                        "items[{index}]: amount {sent} does not match qty × rate = {derived}"
+                    )));
+                }
+                sent
+            }
+        };
+        lines_sum += amount;
+        line_count += 1;
+    }
+
+    // Tax rows are validated in detail by `validate_tax_rows`; here they feed
+    // the document totals.
+    let mut tax_sum = 0.0;
+    let mut extracted = 0.0; // inclusive: tax contained in the line amounts
+    if let Some(Value::Array(rows)) = payload.get("taxes") {
+        for row in rows.iter().filter_map(Value::as_object) {
+            let tax_amount = as_num(row.get("tax_amount"));
+            tax_sum += tax_amount;
+            let withholding =
+                as_non_empty(row.get("tax_type")).as_deref() == Some(WITHHOLDING_TAX_TYPE);
+            if inclusive && !withholding {
+                extracted += tax_amount;
+            }
+        }
+    }
+    let computed_total = round2(lines_sum - extracted);
+    let computed_tax = round2(tax_sum);
+    let computed_grand = round2(computed_total + computed_tax);
+    // Per-line rounding can drift the sums by up to half a cent per line.
+    let line_tolerance = MONEY_EPS * line_count.max(1) as f64;
+
+    let total = match sent_number(payload, "total") {
+        Some(sent) => {
+            if (sent - computed_total).abs() > line_tolerance {
+                return Err(PostingError::Validation(format!(
+                    "total: sent {sent}, expected {computed_total} (Σ line amounts{})",
+                    if inclusive { " − extracted tax" } else { "" }
+                )));
+            }
+            sent
+        }
+        None => computed_total,
+    };
+    let tax_total = match sent_number(payload, "tax_total") {
+        Some(sent) => {
+            if (sent - computed_tax).abs() > MONEY_EPS {
+                return Err(PostingError::Validation(format!(
+                    "tax_total: sent {sent}, expected {computed_tax} (Σ tax row amounts)"
+                )));
+            }
+            sent
+        }
+        None => computed_tax,
+    };
+    let grand = match sent_number(payload, "grand_total") {
+        Some(sent) => {
+            if (sent - computed_grand).abs() > line_tolerance {
+                return Err(PostingError::Validation(format!(
+                    "grand_total: sent {sent}, expected {computed_grand} (total + tax_total)"
+                )));
+            }
+            sent
+        }
+        None => {
+            payload.insert("grand_total".into(), json!(computed_grand));
+            computed_grand
+        }
+    };
+    // The identity itself, over the resolved values (a rounded sum may sit
+    // half a cent from its unrounded parts).
+    if (grand - (total + tax_total)).abs() > 2.0 * MONEY_EPS {
+        return Err(PostingError::Validation(format!(
+            "grand_total {grand} does not equal total {total} + tax_total {tax_total}"
+        )));
+    }
+
+    // Derived state is never accepted from the client: the outstanding an
+    // invoice starts with is exactly its validated grand total.
+    payload.remove("outstanding_amount");
     if track_outstanding {
-        let grand = as_num(payload.get("grand_total"));
         payload.insert("outstanding_amount".into(), json!(grand));
     }
+    Ok(())
 }
 
 /// Monetary GL legs per doctype (receivable/payable, income/expense, VAT,
