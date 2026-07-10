@@ -485,6 +485,168 @@ async fn valid_zero_rate_withholding_and_return_tax_rows_pass() {
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// Settlement guards (Payment Entry)
+// ---------------------------------------------------------------------------
+
+/// A €100 service invoice the payment tests settle against.
+async fn app_with_invoice(invoice_id: &str) -> TestApp {
+    let mut app = app_with_service_item().await;
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                invoice_id,
+                json!({}),
+                json!([{ "item": "SVC-1", "qty": 1, "rate": 100 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "seed invoice failed: {body}");
+    app
+}
+
+fn payment(document_id: &str, paid: f64, references: Value) -> Value {
+    json!({
+        "doctype": "Payment Entry",
+        "document_id": document_id,
+        "payload": {
+            "payment_type": "Receive",
+            "party": "CUST-1",
+            "paid_amount": paid,
+            "posting_date": "2026-07-07",
+            "references": references
+        },
+        "items": []
+    })
+}
+
+fn reference(invoice_id: &str, allocated: f64) -> Value {
+    json!({
+        "reference_doctype": "Sales Invoice",
+        "reference_name": invoice_id,
+        "allocated_amount": allocated
+    })
+}
+
+#[tokio::test]
+async fn payment_over_allocation_and_bad_references_are_rejected() {
+    let mut app = app_with_invoice("SINV-S1").await;
+
+    // Σ allocated > paid_amount.
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV1", 50.0, json!([reference("SINV-S1", 80.0)])),
+        "exceeds paid_amount",
+    )
+    .await;
+
+    // Allocation beyond the invoice's current outstanding — names the invoice.
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV2", 500.0, json!([reference("SINV-S1", 500.0)])),
+        "SINV-S1",
+    )
+    .await;
+
+    // Non-positive paid amounts.
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV3", 0.0, json!([])),
+        "paid_amount",
+    )
+    .await;
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV4", -60.0, json!([])),
+        "paid_amount",
+    )
+    .await;
+
+    // Negative allocations can never inflate an invoice's outstanding.
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV5", 10.0, json!([reference("SINV-S1", -40.0)])),
+        "must not be negative",
+    )
+    .await;
+
+    // References must be officially posted (docstatus 1) invoices…
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV6", 10.0, json!([reference("SINV-GHOST", 10.0)])),
+        "unknown invoice",
+    )
+    .await;
+    // …of a settleable doctype.
+    expect_422(
+        &mut app,
+        "accountant",
+        payment(
+            "PAY-OV7",
+            10.0,
+            json!([{
+                "reference_doctype": "Delivery Note",
+                "reference_name": "DN-1",
+                "allocated_amount": 10.0
+            }]),
+        ),
+        "only submitted Sales/Purchase Invoices",
+    )
+    .await;
+
+    // Nothing posted; the invoice's outstanding is untouched.
+    for voucher in [
+        "PAY-OV1", "PAY-OV2", "PAY-OV3", "PAY-OV4", "PAY-OV5", "PAY-OV6", "PAY-OV7",
+    ] {
+        assert_eq!(app.gl_count(voucher), 0, "GL leaked for {voucher}");
+        assert_eq!(app.settlement_count(voucher), 0);
+    }
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-S1").unwrap(),
+        100.0
+    ));
+
+    // Cumulative over-allocation across payments: 60 settles, another 60
+    // exceeds the €40 remaining.
+    let (status, body) = app
+        .submit_as(
+            "accountant",
+            payment("PAY-OK1", 60.0, json!([reference("SINV-S1", 60.0)])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "first payment failed: {body}");
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-S1").unwrap(),
+        40.0
+    ));
+    expect_422(
+        &mut app,
+        "accountant",
+        payment("PAY-OV8", 60.0, json!([reference("SINV-S1", 60.0)])),
+        "exceeds its outstanding 40",
+    )
+    .await;
+    // Settling the exact remainder is fine.
+    let (status, body) = app
+        .submit_as(
+            "accountant",
+            payment("PAY-OK2", 40.0, json!([reference("SINV-S1", 40.0)])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "remainder payment failed: {body}");
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-S1").unwrap(),
+        0.0
+    ));
+}
+
 #[tokio::test]
 async fn absent_posting_date_defaults_to_today_and_boundary_years_post() {
     let mut app = app_with_service_item().await;

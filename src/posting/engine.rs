@@ -354,7 +354,9 @@ async fn build_submit(
     let mut outstanding_updates = Vec::new();
     if doctype == "Payment Entry" {
         settlements = derive_settlements(&ctx, &payload);
-        outstanding_updates = payment_outstanding_updates(store, company_id, &settlements).await?;
+        validate_payment_submit(&payload, &settlements)?;
+        outstanding_updates =
+            payment_outstanding_updates(store, company_id, &settlements, true).await?;
     }
 
     let bins = recompute_bins(company_id, &ledgers);
@@ -548,8 +550,10 @@ async fn build_cancel(
     check_negative_stock(&settings, &ledgers)?;
     let bins = recompute_bins(company_id, &ledgers);
 
+    // Reversal allocations are negative; the submit-side allocation limits do
+    // not apply when a payment is backed out.
     let outstanding_updates = if cmd.doctype == "Payment Entry" {
-        payment_outstanding_updates(store, company_id, &settlements).await?
+        payment_outstanding_updates(store, company_id, &settlements, false).await?
     } else {
         Vec::new()
     };
@@ -1870,13 +1874,63 @@ fn recompute_bins(company_id: Uuid, ledgers: &Ledgers) -> Vec<Bin> {
         .collect()
 }
 
+/// Document types a Payment Entry may settle.
+const SETTLEABLE_DOCTYPES: [&str; 2] = ["Sales Invoice", "Purchase Invoice"];
+
+/// Submit-side Payment Entry guards, before anything posts:
+/// `paid_amount` must be positive, every allocation non-negative and against
+/// a settleable doctype, and Σ allocations may not exceed the paid amount
+/// (within [`MONEY_EPS`]). The per-invoice outstanding ceiling is enforced in
+/// [`payment_outstanding_updates`], which already loads each invoice and its
+/// stored settlements.
+fn validate_payment_submit(
+    payload: &Map<String, Value>,
+    settlements: &[Settlement],
+) -> Result<(), PostingError> {
+    let paid = as_num(payload.get("paid_amount"));
+    if paid <= 0.0 {
+        return Err(PostingError::Validation(format!(
+            "paid_amount must be positive, got {paid}"
+        )));
+    }
+    let mut allocated_total = 0.0;
+    for settlement in settlements {
+        if !SETTLEABLE_DOCTYPES.contains(&settlement.invoice_voucher_type.as_str()) {
+            return Err(PostingError::Validation(format!(
+                "payment references {} {} — only submitted Sales/Purchase Invoices can be settled",
+                settlement.invoice_voucher_type, settlement.invoice_voucher_no
+            )));
+        }
+        if settlement.allocated_amount < -MONEY_EPS {
+            return Err(PostingError::Validation(format!(
+                "allocated_amount {} against {} {} must not be negative",
+                settlement.allocated_amount,
+                settlement.invoice_voucher_type,
+                settlement.invoice_voucher_no
+            )));
+        }
+        allocated_total += settlement.allocated_amount;
+    }
+    if allocated_total > paid + MONEY_EPS {
+        return Err(PostingError::Validation(format!(
+            "allocated total {allocated_total} exceeds paid_amount {paid}"
+        )));
+    }
+    Ok(())
+}
+
 /// Recomputes `outstanding_amount` for every submitted invoice this payment
 /// (or its cancellation) touches: grand total less all stored settlements
-/// plus the new signed allocations.
+/// plus the new signed allocations. With `enforce_allocation_limits` (the
+/// submit path) an allocation exceeding the invoice's CURRENT outstanding
+/// (within [`MONEY_EPS`]) is rejected, naming the invoice — a payment can
+/// never drive an invoice's outstanding negative. Cancellation passes
+/// `false`: its negated allocations restore outstanding instead.
 async fn payment_outstanding_updates(
     store: &dyn Store,
     company_id: Uuid,
     new_settlements: &[Settlement],
+    enforce_allocation_limits: bool,
 ) -> Result<Vec<(String, String, f64)>, PostingError> {
     let mut updates = Vec::new();
     let mut seen: Vec<(String, String)> = Vec::new();
@@ -1916,6 +1970,15 @@ async fn payment_outstanding_updates(
             .filter(|s| s.invoice_voucher_type == key.0 && s.invoice_voucher_no == key.1)
             .map(|s| s.allocated_amount)
             .sum();
+        if enforce_allocation_limits {
+            let current = outstanding_amount(grand, [stored]);
+            if new > current + MONEY_EPS {
+                return Err(PostingError::Validation(format!(
+                    "allocation {new} against {} {} exceeds its outstanding {current}",
+                    key.0, key.1
+                )));
+            }
+        }
         updates.push((key.0, key.1, outstanding_amount(grand, [stored, new])));
     }
     Ok(updates)
