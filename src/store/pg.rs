@@ -490,13 +490,16 @@ impl Store for PgStore {
         token_hash: &str,
         user_id: Uuid,
         company_id: Uuid,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "insert into user_tokens (token_hash, user_id, company_id) values ($1, $2, $3)",
+            "insert into user_tokens (token_hash, user_id, company_id, expires_at) \
+             values ($1, $2, $3, $4)",
         )
         .bind(token_hash)
         .bind(user_id)
         .bind(company_id)
+        .bind(expires_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -517,10 +520,15 @@ impl Store for PgStore {
                 device_id: Some(row.try_get("id")?),
             }));
         }
-        let user = sqlx::query("select user_id, company_id from user_tokens where token_hash = $1")
-            .bind(token_hash)
-            .fetch_optional(&self.pool)
-            .await?;
+        // Expired user tokens do not resolve; a null expires_at is a legacy
+        // token, treated as non-expiring.
+        let user = sqlx::query(
+            "select user_id, company_id from user_tokens \
+             where token_hash = $1 and (expires_at is null or expires_at > now())",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(match user {
             Some(row) => Some(TokenIdentity {
                 user_id: row.try_get("user_id")?,

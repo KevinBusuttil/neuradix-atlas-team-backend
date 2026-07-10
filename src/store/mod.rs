@@ -77,12 +77,17 @@ pub trait Store: Send + Sync {
         -> Result<u64, StoreError>;
 
     // Tokens (opaque bearer tokens; only SHA-256 hashes are stored)
+    /// `expires_at = None` means non-expiring (legacy tokens issued before
+    /// expiry existed); the API layer always passes an expiry for new tokens.
     async fn insert_user_token(
         &self,
         token_hash: &str,
         user_id: Uuid,
         company_id: Uuid,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), StoreError>;
+    /// Resolves a member/device bearer token. Revoked device tokens and
+    /// expired user tokens do not resolve.
     async fn resolve_token(&self, token_hash: &str) -> Result<Option<TokenIdentity>, StoreError>;
 
     // Invitations

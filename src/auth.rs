@@ -5,6 +5,20 @@
 //! (user, company, device?) — device tokens carry a device id, user tokens do
 //! not. Company-scoped authorization is a separate membership check against
 //! the company id in the request path (`require_membership`).
+//!
+//! # Token lifecycle
+//!
+//! * **User tokens** carry an absolute expiry (default 30 days, env
+//!   `ATLAS_USER_TOKEN_TTL_DAYS`); expired tokens no longer resolve. Tokens
+//!   issued before expiry existed have a null `expires_at` and are treated
+//!   as non-expiring, so the migration does not lock out live sessions.
+//! * **Device tokens** deliberately have **no** absolute expiry: they are
+//!   long-lived credentials for offline-first devices that may sync only
+//!   sporadically, and an expiry would silently brick a device holding
+//!   unpushed local mutations. The controls are explicit revocation
+//!   (per-device, or all of a member's devices on removal) plus
+//!   `last_seen_at` visibility in the device list, which lets owners/admins
+//!   spot and revoke stale or stolen credentials.
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;

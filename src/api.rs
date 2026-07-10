@@ -30,6 +30,19 @@ use crate::AppState;
 const INVITATION_TTL_DAYS: i64 = 7;
 const DEFAULT_AUDIT_LIMIT: i64 = 100;
 const MAX_AUDIT_LIMIT: i64 = 500;
+/// Absolute lifetime of newly issued user tokens, overridable via the
+/// `ATLAS_USER_TOKEN_TTL_DAYS` environment variable.
+const DEFAULT_USER_TOKEN_TTL_DAYS: i64 = 30;
+
+/// When a user token issued right now expires.
+fn user_token_expires_at() -> chrono::DateTime<Utc> {
+    let days = std::env::var("ATLAS_USER_TOKEN_TTL_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_USER_TOKEN_TTL_DAYS);
+    Utc::now() + Duration::days(days)
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -153,7 +166,12 @@ async fn create_company(
     let token = generate_token();
     state
         .store
-        .insert_user_token(&hash_token(&token), owner.id, company.id)
+        .insert_user_token(
+            &hash_token(&token),
+            owner.id,
+            company.id,
+            Some(user_token_expires_at()),
+        )
         .await?;
     state
         .store
@@ -263,7 +281,12 @@ async fn accept_invitation(
     let user_token = generate_token();
     state
         .store
-        .insert_user_token(&hash_token(&user_token), user.id, invitation.company_id)
+        .insert_user_token(
+            &hash_token(&user_token),
+            user.id,
+            invitation.company_id,
+            Some(user_token_expires_at()),
+        )
         .await?;
     state
         .store

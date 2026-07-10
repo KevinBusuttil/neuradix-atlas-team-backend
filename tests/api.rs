@@ -1125,3 +1125,58 @@ async fn member_removal_revokes_their_devices() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+// ---------------------------------------------------------------------------
+// Credential lifecycle (increment 0.5): user-token expiry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn expired_user_token_is_rejected_and_legacy_null_expiry_still_works() {
+    use atlas_team_backend::store::Store;
+
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let user_id = uuid::Uuid::parse_str(&boot.owner_user_id).unwrap();
+    let company_id = uuid::Uuid::parse_str(&boot.company_id).unwrap();
+    let uri = format!("/companies/{}/members", boot.company_id);
+
+    // A token that expired an hour ago, planted directly through the store.
+    let expired_token = "expired-user-token";
+    let hash = hex::encode(Sha256::digest(expired_token.as_bytes()));
+    app.store
+        .insert_user_token(
+            &hash,
+            user_id,
+            company_id,
+            Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .await
+        .unwrap();
+    let (status, _) = app.get(&uri, Some(expired_token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A legacy token with a null expiry (pre-migration) is non-expiring.
+    let legacy_token = "legacy-user-token";
+    let hash = hex::encode(Sha256::digest(legacy_token.as_bytes()));
+    app.store
+        .insert_user_token(&hash, user_id, company_id, None)
+        .await
+        .unwrap();
+    let (status, body) = app.get(&uri, Some(legacy_token)).await;
+    assert_eq!(status, StatusCode::OK, "legacy token failed: {body}");
+
+    // A token with a future expiry works.
+    let fresh_token = "fresh-user-token";
+    let hash = hex::encode(Sha256::digest(fresh_token.as_bytes()));
+    app.store
+        .insert_user_token(
+            &hash,
+            user_id,
+            company_id,
+            Some(chrono::Utc::now() + chrono::Duration::days(30)),
+        )
+        .await
+        .unwrap();
+    let (status, _) = app.get(&uri, Some(fresh_token)).await;
+    assert_eq!(status, StatusCode::OK);
+}

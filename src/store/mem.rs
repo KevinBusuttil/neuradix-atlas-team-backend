@@ -36,8 +36,8 @@ struct Inner {
     users_by_email: HashMap<String, Uuid>,
     /// (user_id, company_id) -> (role, membership created_at)
     memberships: HashMap<(Uuid, Uuid), (Role, chrono::DateTime<Utc>)>,
-    /// token hash -> (user_id, company_id)
-    user_tokens: HashMap<String, (Uuid, Uuid)>,
+    /// token hash -> (user_id, company_id, expires_at; None = non-expiring)
+    user_tokens: HashMap<String, (Uuid, Uuid, Option<chrono::DateTime<Utc>>)>,
     invitations: HashMap<String, Invitation>,
     devices: HashMap<Uuid, Device>,
     /// token hash -> device id
@@ -365,11 +365,12 @@ impl Store for MemStore {
         token_hash: &str,
         user_id: Uuid,
         company_id: Uuid,
+        expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         inner
             .user_tokens
-            .insert(token_hash.to_string(), (user_id, company_id));
+            .insert(token_hash.to_string(), (user_id, company_id, expires_at));
         Ok(())
     }
 
@@ -390,7 +391,9 @@ impl Store for MemStore {
         Ok(inner
             .user_tokens
             .get(token_hash)
-            .map(|&(user_id, company_id)| TokenIdentity {
+            // Expired user tokens do not resolve; None = non-expiring.
+            .filter(|(_, _, expires_at)| expires_at.is_none_or(|expiry| expiry > Utc::now()))
+            .map(|&(user_id, company_id, _)| TokenIdentity {
                 user_id,
                 company_id,
                 device_id: None,
