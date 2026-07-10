@@ -128,6 +128,54 @@ fn today() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
 }
 
+/// Earliest year an official document may be dated in.
+const MIN_POSTING_YEAR: i32 = 1900;
+/// Latest year an official document may be dated in.
+const MAX_POSTING_YEAR: i32 = 2100;
+
+/// The document's `posting_date`, validated: absent / null / blank defaults
+/// to today (the existing derive-when-missing behaviour); anything else must
+/// be a strict `YYYY-MM-DD` string naming a real calendar date between
+/// [`MIN_POSTING_YEAR`] and [`MAX_POSTING_YEAR`]. Everything downstream (the
+/// period-lock comparison, GL/SLE stamping, replication) then operates on
+/// validated ISO dates only, so lexicographic date comparison is sound.
+fn validated_posting_date(payload: &Map<String, Value>) -> Result<String, PostingError> {
+    let date = match payload.get("posting_date") {
+        None | Some(Value::Null) => return Ok(today()),
+        Some(Value::String(s)) if s.trim().is_empty() => return Ok(today()),
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(other) => {
+            return Err(PostingError::Validation(format!(
+                "posting_date must be a YYYY-MM-DD string, got {other}"
+            )))
+        }
+    };
+    let bytes = date.as_bytes();
+    let well_formed = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
+    let real_date = well_formed && {
+        // Well-formed guarantees the parses succeed; from_ymd_opt rejects
+        // impossible calendar dates (2026-02-30, month 13, day 0, …).
+        let year: i32 = date[0..4].parse().unwrap_or_default();
+        let month: u32 = date[5..7].parse().unwrap_or_default();
+        let day: u32 = date[8..10].parse().unwrap_or_default();
+        (MIN_POSTING_YEAR..=MAX_POSTING_YEAR).contains(&year)
+            && chrono::NaiveDate::from_ymd_opt(year, month, day).is_some()
+    };
+    if !real_date {
+        return Err(PostingError::Validation(format!(
+            "posting_date {date:?} is not a valid date: expected YYYY-MM-DD \
+             between {MIN_POSTING_YEAR}-01-01 and {MAX_POSTING_YEAR}-12-31"
+        )));
+    }
+    Ok(date)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points (retry loop around build + atomic commit)
 // ---------------------------------------------------------------------------
@@ -220,7 +268,7 @@ async fn build_submit(
 
     let mut payload = cmd.payload.clone();
     payload.insert("items".into(), Value::Array(cmd.items.clone()));
-    let posting_date = as_non_empty(payload.get("posting_date")).unwrap_or_else(today);
+    let posting_date = validated_posting_date(&payload)?;
     payload.insert("posting_date".into(), json!(posting_date));
     check_period_lock(&settings, &posting_date)?;
 
@@ -366,7 +414,13 @@ async fn build_cancel(
             cmd.doctype, cmd.document_id, document.docstatus
         )));
     }
-    let posting_date = as_non_empty(document.payload.get("posting_date")).unwrap_or_else(today);
+    // The stored date was validated on submit; re-validating on cancel keeps
+    // the period-lock comparison fail-closed for documents that predate the
+    // validation.
+    let posting_date = match document.payload.as_object() {
+        Some(payload) => validated_posting_date(payload)?,
+        None => today(),
+    };
     check_period_lock(&settings, &posting_date)?;
 
     let document_id = cmd.document_id.as_str();
