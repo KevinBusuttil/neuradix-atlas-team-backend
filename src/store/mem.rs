@@ -20,7 +20,7 @@ use crate::posting::model::{
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
 
-use super::{Store, StoreError};
+use super::{MutationPage, Store, StoreError};
 
 #[derive(Debug, Clone)]
 struct StoredMutation {
@@ -517,7 +517,8 @@ impl Store for MemStore {
         &self,
         company_id: Uuid,
         after: i64,
-    ) -> Result<Vec<MutationRecord>, StoreError> {
+        limit: i64,
+    ) -> Result<MutationPage, StoreError> {
         let inner = self.inner.lock().unwrap();
         let mut out: Vec<(i64, MutationRecord)> = inner
             .mutations
@@ -534,7 +535,13 @@ impl Store for MemStore {
             })
             .unwrap_or_default();
         out.sort_by_key(|(version, _)| *version);
-        Ok(out.into_iter().map(|(_, record)| record).collect())
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let has_more = out.len() > limit;
+        out.truncate(limit);
+        Ok(MutationPage {
+            mutations: out.into_iter().map(|(_, record)| record).collect(),
+            has_more,
+        })
     }
 
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError> {

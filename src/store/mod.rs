@@ -39,6 +39,17 @@ pub enum StoreError {
     Internal(String),
 }
 
+/// One page of a paginated mutation pull.
+#[derive(Debug)]
+pub struct MutationPage {
+    /// At most the requested `limit` records, sync-version ascending, with
+    /// `sync_version` set on each.
+    pub mutations: Vec<MutationRecord>,
+    /// Whether mutations exist past the last returned version. Exact — never
+    /// a heuristic — so clients can stop looping the moment it is `false`.
+    pub has_more: bool,
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     // Identity
@@ -135,13 +146,16 @@ pub trait Store: Send + Sync {
         company_id: Uuid,
         mutations: Vec<MutationRecord>,
     ) -> Result<Vec<(String, i64)>, StoreError>;
-    /// Mutations with version > `after`, ordered by version ascending, with
-    /// `sync_version` set on each returned record.
+    /// One page of mutations with version > `after`, ordered by version
+    /// ascending, with `sync_version` set on each returned record. At most
+    /// `limit` records are returned (`limit` must be positive); `has_more`
+    /// reports exactly whether further mutations exist past the page.
     async fn pull_mutations(
         &self,
         company_id: Uuid,
         after: i64,
-    ) -> Result<Vec<MutationRecord>, StoreError>;
+        limit: i64,
+    ) -> Result<MutationPage, StoreError>;
     /// Marks the given mutation ids acknowledged; returns how many matched.
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError>;
 

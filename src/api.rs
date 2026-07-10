@@ -33,6 +33,18 @@ const MAX_AUDIT_LIMIT: i64 = 500;
 /// Absolute lifetime of newly issued user tokens, overridable via the
 /// `ATLAS_USER_TOKEN_TTL_DAYS` environment variable.
 const DEFAULT_USER_TOKEN_TTL_DAYS: i64 = 30;
+/// Maximum (and default) sync-pull page size, overridable via the
+/// `ATLAS_SYNC_PULL_PAGE_SIZE` environment variable.
+const DEFAULT_SYNC_PULL_PAGE_SIZE: i64 = 200;
+
+/// The server-side cap on how many mutations one `/sync/pull` returns.
+fn sync_pull_max_page_size() -> i64 {
+    std::env::var("ATLAS_SYNC_PULL_PAGE_SIZE")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(DEFAULT_SYNC_PULL_PAGE_SIZE)
+}
 
 /// When a user token issued right now expires.
 fn user_token_expires_at() -> chrono::DateTime<Utc> {
@@ -619,10 +631,15 @@ async fn sync_push(
 #[derive(Deserialize)]
 struct PullQuery {
     after: Option<i64>,
+    limit: Option<i64>,
 }
 
-/// Incremental pull: all mutations with sync version > `after` (default 0),
-/// ordered by version, `syncVersion` set on each record.
+/// Incremental pull, paginated: one page of mutations with sync version >
+/// `after` (default 0), ordered by version ascending, `syncVersion` set on
+/// each record. The page size is min(`limit`, server max) — `limit` absent or
+/// ≤ 0 means the server max (default 200, env `ATLAS_SYNC_PULL_PAGE_SIZE`).
+/// `hasMore` reports exactly whether mutations remain past the page; clients
+/// loop with `after` = the last returned `syncVersion` until it is `false`.
 async fn sync_pull(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -631,11 +648,18 @@ async fn sync_pull(
 ) -> Result<Json<Value>, ApiError> {
     require_membership(&state, &auth, company_id).await?;
     auth.require_device()?;
-    let mutations = state
+    let max = sync_pull_max_page_size();
+    let limit = match query.limit {
+        Some(limit) if limit > 0 => limit.min(max),
+        _ => max,
+    };
+    let page = state
         .store
-        .pull_mutations(company_id, query.after.unwrap_or(0))
+        .pull_mutations(company_id, query.after.unwrap_or(0), limit)
         .await?;
-    Ok(Json(json!({ "mutations": mutations })))
+    Ok(Json(
+        json!({ "mutations": page.mutations, "hasMore": page.has_more }),
+    ))
 }
 
 #[derive(Deserialize)]

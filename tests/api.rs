@@ -433,6 +433,179 @@ async fn sync_requires_a_device_token() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// Pushes `count` mutations (ids `m-1..m-count`) in one batch.
+async fn push_numbered_mutations(
+    app: &App,
+    boot: &Boot,
+    device_id: &str,
+    token: &str,
+    count: usize,
+) {
+    let mutations: Vec<Value> = (1..=count)
+        .map(|n| {
+            mutation(
+                &format!("m-{n}"),
+                &format!("CUST-{n:03}"),
+                device_id,
+                &boot.owner_user_id,
+            )
+        })
+        .collect();
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/sync/push", boot.company_id),
+            Some(token),
+            json!({ "mutations": mutations }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "push failed: {body}");
+}
+
+/// One pull page as (ids, syncVersions, hasMore).
+async fn pull_page(
+    app: &App,
+    boot: &Boot,
+    token: &str,
+    after: i64,
+    limit: Option<i64>,
+) -> (Vec<String>, Vec<i64>, bool) {
+    let mut uri = format!("/companies/{}/sync/pull?after={after}", boot.company_id);
+    if let Some(limit) = limit {
+        uri.push_str(&format!("&limit={limit}"));
+    }
+    let (status, body) = app.get(&uri, Some(token)).await;
+    assert_eq!(status, StatusCode::OK, "pull failed: {body}");
+    let mutations = body["mutations"].as_array().unwrap();
+    let ids = mutations
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    let versions = mutations
+        .iter()
+        .map(|m| m["syncVersion"].as_str().unwrap().parse::<i64>().unwrap())
+        .collect();
+    (ids, versions, body["hasMore"].as_bool().unwrap())
+}
+
+#[tokio::test]
+async fn pull_pages_honor_client_limit_and_walk_the_whole_log() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (device_a, token_a) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
+    push_numbered_mutations(&app, &boot, &device_a, &token_a, 5).await;
+
+    // Page 1: exactly the page size, hasMore true.
+    let (ids, versions, has_more) = pull_page(&app, &boot, &token_a, 0, Some(2)).await;
+    assert_eq!(ids, vec!["m-1", "m-2"]);
+    assert_eq!(versions, vec![1, 2]);
+    assert!(has_more);
+
+    // Walk the whole log with after = last returned version; versions stay
+    // strictly ascending across pages, no record skipped or duplicated.
+    let mut after = 0;
+    let mut all_ids = Vec::new();
+    let mut all_versions = Vec::new();
+    let mut pages = 0;
+    loop {
+        let (ids, versions, has_more) = pull_page(&app, &boot, &token_a, after, Some(2)).await;
+        assert!(ids.len() <= 2);
+        all_ids.extend(ids);
+        all_versions.extend(versions);
+        pages += 1;
+        if !has_more {
+            break;
+        }
+        after = *all_versions.last().unwrap();
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(all_ids, vec!["m-1", "m-2", "m-3", "m-4", "m-5"]);
+    assert_eq!(all_versions, vec![1, 2, 3, 4, 5]);
+    // The final page reported hasMore=false and was short.
+    assert_eq!(all_ids.len() % 2, 1);
+}
+
+#[tokio::test]
+async fn pull_limit_absent_zero_or_oversized_uses_the_server_max() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (device_a, token_a) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
+    // 5 past the default server max of 200.
+    push_numbered_mutations(&app, &boot, &device_a, &token_a, 205).await;
+
+    // No limit → server max, hasMore exact.
+    let (ids, versions, has_more) = pull_page(&app, &boot, &token_a, 0, None).await;
+    assert_eq!(ids.len(), 200);
+    assert_eq!(ids[0], "m-1");
+    assert_eq!(ids[199], "m-200");
+    assert_eq!(versions[199], 200);
+    assert!(has_more);
+
+    // limit=0 and a limit past the server max both clamp to the server max.
+    let (ids, _, has_more) = pull_page(&app, &boot, &token_a, 0, Some(0)).await;
+    assert_eq!(ids.len(), 200);
+    assert!(has_more);
+    let (ids, _, has_more) = pull_page(&app, &boot, &token_a, 0, Some(100_000)).await;
+    assert_eq!(ids.len(), 200);
+    assert!(has_more);
+
+    // The final page.
+    let (ids, versions, has_more) = pull_page(&app, &boot, &token_a, 200, None).await;
+    assert_eq!(ids, vec!["m-201", "m-202", "m-203", "m-204", "m-205"]);
+    assert_eq!(versions, vec![201, 202, 203, 204, 205]);
+    assert!(!has_more);
+}
+
+#[tokio::test]
+async fn pull_pages_stay_consistent_when_mutations_arrive_between_pages() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (device_a, token_a) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
+    push_numbered_mutations(&app, &boot, &device_a, &token_a, 4).await;
+
+    let (ids, versions, has_more) = pull_page(&app, &boot, &token_a, 0, Some(2)).await;
+    assert_eq!(ids, vec!["m-1", "m-2"]);
+    assert!(has_more);
+    let mut after = *versions.last().unwrap();
+
+    // New mutations land between pages: the cursor keeps the walk exact —
+    // nothing skipped, nothing duplicated, and the newcomers show up at the
+    // tail in version order.
+    let extra: Vec<Value> = (5..=6)
+        .map(|n| {
+            mutation(
+                &format!("m-{n}"),
+                &format!("CUST-{n:03}"),
+                &device_a,
+                &boot.owner_user_id,
+            )
+        })
+        .collect();
+    let (status, _) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/sync/push", boot.company_id),
+            Some(&token_a),
+            json!({ "mutations": extra }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut all_ids = ids;
+    loop {
+        let (ids, versions, has_more) = pull_page(&app, &boot, &token_a, after, Some(2)).await;
+        all_ids.extend(ids);
+        if !has_more {
+            break;
+        }
+        after = *versions.last().unwrap();
+    }
+    assert_eq!(all_ids, vec!["m-1", "m-2", "m-3", "m-4", "m-5", "m-6"]);
+}
+
 #[tokio::test]
 async fn blob_put_get_head_roundtrip_and_hash_check() {
     let app = App::new();

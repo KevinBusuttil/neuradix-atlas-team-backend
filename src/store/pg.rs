@@ -18,7 +18,7 @@ use crate::posting::model::{
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
 
-use super::{Store, StoreError};
+use super::{MutationPage, Store, StoreError};
 
 pub struct PgStore {
     pool: PgPool,
@@ -691,13 +691,16 @@ impl Store for PgStore {
         &self,
         company_id: Uuid,
         after: i64,
-    ) -> Result<Vec<MutationRecord>, StoreError> {
+        limit: i64,
+    ) -> Result<MutationPage, StoreError> {
+        // Fetch one row past the page: its presence is the exact `has_more`.
         let rows = sqlx::query(
             "select sync_version, record from mutations \
-             where company_id = $1 and sync_version > $2 order by sync_version",
+             where company_id = $1 and sync_version > $2 order by sync_version limit $3",
         )
         .bind(company_id)
         .bind(after)
+        .bind(limit.saturating_add(1))
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -708,7 +711,13 @@ impl Store for PgStore {
             record.sync_version = Some(version.to_string());
             out.push(record);
         }
-        Ok(out)
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let has_more = out.len() > limit;
+        out.truncate(limit);
+        Ok(MutationPage {
+            mutations: out,
+            has_more,
+        })
     }
 
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError> {
