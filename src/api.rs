@@ -4,7 +4,7 @@
 //! row (roadmap §6 criterion 8).
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
@@ -44,6 +44,23 @@ fn sync_pull_max_page_size() -> i64 {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|size| *size > 0)
         .unwrap_or(DEFAULT_SYNC_PULL_PAGE_SIZE)
+}
+
+/// Request-body cap for every route except blob upload: JSON APIs and
+/// webhook intake have no business receiving multi-megabyte bodies.
+const JSON_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum accepted blob size in MiB, overridable via the
+/// `ATLAS_MAX_BLOB_MB` environment variable (read once at router build).
+const DEFAULT_MAX_BLOB_MB: usize = 25;
+
+/// The blob route's body limit in bytes, derived from `ATLAS_MAX_BLOB_MB`.
+fn max_blob_bytes() -> usize {
+    let mb = std::env::var("ATLAS_MAX_BLOB_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(DEFAULT_MAX_BLOB_MB);
+    mb * 1024 * 1024
 }
 
 /// When a user token issued right now expires.
@@ -87,7 +104,13 @@ pub fn router(state: AppState) -> Router {
         .route("/companies/{company_id}/sync/ack", post(sync_ack))
         .route(
             "/companies/{company_id}/blobs/{sha256}",
-            put(put_blob).get(get_blob).head(head_blob),
+            put(put_blob)
+                .get(get_blob)
+                .head(head_blob)
+                // Per-route body limit: blob uploads are the one place large
+                // bodies are legitimate. Innermost layer wins, overriding the
+                // router-wide JSON cap below.
+                .layer(DefaultBodyLimit::max(max_blob_bytes())),
         )
         .route("/webhooks/payments/{provider}", post(webhook_payment))
         .route("/webhooks/channels/{connector}", post(webhook_channel))
@@ -109,6 +132,11 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::portal::routes())
         // Pay-link management + the token-scoped pay plane.
         .merge(crate::pay::routes())
+        // Explicit request-body cap on every route registered above (blob
+        // upload carries its own higher per-route limit). An oversized body
+        // is rejected by the extractor with a plain 413, before any handler
+        // (and thus any `ApiError` mapping) runs.
+        .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 
@@ -579,6 +607,11 @@ struct PushRequest {
 /// Device pushes a batch of `MutationRecord`s. The server assigns
 /// monotonically increasing per-company sync versions; the call is idempotent
 /// on mutation id (roadmap §6 criterion 4).
+///
+/// The request body is subject to the router-wide 2 MiB JSON cap
+/// ([`JSON_BODY_LIMIT_BYTES`]) — a batch of many mutations with large
+/// payloads can exceed it and gets a 413. That is by design: the client
+/// pushes in batches, so an oversized batch is split, not accepted.
 async fn sync_push(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -691,6 +724,13 @@ async fn sync_ack(
 // Blobs (content-addressed attachment bytes, ADR-048 contract)
 // ---------------------------------------------------------------------------
 
+/// Upload attachment bytes, addressed by their SHA-256.
+///
+/// Size policy: the blob route's `DefaultBodyLimit` is `ATLAS_MAX_BLOB_MB`
+/// MiB (default 25, read once at router build). A body over the limit is
+/// rejected by the `Bytes` extractor with a plain 413 before this handler
+/// runs — never a 500; a body exactly at the limit is accepted. Every other
+/// route stays under the router-wide 2 MiB cap.
 async fn put_blob(
     State(state): State<AppState>,
     auth: AuthContext,

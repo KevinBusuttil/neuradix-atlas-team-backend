@@ -662,6 +662,71 @@ async fn blob_put_get_head_roundtrip_and_hash_check() {
 }
 
 #[tokio::test]
+async fn blob_at_the_size_limit_is_accepted_and_over_it_is_413() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let limit = 25 * 1024 * 1024; // default ATLAS_MAX_BLOB_MB
+
+    // Exactly at the limit → stored fine.
+    let at_limit = vec![0xA5u8; limit];
+    let sha = hex::encode(Sha256::digest(&at_limit));
+    let (status, _) = app
+        .send(
+            Method::PUT,
+            &format!("/companies/{}/blobs/{sha}", boot.company_id),
+            Some(&boot.owner_token),
+            Some(Body::from(at_limit)),
+            Some("application/octet-stream"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // One byte over → a clean 413 from the body limit, never a 500, and
+    // nothing stored.
+    let over = vec![0x5Au8; limit + 1];
+    let sha = hex::encode(Sha256::digest(&over));
+    let uri = format!("/companies/{}/blobs/{sha}", boot.company_id);
+    let (status, _) = app
+        .send(
+            Method::PUT,
+            &uri,
+            Some(&boot.owner_token),
+            Some(Body::from(over)),
+            Some("application/octet-stream"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, _) = app
+        .send(Method::HEAD, &uri, Some(&boot.owner_token), None, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn json_routes_reject_bodies_over_two_megabytes_with_413() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (device_a, token_a) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
+
+    // One push mutation whose payload alone crosses the 2 MiB JSON cap.
+    // (The rejection body is plain text, so bypass the JSON helper.)
+    let mut record = mutation("m-big", "CUST-BIG", &device_a, &boot.owner_user_id);
+    record["payload"]["note"] = json!("x".repeat(2 * 1024 * 1024));
+    let body = json!({ "mutations": [record] }).to_string();
+    let (status, _) = app
+        .send(
+            Method::POST,
+            &format!("/companies/{}/sync/push", boot.company_id),
+            Some(&token_a),
+            Some(Body::from(body)),
+            Some("application/json"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn webhooks_are_logged_without_auth() {
     // The generic intake routes stay log-only; `/webhooks/payments/stripe`
     // is now the signature-verified processing endpoint (tests/payments.rs).
