@@ -647,6 +647,65 @@ async fn payment_over_allocation_and_bad_references_are_rejected() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Cancel-with-settlements guard
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cancelling_a_settled_invoice_conflicts_until_the_payment_is_cancelled() {
+    let mut app = app_with_invoice("SINV-C1").await;
+    let (status, body) = app
+        .submit_as(
+            "accountant",
+            payment("PAY-C1", 60.0, json!([reference("SINV-C1", 60.0)])),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "payment failed: {body}");
+
+    // The invoice has a live settlement: cancelling it is a 409 pointing at
+    // the payment.
+    let (status, response) = app
+        .cancel_as(
+            "owner",
+            json!({ "doctype": "Sales Invoice", "document_id": "SINV-C1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap()
+            .contains("cancel the payment"),
+        "{response}"
+    );
+    // Nothing reversed; the invoice is still submitted and partially settled.
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-C1").unwrap(),
+        40.0
+    ));
+
+    // Cancel the payment first (restores outstanding), then the invoice.
+    let (status, body) = app
+        .cancel_as(
+            "accountant",
+            json!({ "doctype": "Payment Entry", "document_id": "PAY-C1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "payment cancel failed: {body}");
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-C1").unwrap(),
+        100.0
+    ));
+    let (status, body) = app
+        .cancel_as(
+            "owner",
+            json!({ "doctype": "Sales Invoice", "document_id": "SINV-C1" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "invoice cancel failed: {body}");
+    assert_eq!(body["docstatus"], json!(2));
+}
+
 #[tokio::test]
 async fn absent_posting_date_defaults_to_today_and_boundary_years_post() {
     let mut app = app_with_service_item().await;

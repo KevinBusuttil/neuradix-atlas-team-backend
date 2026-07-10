@@ -180,6 +180,22 @@
       }
     },
     {
+      "comment": "The settled USD sale cannot be cancelled while its settlement is live: 409 pointing at the payment",
+      "cancel": { "doctype": "Sales Invoice", "document_id": "SINV-FX1" },
+      "expect_status": 409,
+      "error_contains": "cancel the payment"
+    },
+    {
+      "comment": "Cancel the USD payment first: the reversal restores the invoice's outstanding",
+      "as_role": "accountant",
+      "cancel": { "doctype": "Payment Entry", "document_id": "PAY-FX1" },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "outstanding": { "Sales Invoice/SINV-FX1": 100 }
+      }
+    },
+    {
       "comment": "Cancel the USD sale: the reversal swaps the base columns with the transaction columns and negates the CT base",
       "cancel": { "doctype": "Sales Invoice", "document_id": "SINV-FX1" },
       "expect_status": 200,

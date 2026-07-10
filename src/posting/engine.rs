@@ -429,6 +429,24 @@ async fn build_cancel(
             cmd.doctype, cmd.document_id, document.docstatus
         )));
     }
+    // An invoice with live (non-reversed) settlements cannot be cancelled:
+    // its payments must be cancelled first, which restores the outstanding
+    // and nets the settlement rows to zero.
+    if SETTLEABLE_DOCTYPES.contains(&cmd.doctype.as_str()) {
+        let settled: f64 = store
+            .settlements_for_invoice(company_id, &cmd.doctype, &cmd.document_id)
+            .await?
+            .iter()
+            .map(|s| s.allocated_amount)
+            .sum();
+        if settled.abs() > MONEY_EPS {
+            return Err(PostingError::Conflict(format!(
+                "invoice {} {} has payments settled against it ({settled}); \
+                 cancel the payment entries first",
+                cmd.doctype, cmd.document_id
+            )));
+        }
+    }
     // The stored date was validated on submit; re-validating on cancel keeps
     // the period-lock comparison fail-closed for documents that predate the
     // validation.
