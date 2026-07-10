@@ -96,6 +96,10 @@ pub struct Device {
     pub token_hash: String,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Stamped on successful device-token authentication (throttled — see
+    /// `Store::touch_device_seen`), so owners/admins can spot stale or
+    /// stolen credentials in the device list.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 /// What a bearer token resolves to. `device_id` is `Some` for device tokens

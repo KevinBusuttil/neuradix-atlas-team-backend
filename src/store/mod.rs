@@ -75,6 +75,29 @@ pub trait Store: Send + Sync {
 
     // Devices
     async fn create_device(&self, device: Device) -> Result<(), StoreError>;
+    /// All devices of a company (including revoked ones), oldest first.
+    async fn devices(&self, company_id: Uuid) -> Result<Vec<Device>, StoreError>;
+    /// One device, scoped to the company — `None` when the id exists but
+    /// belongs to another company (callers surface that as 404, never 403).
+    async fn device(&self, company_id: Uuid, device_id: Uuid)
+        -> Result<Option<Device>, StoreError>;
+    /// Marks a device revoked; idempotent (an already-revoked device keeps
+    /// its original `revoked_at`). Returns the post-update device, or `None`
+    /// when the device is not in the company.
+    async fn revoke_device(
+        &self,
+        company_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<Device>, StoreError>;
+    /// Stamps `last_seen_at = seen_at`, but only when the current value is
+    /// null or older than `stale_before` — the write throttle that keeps
+    /// sync polling from hammering the devices table.
+    async fn touch_device_seen(
+        &self,
+        device_id: Uuid,
+        seen_at: chrono::DateTime<chrono::Utc>,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError>;
 
     // Mutation log (per-company, server-assigned monotonic sync versions)
     /// Assigns the next sync versions; idempotent on mutation id — a re-pushed

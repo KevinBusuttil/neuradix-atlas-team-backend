@@ -40,7 +40,14 @@ pub fn router(state: AppState) -> Router {
             post(create_invitation),
         )
         .route("/invitations/{token}/accept", post(accept_invitation))
-        .route("/companies/{company_id}/devices", post(register_device))
+        .route(
+            "/companies/{company_id}/devices",
+            post(register_device).get(list_devices),
+        )
+        .route(
+            "/companies/{company_id}/devices/{device_id}/revoke",
+            post(revoke_device),
+        )
         .route("/companies/{company_id}/sync/push", post(sync_push))
         .route("/companies/{company_id}/sync/pull", get(sync_pull))
         .route("/companies/{company_id}/sync/ack", post(sync_ack))
@@ -298,6 +305,7 @@ async fn register_device(
         token_hash: hash_token(&device_token),
         created_at: Utc::now(),
         revoked_at: None,
+        last_seen_at: None,
     };
     state.store.create_device(device.clone()).await?;
     state
@@ -315,6 +323,71 @@ async fn register_device(
     Ok((
         StatusCode::CREATED,
         Json(json!({ "deviceId": device.id, "deviceToken": device_token })),
+    ))
+}
+
+/// Device inventory: any member sees their own devices; owner/admin see the
+/// whole company's (including revoked ones — the point is credential
+/// visibility).
+async fn list_devices(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    let sees_all = matches!(role, Role::Owner | Role::Admin);
+    let devices: Vec<Value> = state
+        .store
+        .devices(company_id)
+        .await?
+        .into_iter()
+        .filter(|device| sees_all || device.user_id == auth.user_id())
+        .map(|device| {
+            json!({
+                "id": device.id,
+                "userId": device.user_id,
+                "name": device.name,
+                "createdAt": device.created_at,
+                "revokedAt": device.revoked_at,
+                "lastSeenAt": device.last_seen_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "devices": devices })))
+}
+
+/// Revoke a device token. A member may revoke their own device; owner/admin
+/// may revoke anyone's. Idempotent — an already-revoked device keeps its
+/// original `revokedAt` and still answers 200.
+async fn revoke_device(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((company_id, device_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    let device = state
+        .store
+        .device(company_id, device_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if device.user_id != auth.user_id() {
+        require_role(role, &[Role::Owner, Role::Admin])?;
+    }
+    let device = state
+        .store
+        .revoke_device(company_id, device_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "device.revoke",
+        json!({ "deviceId": device.id, "deviceUserId": device.user_id }),
+    )
+    .await?;
+    Ok(Json(
+        json!({ "id": device.id, "revokedAt": device.revoked_at }),
     ))
 }
 

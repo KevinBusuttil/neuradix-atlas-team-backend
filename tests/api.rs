@@ -88,14 +88,18 @@ struct Boot {
 }
 
 async fn bootstrap(app: &App) -> Boot {
+    bootstrap_named(app, "Busuttil Trading Ltd", "owner@example.com").await
+}
+
+async fn bootstrap_named(app: &App, name: &str, owner_email: &str) -> Boot {
     let (status, body) = app
         .json(
             Method::POST,
             "/companies",
             None,
             json!({
-                "name": "Busuttil Trading Ltd",
-                "owner_email": "owner@example.com",
+                "name": name,
+                "owner_email": owner_email,
                 "owner_name": "Olivia Owner"
             }),
         )
@@ -690,4 +694,175 @@ async fn every_mutating_action_writes_an_audit_row() {
         .find(|e| e["action"] == json!("sync.push"))
         .unwrap();
     assert_eq!(push_row["deviceId"].as_str().unwrap(), device_id);
+}
+
+// ---------------------------------------------------------------------------
+// Credential lifecycle (increment 0.5): device management
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn device_list_scopes_to_own_devices_unless_owner_or_admin() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (sales_user_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
+    let (owner_device, _) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Front desk").await;
+    let (sales_device, _) =
+        register_device(&app, &boot.company_id, &sales_token, "Sam's phone").await;
+
+    let uri = format!("/companies/{}/devices", boot.company_id);
+
+    // A plain member sees only their own devices.
+    let (status, body) = app.get(&uri, Some(&sales_token)).await;
+    assert_eq!(status, StatusCode::OK, "sales device list failed: {body}");
+    let devices = body["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["id"].as_str().unwrap(), sales_device);
+    assert_eq!(devices[0]["userId"].as_str().unwrap(), sales_user_id);
+    assert!(devices[0]["name"].is_string());
+    assert!(devices[0]["createdAt"].is_string());
+    assert!(devices[0]["revokedAt"].is_null());
+
+    // Owner sees every device in the company.
+    let (status, body) = app.get(&uri, Some(&boot.owner_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let devices = body["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    let ids: Vec<&str> = devices.iter().map(|d| d["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&owner_device.as_str()));
+    assert!(ids.contains(&sales_device.as_str()));
+}
+
+#[tokio::test]
+async fn device_auth_stamps_last_seen_at() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (device_id, device_token) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Front desk").await;
+
+    // Fresh device: never seen.
+    let uri = format!("/companies/{}/devices", boot.company_id);
+    let (_, body) = app.get(&uri, Some(&boot.owner_token)).await;
+    let device = &body["devices"].as_array().unwrap()[0];
+    assert!(device["lastSeenAt"].is_null());
+
+    // Any authenticated device request stamps last_seen_at.
+    let (status, _) = app
+        .get(
+            &format!("/companies/{}/sync/pull?after=0", boot.company_id),
+            Some(&device_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = app.get(&uri, Some(&boot.owner_token)).await;
+    let device = body["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"].as_str().unwrap() == device_id)
+        .unwrap()
+        .clone();
+    assert!(device["lastSeenAt"].is_string(), "no lastSeenAt: {device}");
+}
+
+#[tokio::test]
+async fn revoked_device_token_is_rejected_on_push_and_pull() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (device_id, device_token) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Front desk").await;
+
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/devices/{device_id}/revoke", boot.company_id),
+            Some(&boot.owner_token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "revoke failed: {body}");
+    assert_eq!(body["id"].as_str().unwrap(), device_id);
+    let revoked_at = body["revokedAt"].as_str().unwrap().to_string();
+
+    // The dead token no longer authenticates sync push...
+    let (status, _) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/sync/push", boot.company_id),
+            Some(&device_token),
+            json!({ "mutations": [
+                mutation("m-1", "CUST-001", &device_id, &boot.owner_user_id),
+            ]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // ...nor sync pull.
+    let (status, _) = app
+        .get(
+            &format!("/companies/{}/sync/pull?after=0", boot.company_id),
+            Some(&device_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Revoking again is idempotent: 200, same original revokedAt.
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/devices/{device_id}/revoke", boot.company_id),
+            Some(&boot.owner_token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["revokedAt"].as_str().unwrap(), revoked_at);
+}
+
+#[tokio::test]
+async fn device_revocation_permission_matrix() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (_, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
+    let (_, admin_token) = join_member(&app, &boot, "admin@example.com", "admin").await;
+    let (owner_device, _) =
+        register_device(&app, &boot.company_id, &boot.owner_token, "Front desk").await;
+    let (sales_device_a, _) =
+        register_device(&app, &boot.company_id, &sales_token, "Sam's phone").await;
+    let (sales_device_b, _) =
+        register_device(&app, &boot.company_id, &sales_token, "Sam's tablet").await;
+
+    let revoke = |device: String, token: String| {
+        let app = &app;
+        let company_id = boot.company_id.clone();
+        async move {
+            app.json(
+                Method::POST,
+                &format!("/companies/{company_id}/devices/{device}/revoke"),
+                Some(&token),
+                json!({}),
+            )
+            .await
+        }
+    };
+
+    // A plain member cannot revoke someone else's device.
+    let (status, _) = revoke(owner_device.clone(), sales_token.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A plain member may revoke their own device.
+    let (status, _) = revoke(sales_device_a.clone(), sales_token.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Admin may revoke anyone's device.
+    let (status, _) = revoke(sales_device_b.clone(), admin_token.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A device that is not in this company is a 404, even for the owner.
+    let rival = bootstrap_named(&app, "Rival Co", "rival@example.com").await;
+    let (rival_device, _) =
+        register_device(&app, &rival.company_id, &rival.owner_token, "Elsewhere").await;
+    let (status, _) = revoke(rival_device, boot.owner_token.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

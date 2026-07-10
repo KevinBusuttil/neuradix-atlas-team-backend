@@ -365,6 +365,63 @@ impl Store for MemStore {
         Ok(())
     }
 
+    async fn devices(&self, company_id: Uuid) -> Result<Vec<Device>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut devices: Vec<Device> = inner
+            .devices
+            .values()
+            .filter(|device| device.company_id == company_id)
+            .cloned()
+            .collect();
+        devices.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(devices)
+    }
+
+    async fn device(
+        &self,
+        company_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<Device>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .devices
+            .get(&device_id)
+            .filter(|device| device.company_id == company_id)
+            .cloned())
+    }
+
+    async fn revoke_device(
+        &self,
+        company_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<Device>, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.devices.get_mut(&device_id) {
+            Some(device) if device.company_id == company_id => {
+                if device.revoked_at.is_none() {
+                    device.revoked_at = Some(Utc::now());
+                }
+                Ok(Some(device.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn touch_device_seen(
+        &self,
+        device_id: Uuid,
+        seen_at: chrono::DateTime<Utc>,
+        stale_before: chrono::DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(device) = inner.devices.get_mut(&device_id) {
+            if device.last_seen_at.is_none_or(|seen| seen < stale_before) {
+                device.last_seen_at = Some(seen_at);
+            }
+        }
+        Ok(())
+    }
+
     async fn push_mutations(
         &self,
         company_id: Uuid,

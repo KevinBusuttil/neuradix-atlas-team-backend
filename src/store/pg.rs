@@ -44,6 +44,22 @@ fn parse_role(raw: &str) -> Result<Role, StoreError> {
     Role::parse(raw).ok_or_else(|| StoreError::Internal(format!("unknown role in db: {raw}")))
 }
 
+fn device_from_row(row: &PgRow) -> Result<Device, StoreError> {
+    Ok(Device {
+        id: row.try_get("id")?,
+        company_id: row.try_get("company_id")?,
+        user_id: row.try_get("user_id")?,
+        name: row.try_get("name")?,
+        token_hash: row.try_get("token_hash")?,
+        created_at: row.try_get("created_at")?,
+        revoked_at: row.try_get("revoked_at")?,
+        last_seen_at: row.try_get("last_seen_at")?,
+    })
+}
+
+const DEVICE_COLUMNS: &str =
+    "id, company_id, user_id, name, token_hash, created_at, revoked_at, last_seen_at";
+
 fn gl_from_row(row: &PgRow) -> Result<GlEntry, StoreError> {
     Ok(GlEntry {
         id: row.try_get("id")?,
@@ -506,8 +522,8 @@ impl Store for PgStore {
     async fn create_device(&self, device: Device) -> Result<(), StoreError> {
         sqlx::query(
             "insert into devices \
-             (id, company_id, user_id, name, token_hash, created_at, revoked_at) \
-             values ($1, $2, $3, $4, $5, $6, $7)",
+             (id, company_id, user_id, name, token_hash, created_at, revoked_at, last_seen_at) \
+             values ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(device.id)
         .bind(device.company_id)
@@ -516,6 +532,67 @@ impl Store for PgStore {
         .bind(&device.token_hash)
         .bind(device.created_at)
         .bind(device.revoked_at)
+        .bind(device.last_seen_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn devices(&self, company_id: Uuid) -> Result<Vec<Device>, StoreError> {
+        let rows = sqlx::query(&format!(
+            "select {DEVICE_COLUMNS} from devices where company_id = $1 \
+             order by created_at, id",
+        ))
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(device_from_row).collect()
+    }
+
+    async fn device(
+        &self,
+        company_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<Device>, StoreError> {
+        let row = sqlx::query(&format!(
+            "select {DEVICE_COLUMNS} from devices where id = $1 and company_id = $2",
+        ))
+        .bind(device_id)
+        .bind(company_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(device_from_row).transpose()
+    }
+
+    async fn revoke_device(
+        &self,
+        company_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<Option<Device>, StoreError> {
+        let row = sqlx::query(&format!(
+            "update devices set revoked_at = coalesce(revoked_at, now()) \
+             where id = $1 and company_id = $2 returning {DEVICE_COLUMNS}",
+        ))
+        .bind(device_id)
+        .bind(company_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(device_from_row).transpose()
+    }
+
+    async fn touch_device_seen(
+        &self,
+        device_id: Uuid,
+        seen_at: chrono::DateTime<chrono::Utc>,
+        stale_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "update devices set last_seen_at = $2 \
+             where id = $1 and (last_seen_at is null or last_seen_at < $3)",
+        )
+        .bind(device_id)
+        .bind(seen_at)
+        .bind(stale_before)
         .execute(&self.pool)
         .await?;
         Ok(())

@@ -9,6 +9,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use chrono::{Duration, Utc};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -16,6 +17,11 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::model::{Role, TokenIdentity};
 use crate::AppState;
+
+/// `last_seen_at` write throttle: a device's last-seen stamp is refreshed on
+/// successful authentication at most once per this window, so sync polling
+/// does not turn every request into a devices-table write.
+const DEVICE_SEEN_THROTTLE_MINUTES: i64 = 5;
 
 /// Generate a fresh opaque token (64 hex chars, 256 bits of randomness).
 pub fn generate_token() -> String {
@@ -68,6 +74,17 @@ impl FromRequestParts<AppState> for AuthContext {
             .resolve_token(&hash_token(token))
             .await?
             .ok_or(ApiError::Unauthorized)?;
+        if let Some(device_id) = identity.device_id {
+            let now = Utc::now();
+            state
+                .store
+                .touch_device_seen(
+                    device_id,
+                    now,
+                    now - Duration::minutes(DEVICE_SEEN_THROTTLE_MINUTES),
+                )
+                .await?;
+        }
         Ok(AuthContext(identity))
     }
 }
