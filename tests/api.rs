@@ -866,3 +866,262 @@ async fn device_revocation_permission_matrix() {
     let (status, _) = revoke(rival_device, boot.owner_token.clone()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// Credential lifecycle (increment 0.5): member management
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn member_list_is_visible_to_every_member() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (sales_user_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
+
+    let uri = format!("/companies/{}/members", boot.company_id);
+    let (status, body) = app.get(&uri, Some(&sales_token)).await;
+    assert_eq!(status, StatusCode::OK, "member list failed: {body}");
+    let members = body["members"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    let owner = members
+        .iter()
+        .find(|m| m["userId"].as_str().unwrap() == boot.owner_user_id)
+        .unwrap();
+    assert_eq!(owner["email"].as_str().unwrap(), "owner@example.com");
+    assert_eq!(owner["role"].as_str().unwrap(), "owner");
+    assert!(owner["displayName"].is_string());
+    assert!(owner["createdAt"].is_string());
+    let sales = members
+        .iter()
+        .find(|m| m["userId"].as_str().unwrap() == sales_user_id)
+        .unwrap();
+    assert_eq!(sales["role"].as_str().unwrap(), "sales");
+}
+
+#[tokio::test]
+async fn member_removal_permission_matrix() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (admin_a_id, admin_a_token) =
+        join_member(&app, &boot, "admin.a@example.com", "admin").await;
+    let (admin_b_id, _) = join_member(&app, &boot, "admin.b@example.com", "admin").await;
+    let (sales_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
+
+    let remove = |user: String, token: String| {
+        let app = &app;
+        let company_id = boot.company_id.clone();
+        async move {
+            app.json(
+                Method::DELETE,
+                &format!("/companies/{company_id}/members/{user}"),
+                Some(&token),
+                json!({}),
+            )
+            .await
+        }
+    };
+
+    // A plain member cannot remove anyone.
+    let (status, _) = remove(admin_a_id.clone(), sales_token.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Admins cannot remove owners or other admins.
+    let (status, _) = remove(boot.owner_user_id.clone(), admin_a_token.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = remove(admin_b_id.clone(), admin_a_token.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An admin may remove a plain member.
+    let (status, body) = remove(sales_id.clone(), admin_a_token.clone()).await;
+    assert_eq!(status, StatusCode::OK, "admin removal failed: {body}");
+    assert_eq!(body["removed"], json!(true));
+
+    // Owner may remove an admin.
+    let (status, _) = remove(admin_b_id.clone(), boot.owner_token.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Removing someone who is not a member is a 404.
+    let (status, _) = remove(sales_id, boot.owner_token.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn last_owner_cannot_be_removed_or_demoted() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+
+    // The sole owner cannot self-remove.
+    let (status, body) = app
+        .json(
+            Method::DELETE,
+            &format!(
+                "/companies/{}/members/{}",
+                boot.company_id, boot.owner_user_id
+            ),
+            Some(&boot.owner_token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "expected 409: {body}");
+
+    // ...nor demote themself.
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!(
+                "/companies/{}/members/{}/role",
+                boot.company_id, boot.owner_user_id
+            ),
+            Some(&boot.owner_token),
+            json!({ "role": "admin" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "expected 409: {body}");
+
+    // With a second owner promoted, self-removal works.
+    let (second_id, _) = join_member(&app, &boot, "second@example.com", "admin").await;
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/members/{second_id}/role", boot.company_id),
+            Some(&boot.owner_token),
+            json!({ "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "promotion failed: {body}");
+    assert_eq!(body["role"].as_str().unwrap(), "owner");
+
+    let (status, _) = app
+        .json(
+            Method::DELETE,
+            &format!(
+                "/companies/{}/members/{}",
+                boot.company_id, boot.owner_user_id
+            ),
+            Some(&boot.owner_token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn owners_cannot_be_removed_by_anyone_else() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (second_id, _) = join_member(&app, &boot, "second@example.com", "admin").await;
+    // Promote to a second owner.
+    let (status, _) = app
+        .json(
+            Method::POST,
+            &format!("/companies/{}/members/{second_id}/role", boot.company_id),
+            Some(&boot.owner_token),
+            json!({ "role": "owner" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Even an owner cannot remove another owner — owners only leave by
+    // their own hand.
+    let (status, _) = app
+        .json(
+            Method::DELETE,
+            &format!("/companies/{}/members/{second_id}", boot.company_id),
+            Some(&boot.owner_token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn role_change_is_owner_only_and_validates_the_role() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (_, admin_token) = join_member(&app, &boot, "admin@example.com", "admin").await;
+    let (sales_id, _) = join_member(&app, &boot, "sales@example.com", "sales").await;
+    let uri = format!("/companies/{}/members/{sales_id}/role", boot.company_id);
+
+    // Admins cannot change roles — owner only.
+    let (status, _) = app
+        .json(
+            Method::POST,
+            &uri,
+            Some(&admin_token),
+            json!({ "role": "stock" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unknown role → 400.
+    let (status, _) = app
+        .json(
+            Method::POST,
+            &uri,
+            Some(&boot.owner_token),
+            json!({ "role": "superuser" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Owner changes the role.
+    let (status, body) = app
+        .json(
+            Method::POST,
+            &uri,
+            Some(&boot.owner_token),
+            json!({ "role": "accountant" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "role change failed: {body}");
+    assert_eq!(body["userId"].as_str().unwrap(), sales_id);
+    assert_eq!(body["role"].as_str().unwrap(), "accountant");
+}
+
+#[tokio::test]
+async fn member_removal_revokes_their_devices() {
+    let app = App::new();
+    let boot = bootstrap(&app).await;
+    let (sales_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
+    let (_, sales_device_token) =
+        register_device(&app, &boot.company_id, &sales_token, "Sam's phone").await;
+
+    // The device token works before removal.
+    let (status, _) = app
+        .get(
+            &format!("/companies/{}/sync/pull?after=0", boot.company_id),
+            Some(&sales_device_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = app
+        .json(
+            Method::DELETE,
+            &format!("/companies/{}/members/{sales_id}", boot.company_id),
+            Some(&boot.owner_token),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "removal failed: {body}");
+    assert_eq!(body["revokedDevices"], json!(1));
+
+    // The removed member's device token is dead (401 — the token itself no
+    // longer resolves).
+    let (status, _) = app
+        .get(
+            &format!("/companies/{}/sync/pull?after=0", boot.company_id),
+            Some(&sales_device_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Their (account-global) user token still authenticates, but membership
+    // is gone → 403 on company routes.
+    let (status, _) = app
+        .get(
+            &format!("/companies/{}/members", boot.company_id),
+            Some(&sales_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, PayLink, PortalLink, Role,
+    AuditEntry, Company, Device, Invitation, Member, MutationRecord, PayLink, PortalLink, Role,
     TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
@@ -34,8 +34,8 @@ struct Inner {
     companies: HashMap<Uuid, Company>,
     users: HashMap<Uuid, User>,
     users_by_email: HashMap<String, Uuid>,
-    /// (user_id, company_id) -> role
-    memberships: HashMap<(Uuid, Uuid), Role>,
+    /// (user_id, company_id) -> (role, membership created_at)
+    memberships: HashMap<(Uuid, Uuid), (Role, chrono::DateTime<Utc>)>,
     /// token hash -> (user_id, company_id)
     user_tokens: HashMap<String, (Uuid, Uuid)>,
     invitations: HashMap<String, Invitation>,
@@ -279,7 +279,7 @@ impl Store for MemStore {
         inner
             .memberships
             .entry((user_id, company_id))
-            .or_insert(role);
+            .or_insert((role, Utc::now()));
         Ok(())
     }
 
@@ -289,7 +289,75 @@ impl Store for MemStore {
         company_id: Uuid,
     ) -> Result<Option<Role>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.memberships.get(&(user_id, company_id)).copied())
+        Ok(inner
+            .memberships
+            .get(&(user_id, company_id))
+            .map(|&(role, _)| role))
+    }
+
+    async fn company_members(&self, company_id: Uuid) -> Result<Vec<Member>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let mut members: Vec<Member> = inner
+            .memberships
+            .iter()
+            .filter(|((_, company), _)| *company == company_id)
+            .filter_map(|((user_id, _), &(role, created_at))| {
+                inner.users.get(user_id).map(|user| Member {
+                    user_id: *user_id,
+                    email: user.email.clone(),
+                    display_name: user.display_name.clone(),
+                    role,
+                    created_at,
+                })
+            })
+            .collect();
+        members.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.user_id.cmp(&b.user_id))
+        });
+        Ok(members)
+    }
+
+    async fn remove_membership(&self, user_id: Uuid, company_id: Uuid) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner.memberships.remove(&(user_id, company_id)).is_some())
+    }
+
+    async fn set_membership_role(
+        &self,
+        user_id: Uuid,
+        company_id: Uuid,
+        role: Role,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.memberships.get_mut(&(user_id, company_id)) {
+            Some((current, _)) => {
+                *current = role;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn revoke_user_devices(
+        &self,
+        company_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<u64, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let now = Utc::now();
+        let mut revoked = 0;
+        for device in inner.devices.values_mut() {
+            if device.company_id == company_id
+                && device.user_id == user_id
+                && device.revoked_at.is_none()
+            {
+                device.revoked_at = Some(now);
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
     }
 
     async fn insert_user_token(

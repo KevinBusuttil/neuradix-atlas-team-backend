@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
@@ -47,6 +47,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/companies/{company_id}/devices/{device_id}/revoke",
             post(revoke_device),
+        )
+        .route("/companies/{company_id}/members", get(list_members))
+        .route(
+            "/companies/{company_id}/members/{user_id}",
+            delete(remove_member),
+        )
+        .route(
+            "/companies/{company_id}/members/{user_id}/role",
+            post(change_member_role),
         )
         .route("/companies/{company_id}/sync/push", post(sync_push))
         .route("/companies/{company_id}/sync/pull", get(sync_pull))
@@ -389,6 +398,134 @@ async fn revoke_device(
     Ok(Json(
         json!({ "id": device.id, "revokedAt": device.revoked_at }),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Members
+// ---------------------------------------------------------------------------
+
+/// Member directory: visible to every member of the company.
+async fn list_members(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    let members = state.store.company_members(company_id).await?;
+    Ok(Json(json!({ "members": members })))
+}
+
+/// How many owners the company has — the guard behind the last-owner rules.
+async fn owner_count(state: &AppState, company_id: Uuid) -> Result<usize, ApiError> {
+    Ok(state
+        .store
+        .company_members(company_id)
+        .await?
+        .iter()
+        .filter(|member| member.role == Role::Owner)
+        .count())
+}
+
+/// Remove a member (owner/admin). An owner may only be removed by themself,
+/// and never when they are the last owner (409 — a company must always keep
+/// one). Admins cannot remove owners or other admins. Removal also revokes
+/// the member's devices in this company — device tokens carry company access;
+/// account-global user tokens are left alone.
+async fn remove_member(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner, Role::Admin])?;
+    let target_role = state
+        .store
+        .membership_role(user_id, company_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    match target_role {
+        Role::Owner => {
+            if user_id != auth.user_id() {
+                return Err(ApiError::Forbidden);
+            }
+            if owner_count(&state, company_id).await? <= 1 {
+                return Err(ApiError::Conflict(
+                    "cannot remove the last owner of the company".into(),
+                ));
+            }
+        }
+        Role::Admin => {
+            if role == Role::Admin && user_id != auth.user_id() {
+                return Err(ApiError::Forbidden);
+            }
+        }
+        _ => {}
+    }
+    if !state.store.remove_membership(user_id, company_id).await? {
+        return Err(ApiError::NotFound);
+    }
+    let revoked_devices = state.store.revoke_user_devices(company_id, user_id).await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "member.remove",
+        json!({ "userId": user_id, "role": target_role, "revokedDevices": revoked_devices }),
+    )
+    .await?;
+    Ok(Json(json!({
+        "userId": user_id,
+        "removed": true,
+        "revokedDevices": revoked_devices,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ChangeRoleRequest {
+    role: String,
+}
+
+/// Change a member's role (owner only). Demoting the last owner is a 409 —
+/// a company must always keep one.
+async fn change_member_role(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<ChangeRoleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner])?;
+    let new_role = Role::parse(&req.role)
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown role {}", req.role)))?;
+    let target_role = state
+        .store
+        .membership_role(user_id, company_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    if target_role == Role::Owner
+        && new_role != Role::Owner
+        && owner_count(&state, company_id).await? <= 1
+    {
+        return Err(ApiError::Conflict(
+            "cannot demote the last owner of the company".into(),
+        ));
+    }
+    if !state
+        .store
+        .set_membership_role(user_id, company_id, new_role)
+        .await?
+    {
+        return Err(ApiError::NotFound);
+    }
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "member.role",
+        json!({ "userId": user_id, "from": target_role, "to": new_role }),
+    )
+    .await?;
+    Ok(Json(json!({ "userId": user_id, "role": new_role })))
 }
 
 // ---------------------------------------------------------------------------

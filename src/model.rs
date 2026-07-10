@@ -75,6 +75,19 @@ impl Role {
     }
 }
 
+/// A company membership joined with its user record — the member-list read
+/// model. `created_at` is the membership's creation time (when the user
+/// joined the company), not the user's.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Member {
+    pub user_id: Uuid,
+    pub email: String,
+    pub display_name: String,
+    pub role: Role,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Invitation {
     pub token: String,

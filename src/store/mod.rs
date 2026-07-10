@@ -10,7 +10,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, PayLink, PortalLink, Role,
+    AuditEntry, Company, Device, Invitation, Member, MutationRecord, PayLink, PortalLink, Role,
     TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
@@ -58,6 +58,23 @@ pub trait Store: Send + Sync {
         user_id: Uuid,
         company_id: Uuid,
     ) -> Result<Option<Role>, StoreError>;
+    /// All members of a company joined with their user records, oldest
+    /// membership first.
+    async fn company_members(&self, company_id: Uuid) -> Result<Vec<Member>, StoreError>;
+    /// Deletes a membership. Returns `false` when the user was not a member.
+    async fn remove_membership(&self, user_id: Uuid, company_id: Uuid) -> Result<bool, StoreError>;
+    /// Changes a member's role. Returns `false` when the user is not a
+    /// member. (Unlike `upsert_membership`, this overwrites.)
+    async fn set_membership_role(
+        &self,
+        user_id: Uuid,
+        company_id: Uuid,
+        role: Role,
+    ) -> Result<bool, StoreError>;
+    /// Revokes every live device of a user in a company (member removal —
+    /// device tokens carry company access). Returns how many were revoked.
+    async fn revoke_user_devices(&self, company_id: Uuid, user_id: Uuid)
+        -> Result<u64, StoreError>;
 
     // Tokens (opaque bearer tokens; only SHA-256 hashes are stored)
     async fn insert_user_token(

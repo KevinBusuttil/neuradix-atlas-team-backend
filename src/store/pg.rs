@@ -8,8 +8,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::model::{
-    AuditEntry, Company, Device, Invitation, MutationRecord, PayLink, PortalLink, PortalLinkKind,
-    Role, TokenIdentity, User, WebhookEvent,
+    AuditEntry, Company, Device, Invitation, Member, MutationRecord, PayLink, PortalLink,
+    PortalLinkKind, Role, TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
     format_number, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
@@ -420,6 +420,69 @@ impl Store for PgStore {
             )?)),
             None => Ok(None),
         }
+    }
+
+    async fn company_members(&self, company_id: Uuid) -> Result<Vec<Member>, StoreError> {
+        let rows = sqlx::query(
+            "select m.user_id, u.email, u.display_name, m.role, m.created_at \
+             from memberships m join users u on u.id = m.user_id \
+             where m.company_id = $1 order by m.created_at, m.user_id",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(Member {
+                    user_id: row.try_get("user_id")?,
+                    email: row.try_get("email")?,
+                    display_name: row.try_get("display_name")?,
+                    role: parse_role(row.try_get::<String, _>("role")?.as_str())?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn remove_membership(&self, user_id: Uuid, company_id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query("delete from memberships where user_id = $1 and company_id = $2")
+            .bind(user_id)
+            .bind(company_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_membership_role(
+        &self,
+        user_id: Uuid,
+        company_id: Uuid,
+        role: Role,
+    ) -> Result<bool, StoreError> {
+        let result =
+            sqlx::query("update memberships set role = $3 where user_id = $1 and company_id = $2")
+                .bind(user_id)
+                .bind(company_id)
+                .bind(role.as_str())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn revoke_user_devices(
+        &self,
+        company_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "update devices set revoked_at = now() \
+             where company_id = $1 and user_id = $2 and revoked_at is null",
+        )
+        .bind(company_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     async fn insert_user_token(
