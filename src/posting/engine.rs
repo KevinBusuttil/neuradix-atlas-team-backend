@@ -36,6 +36,9 @@ const EPS: f64 = 1e-7;
 /// total) — the same sub-cent tolerance as the JE balance guard and the
 /// settlement paid-epsilon.
 const MONEY_EPS: f64 = 0.005;
+/// Cent tolerance for a single tax row against `taxable_amount × rate / 100`
+/// (the client rounds per tax code, so a row may drift up to a cent).
+const TAX_ROW_EPS: f64 = 0.01;
 /// JE-style balance guard tolerance on the generated GL.
 const BALANCE_TOLERANCE: f64 = 0.005;
 /// `tax_type` of a withholding tax row: deducted from the document total
@@ -292,9 +295,11 @@ async fn build_submit(
 
     resolve_account_fallbacks(doctype, &mut payload, &settings);
     if matches!(doctype, "Sales Invoice" | "Purchase Invoice") {
+        validate_tax_rows(&payload)?;
         validate_invoice_totals(&mut payload, true)?;
     } else if doctype == "POS Invoice" {
         // Payment is captured inline via `tenders` — no outstanding to track.
+        validate_tax_rows(&payload)?;
         validate_invoice_totals(&mut payload, false)?;
     }
 
@@ -851,6 +856,59 @@ fn validate_invoice_totals(
     payload.remove("outstanding_amount");
     if track_outstanding {
         payload.insert("outstanding_amount".into(), json!(grand));
+    }
+    Ok(())
+}
+
+/// Every `taxes` row must satisfy the tax identity before it may post:
+/// `tax_amount ≈ round2(taxable_amount × rate / 100)` within [`TAX_ROW_EPS`]
+/// (withholding rows carry the negated magnitude — they are deducted). The
+/// identity holds in both pricing modes: inclusive extraction sets
+/// `taxable = gross − tax`, so `tax ≈ taxable × rate / 100` still — the Dart
+/// `HubTaxEngine.compute`. Rates must be non-negative; zero-rate (exempt)
+/// rows therefore carry a zero `tax_amount` but keep their taxable base for
+/// the VAT return. `taxable_amount` must be non-negative on a normal
+/// document and non-positive on a return (`is_return`), matching how return
+/// fixtures carry negated line amounts.
+fn validate_tax_rows(payload: &Map<String, Value>) -> Result<(), PostingError> {
+    let rows = match payload.get("taxes") {
+        Some(Value::Array(rows)) => rows.as_slice(),
+        _ => return Ok(()),
+    };
+    let is_return = is_true(payload.get("is_return"));
+    for (index, row) in rows.iter().enumerate() {
+        // Non-object rows never post (every reader skips them).
+        let Some(row) = row.as_object() else {
+            continue;
+        };
+        let rate = as_num(row.get("rate"));
+        let taxable = as_num(row.get("taxable_amount"));
+        let tax_amount = as_num(row.get("tax_amount"));
+        if rate < 0.0 {
+            return Err(PostingError::Validation(format!(
+                "taxes[{index}]: rate {rate} must not be negative"
+            )));
+        }
+        if !is_return && taxable < -MONEY_EPS {
+            return Err(PostingError::Validation(format!(
+                "taxes[{index}]: taxable_amount {taxable} must not be negative"
+            )));
+        }
+        if is_return && taxable > MONEY_EPS {
+            return Err(PostingError::Validation(format!(
+                "taxes[{index}]: taxable_amount {taxable} must not be positive on a return"
+            )));
+        }
+        let magnitude = round2(taxable * rate / 100.0);
+        let withholding =
+            as_non_empty(row.get("tax_type")).as_deref() == Some(WITHHOLDING_TAX_TYPE);
+        let expected = if withholding { -magnitude } else { magnitude };
+        if (tax_amount - expected).abs() > TAX_ROW_EPS {
+            return Err(PostingError::Validation(format!(
+                "taxes[{index}]: tax_amount {tax_amount}, expected {expected} \
+                 (taxable_amount {taxable} × rate {rate}%)"
+            )));
+        }
     }
     Ok(())
 }

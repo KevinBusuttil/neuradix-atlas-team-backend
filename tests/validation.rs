@@ -297,6 +297,194 @@ async fn inclusive_pricing_invoice_computed_the_dart_way_passes() {
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// Tax-row validation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tampered_tax_rows_are_rejected() {
+    let mut app = app_with_service_item().await;
+    // rate 18 on a €10 base claims €5 of VAT: 422 quoting the expectation.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-TAX1",
+            json!({ "taxes": [{
+                "tax_type": "VAT",
+                "tax_account": "VAT Output",
+                "rate": 18,
+                "taxable_amount": 10,
+                "tax_amount": 5
+            }] }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+        ),
+        "expected 1.8",
+    )
+    .await;
+    // A zero-rate (exempt) row must carry no tax amount.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-TAX2",
+            json!({ "taxes": [{
+                "tax_type": "VAT",
+                "tax_account": "VAT Output",
+                "rate": 0,
+                "taxable_amount": 10,
+                "tax_amount": 9999
+            }] }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+        ),
+        "expected 0",
+    )
+    .await;
+    // Negative rates and negative taxable bases (outside a return) fail.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-TAX3",
+            json!({ "taxes": [{ "rate": -18, "taxable_amount": 10, "tax_amount": -1.8 }] }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+        ),
+        "rate -18",
+    )
+    .await;
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-TAX4",
+            json!({ "taxes": [{ "rate": 18, "taxable_amount": -10, "tax_amount": -1.8 }] }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+        ),
+        "taxable_amount -10",
+    )
+    .await;
+    for voucher in ["SINV-TAX1", "SINV-TAX2", "SINV-TAX3", "SINV-TAX4"] {
+        assert_eq!(app.gl_count(voucher), 0, "GL leaked for {voucher}");
+        assert_eq!(app.tax_transaction_count(voucher), 0);
+    }
+}
+
+#[tokio::test]
+async fn valid_zero_rate_withholding_and_return_tax_rows_pass() {
+    let mut app = app_with_service_item().await;
+    // Zero-rated export: taxable base captured, no tax owed.
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                "SINV-ZR1",
+                json!({ "taxes": [{
+                    "tax_type": "VAT",
+                    "tax_code": "VAT-0",
+                    "tax_account": "VAT Output",
+                    "rate": 0,
+                    "taxable_amount": 10,
+                    "tax_amount": 0
+                }] }),
+                json!([{ "item": "SVC-1", "qty": 1, "rate": 10 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "zero-rate submit failed: {body}");
+    assert_eq!(app.tax_transaction_count("SINV-ZR1"), 1);
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-ZR1").unwrap(),
+        10.0
+    ));
+
+    // Withholding is deducted: the Dart engine carries its amount negative.
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                "SINV-WH1",
+                json!({ "taxes": [{
+                    "tax_type": "Withholding",
+                    "tax_code": "WHT-10",
+                    "tax_account": "WHT Receivable",
+                    "rate": 10,
+                    "taxable_amount": 100,
+                    "tax_amount": -10
+                }] }),
+                json!([{ "item": "SVC-1", "qty": 1, "rate": 100 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "withholding submit failed: {body}");
+    assert!(approx(
+        app.outstanding("Sales Invoice", "SINV-WH1").unwrap(),
+        90.0
+    ));
+    // Claiming the withholding positive (inflating the receivable) fails.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-WH2",
+            json!({ "taxes": [{
+                "tax_type": "Withholding",
+                "tax_account": "WHT Receivable",
+                "rate": 10,
+                "taxable_amount": 100,
+                "tax_amount": 10
+            }] }),
+            json!([{ "item": "SVC-1", "qty": 1, "rate": 100 }]),
+        ),
+        "expected -10",
+    )
+    .await;
+
+    // A return mirrors the fixtures: negated line amounts, negated tax rows.
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            service_invoice(
+                "SINV-RET1",
+                json!({
+                    "is_return": 1,
+                    "return_against": "SINV-ZR1",
+                    "taxes": [{
+                        "tax_type": "VAT",
+                        "tax_code": "VAT-15",
+                        "tax_account": "VAT Output",
+                        "rate": 15,
+                        "taxable_amount": -60,
+                        "tax_amount": -9
+                    }]
+                }),
+                json!([{ "item": "SVC-1", "qty": -3, "rate": 20 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "return submit failed: {body}");
+    // A return must carry its tax negated, never positive.
+    expect_422(
+        &mut app,
+        "owner",
+        service_invoice(
+            "SINV-RET2",
+            json!({
+                "is_return": 1,
+                "taxes": [{
+                    "tax_type": "VAT",
+                    "tax_account": "VAT Output",
+                    "rate": 15,
+                    "taxable_amount": 60,
+                    "tax_amount": 9
+                }]
+            }),
+            json!([{ "item": "SVC-1", "qty": -3, "rate": 20 }]),
+        ),
+        "taxable_amount 60",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn absent_posting_date_defaults_to_today_and_boundary_years_post() {
     let mut app = app_with_service_item().await;
