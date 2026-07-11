@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 use atlas_team_backend::auth::{generate_token, hash_token};
 use atlas_team_backend::model::PayLink;
-use atlas_team_backend::store::Store;
 use hmac::{Hmac, Mac};
 use support::{approx, TestApp};
 
@@ -436,7 +435,7 @@ async fn webhook_without_configured_secret_fails_closed() {
         "{response}"
     );
     // The intake log still recorded the delivery.
-    assert_eq!(app.store.webhook_events().len(), 1);
+    assert_eq!(app.store.webhook_events().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -493,7 +492,7 @@ async fn webhook_rejects_bad_signatures_and_stale_timestamps() {
     assert_eq!(response["handled"], json!(false));
 
     // Nothing was ever posted.
-    assert_eq!(app.store.all_gl_entries(app.company_uuid()).len(), 0);
+    assert_eq!(app.all_gl_entries().await.len(), 0);
 }
 
 #[tokio::test]
@@ -502,7 +501,7 @@ async fn webhook_posts_official_payment_entry_and_replays_idempotently() {
     submit_invoice(&mut app, "SINV-W1", "CUST-1", 150.0).await;
     let (_, token) = create_pay_link(&app, "SINV-W1").await;
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-W1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-W1").await.unwrap(),
         150.0
     ));
 
@@ -519,13 +518,15 @@ async fn webhook_posts_official_payment_entry_and_replays_idempotently() {
     // The engine settled the invoice: outstanding dropped, the settlement
     // exists, the official number was allocated.
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-W1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-W1").await.unwrap(),
         0.0
     ));
-    assert_eq!(app.settlement_count("PAY-STRIPE-evt_W1"), 1);
+    assert_eq!(app.settlement_count("PAY-STRIPE-evt_W1").await, 1);
     let payment = app
         .store
-        .document(app.company_uuid(), "Payment Entry", "PAY-STRIPE-evt_W1")
+        .posted_document(app.company_uuid(), "Payment Entry", "PAY-STRIPE-evt_W1")
+        .await
+        .unwrap()
         .expect("payment entry not posted");
     assert_eq!(payment.docstatus, 1);
     assert_eq!(payment.official_number.as_deref(), Some("PAY-00001"));
@@ -571,10 +572,10 @@ async fn webhook_posts_official_payment_entry_and_replays_idempotently() {
     assert_eq!(response["handled"], json!(true));
     assert_eq!(response["number"], json!("PAY-00001"));
     assert_eq!(response["replayed"], json!(true));
-    assert_eq!(app.settlement_count("PAY-STRIPE-evt_W1"), 1);
-    assert_eq!(app.gl_count("PAY-STRIPE-evt_W1"), 2);
+    assert_eq!(app.settlement_count("PAY-STRIPE-evt_W1").await, 1);
+    assert_eq!(app.gl_count("PAY-STRIPE-evt_W1").await, 2);
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-W1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-W1").await.unwrap(),
         0.0
     ));
     let (_, pulled) = app

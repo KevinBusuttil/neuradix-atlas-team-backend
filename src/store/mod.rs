@@ -14,8 +14,8 @@ use crate::model::{
     TokenIdentity, User, WebhookEvent,
 };
 use crate::posting::model::{
-    CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction, PostedDocument, PostingCommit,
-    Settlement, StockLedgerEntry, TaxTransaction,
+    Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction, PostedDocument,
+    PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::projection::CompanyDocument;
 
@@ -325,4 +325,34 @@ pub trait Store: Send + Sync {
     /// Every GL entry of the company, ordered by posting date then voucher
     /// (then row id) — the accountant portal's GL export order.
     async fn gl_entries_ordered(&self, company_id: Uuid) -> Result<Vec<GlEntry>, StoreError>;
+
+    // ------------------------------------------------------------------
+    // Whole-table inspection (test suite / operational verification)
+    //
+    // The store-parameterized test suite asserts ledger state through these
+    // on BOTH implementations, so mem and pg are pinned to the same
+    // behaviour by the same assertions.
+    // ------------------------------------------------------------------
+
+    /// All webhook events received so far, oldest first.
+    async fn webhook_events(&self) -> Result<Vec<WebhookEvent>, StoreError>;
+    /// Every stock ledger entry of a company, insertion order.
+    async fn all_stock_ledger_entries(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError>;
+    /// Every customer/supplier subledger row of a company.
+    async fn all_party_transactions(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<PartyTransaction>, StoreError>;
+    /// Every tax subledger row of a company.
+    async fn all_tax_transactions(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<TaxTransaction>, StoreError>;
+    /// Every settlement of a company.
+    async fn all_settlements(&self, company_id: Uuid) -> Result<Vec<Settlement>, StoreError>;
+    /// Every (item, warehouse) bin of a company.
+    async fn all_bins(&self, company_id: Uuid) -> Result<Vec<Bin>, StoreError>;
 }

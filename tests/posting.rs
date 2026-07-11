@@ -94,9 +94,13 @@ async fn idempotency_key_replay_returns_same_result_without_double_posting() {
     let (status, replay) = app.submit_as("owner", submit).await;
     assert_eq!(status, StatusCode::OK, "replay failed: {replay}");
     assert_eq!(first, replay, "replay must return the committed response");
-    assert_eq!(app.gl_count("PINV-I1"), 4, "GL must not double-post");
-    assert_eq!(app.sle_count("PINV-I1"), 1, "SLE must not double-post");
-    let bin = app.bin("ITEM-A", "WH").unwrap();
+    assert_eq!(app.gl_count("PINV-I1").await, 4, "GL must not double-post");
+    assert_eq!(
+        app.sle_count("PINV-I1").await,
+        1,
+        "SLE must not double-post"
+    );
+    let bin = app.bin("ITEM-A", "WH").await.unwrap();
     assert!(approx(bin.actual_qty, 10.0), "bin qty {}", bin.actual_qty);
     assert!(approx(bin.stock_value, 50.0));
 
@@ -248,9 +252,9 @@ async fn concurrent_oversell_admits_exactly_one_winner() {
         vec![StatusCode::OK, StatusCode::UNPROCESSABLE_ENTITY],
         "exactly one concurrent sale of 7/10 may succeed"
     );
-    let bin = app.bin("ITEM-A", "WH").unwrap();
+    let bin = app.bin("ITEM-A", "WH").await.unwrap();
     assert!(approx(bin.actual_qty, 3.0), "bin qty {}", bin.actual_qty);
-    assert!(approx(app.account_balance("COGS"), 35.0));
+    assert!(approx(app.account_balance("COGS").await, 35.0));
 }
 
 #[tokio::test]

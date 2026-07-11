@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 use atlas_team_backend::auth::{generate_token, hash_token};
 use atlas_team_backend::model::{PortalLink, PortalLinkKind};
-use atlas_team_backend::store::Store;
 use support::TestApp;
 
 /// A raw request with an optional Accept header; returns the response bytes.

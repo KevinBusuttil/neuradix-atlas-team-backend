@@ -184,7 +184,7 @@ async fn tampered_grand_total_is_rejected_with_expected_vs_sent() {
 
     // Nothing reached the ledger.
     for voucher in ["SINV-T1", "SINV-T2", "SINV-T3", "SINV-T4", "POS-T1"] {
-        assert_eq!(app.gl_count(voucher), 0, "GL leaked for {voucher}");
+        assert_eq!(app.gl_count(voucher).await, 0, "GL leaked for {voucher}");
     }
 }
 
@@ -219,7 +219,10 @@ async fn consistent_client_totals_pass_and_client_outstanding_is_ignored() {
         .await;
     assert_eq!(status, StatusCode::OK, "consistent submit failed: {body}");
     assert!(
-        approx(app.outstanding("Sales Invoice", "SINV-OK1").unwrap(), 24.90),
+        approx(
+            app.outstanding("Sales Invoice", "SINV-OK1").await.unwrap(),
+            24.90
+        ),
         "outstanding must be the validated grand total, not the client's"
     );
 }
@@ -258,14 +261,20 @@ async fn inclusive_pricing_invoice_computed_the_dart_way_passes() {
         .await;
     assert_eq!(status, StatusCode::OK, "inclusive submit failed: {body}");
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-INC1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-INC1").await.unwrap(),
         50.0
     ));
     // The GL books net revenue + output VAT, receivable gross.
-    assert!(approx(app.voucher_account("Debtors", "SINV-INC1"), 50.0));
-    assert!(approx(app.voucher_account("Sales", "SINV-INC1"), -42.37));
     assert!(approx(
-        app.voucher_account("VAT Output", "SINV-INC1"),
+        app.voucher_account("Debtors", "SINV-INC1").await,
+        50.0
+    ));
+    assert!(approx(
+        app.voucher_account("Sales", "SINV-INC1").await,
+        -42.37
+    ));
+    assert!(approx(
+        app.voucher_account("VAT Output", "SINV-INC1").await,
         -7.63
     ));
 
@@ -364,8 +373,8 @@ async fn tampered_tax_rows_are_rejected() {
     )
     .await;
     for voucher in ["SINV-TAX1", "SINV-TAX2", "SINV-TAX3", "SINV-TAX4"] {
-        assert_eq!(app.gl_count(voucher), 0, "GL leaked for {voucher}");
-        assert_eq!(app.tax_transaction_count(voucher), 0);
+        assert_eq!(app.gl_count(voucher).await, 0, "GL leaked for {voucher}");
+        assert_eq!(app.tax_transaction_count(voucher).await, 0);
     }
 }
 
@@ -391,9 +400,9 @@ async fn valid_zero_rate_withholding_and_return_tax_rows_pass() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "zero-rate submit failed: {body}");
-    assert_eq!(app.tax_transaction_count("SINV-ZR1"), 1);
+    assert_eq!(app.tax_transaction_count("SINV-ZR1").await, 1);
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-ZR1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-ZR1").await.unwrap(),
         10.0
     ));
 
@@ -417,7 +426,7 @@ async fn valid_zero_rate_withholding_and_return_tax_rows_pass() {
         .await;
     assert_eq!(status, StatusCode::OK, "withholding submit failed: {body}");
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-WH1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-WH1").await.unwrap(),
         90.0
     ));
     // Claiming the withholding positive (inflating the receivable) fails.
@@ -605,11 +614,11 @@ async fn payment_over_allocation_and_bad_references_are_rejected() {
     for voucher in [
         "PAY-OV1", "PAY-OV2", "PAY-OV3", "PAY-OV4", "PAY-OV5", "PAY-OV6", "PAY-OV7",
     ] {
-        assert_eq!(app.gl_count(voucher), 0, "GL leaked for {voucher}");
-        assert_eq!(app.settlement_count(voucher), 0);
+        assert_eq!(app.gl_count(voucher).await, 0, "GL leaked for {voucher}");
+        assert_eq!(app.settlement_count(voucher).await, 0);
     }
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-S1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-S1").await.unwrap(),
         100.0
     ));
 
@@ -623,7 +632,7 @@ async fn payment_over_allocation_and_bad_references_are_rejected() {
         .await;
     assert_eq!(status, StatusCode::OK, "first payment failed: {body}");
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-S1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-S1").await.unwrap(),
         40.0
     ));
     expect_422(
@@ -642,7 +651,7 @@ async fn payment_over_allocation_and_bad_references_are_rejected() {
         .await;
     assert_eq!(status, StatusCode::OK, "remainder payment failed: {body}");
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-S1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-S1").await.unwrap(),
         0.0
     ));
 }
@@ -680,7 +689,7 @@ async fn cancelling_a_settled_invoice_conflicts_until_the_payment_is_cancelled()
     );
     // Nothing reversed; the invoice is still submitted and partially settled.
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-C1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-C1").await.unwrap(),
         40.0
     ));
 
@@ -693,7 +702,7 @@ async fn cancelling_a_settled_invoice_conflicts_until_the_payment_is_cancelled()
         .await;
     assert_eq!(status, StatusCode::OK, "payment cancel failed: {body}");
     assert!(approx(
-        app.outstanding("Sales Invoice", "SINV-C1").unwrap(),
+        app.outstanding("Sales Invoice", "SINV-C1").await.unwrap(),
         100.0
     ));
     let (status, body) = app

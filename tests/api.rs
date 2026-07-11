@@ -1,9 +1,13 @@
-//! Integration tests: the full router over `MemStore`, driven with
-//! `tower::ServiceExt::oneshot`. No database, no network.
+//! Integration tests: the full router driven with
+//! `tower::ServiceExt::oneshot`. Runs over `MemStore` by default; set
+//! `ATLAS_TEST_DATABASE_URL` to run the same tests over `PgStore` (see
+//! `tests/support/mod.rs`).
+
+mod support;
 
 use std::sync::Arc;
 
-use atlas_team_backend::store::MemStore;
+use atlas_team_backend::store::Store;
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
@@ -14,14 +18,20 @@ use tower::ServiceExt;
 
 struct App {
     router: Router,
-    store: Arc<MemStore>,
+    store: Arc<dyn Store>,
+    /// Keeps the per-test Postgres database alive for the test's lifetime.
+    _db: Option<support::PgTestDb>,
 }
 
 impl App {
-    fn new() -> Self {
-        let store = Arc::new(MemStore::new());
+    async fn new() -> Self {
+        let (store, db) = support::test_store().await;
         let router = atlas_team_backend::router(store.clone());
-        Self { router, store }
+        Self {
+            router,
+            store,
+            _db: db,
+        }
     }
 
     async fn send(
@@ -191,7 +201,7 @@ fn mutation(id: &str, document_id: &str, device_id: &str, user_id: &str) -> Valu
 
 #[tokio::test]
 async fn health_needs_no_auth() {
-    let app = App::new();
+    let app = App::new().await;
     let (status, body) = app.get("/health", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({ "status": "ok" }));
@@ -199,7 +209,7 @@ async fn health_needs_no_auth() {
 
 #[tokio::test]
 async fn bootstrap_creates_company_owner_and_token() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     assert!(!boot.company_id.is_empty());
     assert!(!boot.owner_user_id.is_empty());
@@ -215,7 +225,7 @@ async fn bootstrap_creates_company_owner_and_token() {
 
 #[tokio::test]
 async fn invitation_flow_lets_second_user_join_and_register_devices() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (second_user_id, second_token) =
         join_member(&app, &boot, "second@example.com", "sales").await;
@@ -230,7 +240,7 @@ async fn invitation_flow_lets_second_user_join_and_register_devices() {
 
 #[tokio::test]
 async fn invitation_cannot_be_accepted_twice() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (status, body) = app
         .json(
@@ -266,7 +276,7 @@ async fn invitation_cannot_be_accepted_twice() {
 
 #[tokio::test]
 async fn push_assigns_monotonic_versions_and_is_idempotent() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -307,7 +317,7 @@ async fn push_assigns_monotonic_versions_and_is_idempotent() {
 
 #[tokio::test]
 async fn pull_returns_camelcase_records_in_version_order() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -377,7 +387,7 @@ async fn pull_returns_camelcase_records_in_version_order() {
 
 #[tokio::test]
 async fn ack_marks_mutations_acknowledged() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -421,7 +431,7 @@ async fn ack_marks_mutations_acknowledged() {
 
 #[tokio::test]
 async fn sync_requires_a_device_token() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     // A user token is authenticated but not a device — sync is device-only.
     let (status, _) = app
@@ -490,7 +500,7 @@ async fn pull_page(
 
 #[tokio::test]
 async fn pull_pages_honor_client_limit_and_walk_the_whole_log() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -528,7 +538,7 @@ async fn pull_pages_honor_client_limit_and_walk_the_whole_log() {
 
 #[tokio::test]
 async fn pull_limit_absent_zero_or_oversized_uses_the_server_max() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -560,7 +570,7 @@ async fn pull_limit_absent_zero_or_oversized_uses_the_server_max() {
 
 #[tokio::test]
 async fn pull_pages_stay_consistent_when_mutations_arrive_between_pages() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -608,7 +618,7 @@ async fn pull_pages_stay_consistent_when_mutations_arrive_between_pages() {
 
 #[tokio::test]
 async fn blob_put_get_head_roundtrip_and_hash_check() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let bytes = b"scanned-receipt-bytes".to_vec();
     let sha = hex::encode(Sha256::digest(&bytes));
@@ -663,7 +673,7 @@ async fn blob_put_get_head_roundtrip_and_hash_check() {
 
 #[tokio::test]
 async fn blob_at_the_size_limit_is_accepted_and_over_it_is_413() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let limit = 25 * 1024 * 1024; // default ATLAS_MAX_BLOB_MB
 
@@ -704,7 +714,7 @@ async fn blob_at_the_size_limit_is_accepted_and_over_it_is_413() {
 
 #[tokio::test]
 async fn json_routes_reject_bodies_over_two_megabytes_with_413() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_a, token_a) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Device A").await;
@@ -730,7 +740,7 @@ async fn json_routes_reject_bodies_over_two_megabytes_with_413() {
 async fn webhooks_are_logged_without_auth() {
     // The generic intake routes stay log-only; `/webhooks/payments/stripe`
     // is now the signature-verified processing endpoint (tests/payments.rs).
-    let app = App::new();
+    let app = App::new().await;
     let payload = json!({ "type": "payment_intent.succeeded", "id": "pi_123" });
     let (status, body) = app
         .json(
@@ -753,7 +763,7 @@ async fn webhooks_are_logged_without_auth() {
         .await;
     assert_eq!(status, StatusCode::OK);
 
-    let events = app.store.webhook_events();
+    let events = app.store.webhook_events().await.unwrap();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].kind.as_str(), "payment");
     assert_eq!(events[0].provider, "paypal");
@@ -766,7 +776,7 @@ async fn webhooks_are_logged_without_auth() {
 
 #[tokio::test]
 async fn company_routes_reject_missing_or_bad_tokens_with_401() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let uri = format!("/companies/{}/devices", boot.company_id);
 
@@ -788,7 +798,7 @@ async fn company_routes_reject_missing_or_bad_tokens_with_401() {
 
 #[tokio::test]
 async fn non_members_get_403() {
-    let app = App::new();
+    let app = App::new().await;
     let boot_a = bootstrap(&app).await;
     // A second, unrelated company; its owner is not a member of company A.
     let (status, body) = app
@@ -819,7 +829,7 @@ async fn non_members_get_403() {
 
 #[tokio::test]
 async fn only_owner_or_admin_can_invite() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (_user_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
     let (status, _) = app
@@ -835,7 +845,7 @@ async fn only_owner_or_admin_can_invite() {
 
 #[tokio::test]
 async fn audit_feed_is_role_restricted() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (_user_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
     let uri = format!("/companies/{}/audit", boot.company_id);
@@ -849,7 +859,7 @@ async fn audit_feed_is_role_restricted() {
 
 #[tokio::test]
 async fn every_mutating_action_writes_an_audit_row() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (_second_user_id, second_token) =
         join_member(&app, &boot, "second@example.com", "accountant").await;
@@ -940,7 +950,7 @@ async fn every_mutating_action_writes_an_audit_row() {
 
 #[tokio::test]
 async fn device_list_scopes_to_own_devices_unless_owner_or_admin() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (sales_user_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
     let (owner_device, _) =
@@ -973,7 +983,7 @@ async fn device_list_scopes_to_own_devices_unless_owner_or_admin() {
 
 #[tokio::test]
 async fn device_auth_stamps_last_seen_at() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_id, device_token) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Front desk").await;
@@ -1006,7 +1016,7 @@ async fn device_auth_stamps_last_seen_at() {
 
 #[tokio::test]
 async fn revoked_device_token_is_rejected_on_push_and_pull() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (device_id, device_token) =
         register_device(&app, &boot.company_id, &boot.owner_token, "Front desk").await;
@@ -1060,7 +1070,7 @@ async fn revoked_device_token_is_rejected_on_push_and_pull() {
 
 #[tokio::test]
 async fn device_revocation_permission_matrix() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (_, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
     let (_, admin_token) = join_member(&app, &boot, "admin@example.com", "admin").await;
@@ -1111,7 +1121,7 @@ async fn device_revocation_permission_matrix() {
 
 #[tokio::test]
 async fn member_list_is_visible_to_every_member() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (sales_user_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
 
@@ -1137,7 +1147,7 @@ async fn member_list_is_visible_to_every_member() {
 
 #[tokio::test]
 async fn member_removal_permission_matrix() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (admin_a_id, admin_a_token) =
         join_member(&app, &boot, "admin.a@example.com", "admin").await;
@@ -1184,7 +1194,7 @@ async fn member_removal_permission_matrix() {
 
 #[tokio::test]
 async fn last_owner_cannot_be_removed_or_demoted() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
 
     // The sole owner cannot self-remove.
@@ -1244,7 +1254,7 @@ async fn last_owner_cannot_be_removed_or_demoted() {
 
 #[tokio::test]
 async fn owners_cannot_be_removed_by_anyone_else() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (second_id, _) = join_member(&app, &boot, "second@example.com", "admin").await;
     // Promote to a second owner.
@@ -1273,7 +1283,7 @@ async fn owners_cannot_be_removed_by_anyone_else() {
 
 #[tokio::test]
 async fn role_change_is_owner_only_and_validates_the_role() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (_, admin_token) = join_member(&app, &boot, "admin@example.com", "admin").await;
     let (sales_id, _) = join_member(&app, &boot, "sales@example.com", "sales").await;
@@ -1317,7 +1327,7 @@ async fn role_change_is_owner_only_and_validates_the_role() {
 
 #[tokio::test]
 async fn member_removal_revokes_their_devices() {
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (sales_id, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
     let (_, sales_device_token) =
@@ -1370,9 +1380,7 @@ async fn member_removal_revokes_their_devices() {
 
 #[tokio::test]
 async fn expired_user_token_is_rejected_and_legacy_null_expiry_still_works() {
-    use atlas_team_backend::store::Store;
-
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let user_id = uuid::Uuid::parse_str(&boot.owner_user_id).unwrap();
     let company_id = uuid::Uuid::parse_str(&boot.company_id).unwrap();
@@ -1425,9 +1433,7 @@ async fn expired_user_token_is_rejected_and_legacy_null_expiry_still_works() {
 
 #[tokio::test]
 async fn invitation_tokens_are_stored_hashed_and_wrong_tokens_401() {
-    use atlas_team_backend::store::Store;
-
-    let app = App::new();
+    let app = App::new().await;
     let boot = bootstrap(&app).await;
     let (status, body) = app
         .json(

@@ -152,88 +152,6 @@ impl MemStore {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Test-inspection helper: all webhook events received so far.
-    pub fn webhook_events(&self) -> Vec<WebhookEvent> {
-        self.inner.lock().unwrap().webhooks.clone()
-    }
-
-    /// Test-inspection helper: every GL entry posted for a company.
-    pub fn all_gl_entries(&self, company_id: Uuid) -> Vec<GlEntry> {
-        self.inner
-            .lock()
-            .unwrap()
-            .gl_entries
-            .get(&company_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Test-inspection helper: every stock ledger entry for a company.
-    pub fn all_stock_ledger_entries(&self, company_id: Uuid) -> Vec<StockLedgerEntry> {
-        self.inner
-            .lock()
-            .unwrap()
-            .stock_ledger
-            .get(&company_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Test-inspection helper: every bin for a company.
-    pub fn all_bins(&self, company_id: Uuid) -> Vec<Bin> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .bins
-            .iter()
-            .filter(|((company, _, _), _)| *company == company_id)
-            .map(|(_, bin)| bin.clone())
-            .collect()
-    }
-
-    /// Test-inspection helper: every customer/supplier subledger row for a
-    /// company.
-    pub fn all_party_transactions(&self, company_id: Uuid) -> Vec<PartyTransaction> {
-        self.inner
-            .lock()
-            .unwrap()
-            .party_transactions
-            .get(&company_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Test-inspection helper: every tax subledger row for a company.
-    pub fn all_tax_transactions(&self, company_id: Uuid) -> Vec<TaxTransaction> {
-        self.inner
-            .lock()
-            .unwrap()
-            .tax_transactions
-            .get(&company_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Test-inspection helper: every settlement for a company.
-    pub fn all_settlements(&self, company_id: Uuid) -> Vec<Settlement> {
-        self.inner
-            .lock()
-            .unwrap()
-            .settlements
-            .get(&company_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Test-inspection helper: a posted document.
-    pub fn document(&self, company_id: Uuid, doctype: &str, id: &str) -> Option<PostedDocument> {
-        self.inner
-            .lock()
-            .unwrap()
-            .documents
-            .get(&(company_id, doctype.to_string(), id.to_string()))
-            .cloned()
-    }
 }
 
 #[async_trait]
@@ -1120,5 +1038,76 @@ impl Store for MemStore {
             (&a.posting_date, &a.voucher_no, &a.id).cmp(&(&b.posting_date, &b.voucher_no, &b.id))
         });
         Ok(entries)
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-table inspection (test suite / operational verification)
+    // ------------------------------------------------------------------
+
+    async fn webhook_events(&self) -> Result<Vec<WebhookEvent>, StoreError> {
+        Ok(self.inner.lock().unwrap().webhooks.clone())
+    }
+
+    async fn all_stock_ledger_entries(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .stock_ledger
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn all_party_transactions(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<PartyTransaction>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .party_transactions
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn all_tax_transactions(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<TaxTransaction>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .tax_transactions
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn all_settlements(&self, company_id: Uuid) -> Result<Vec<Settlement>, StoreError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .settlements
+            .get(&company_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn all_bins(&self, company_id: Uuid) -> Result<Vec<Bin>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .bins
+            .iter()
+            .filter(|((company, _, _), _)| *company == company_id)
+            .map(|(_, bin)| bin.clone())
+            .collect())
     }
 }

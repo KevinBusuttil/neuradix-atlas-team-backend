@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::model::{
     AuditEntry, Company, Device, Invitation, Member, MutationRecord, PayLink, PortalLink,
-    PortalLinkKind, Role, TokenIdentity, User, WebhookEvent,
+    PortalLinkKind, Role, TokenIdentity, User, WebhookEvent, WebhookKind,
 };
 use crate::posting::model::{
-    format_number, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
+    format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
     PostedDocument, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
@@ -1658,5 +1658,114 @@ impl Store for PgStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(gl_from_row).collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Whole-table inspection (test suite / operational verification)
+    // ------------------------------------------------------------------
+
+    async fn webhook_events(&self) -> Result<Vec<WebhookEvent>, StoreError> {
+        let rows = sqlx::query(
+            "select id, kind, provider, headers, body, received_at \
+             from webhook_events order by received_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let kind: String = row.try_get("kind")?;
+                Ok(WebhookEvent {
+                    id: row.try_get("id")?,
+                    kind: WebhookKind::parse(&kind).ok_or_else(|| {
+                        StoreError::Internal(format!("unknown webhook kind in db: {kind}"))
+                    })?,
+                    provider: row.try_get("provider")?,
+                    headers: row.try_get("headers")?,
+                    body: row.try_get("body")?,
+                    received_at: row.try_get("received_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn all_stock_ledger_entries(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<StockLedgerEntry>, StoreError> {
+        let rows = sqlx::query(
+            "select seq, company_id, id, trans_type, item, warehouse, qty_change, \
+             valuation_rate, voucher_type, voucher_no, posting_date, uom, is_reversal, batch_id \
+             from stock_ledger_entries where company_id = $1 order by seq",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(sle_from_row).collect()
+    }
+
+    async fn all_party_transactions(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<PartyTransaction>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, kind, trans_type, party, posting_date, due_date, amount, \
+             currency, conversion_rate, base_amount, voucher_type, voucher_no, is_reversal, \
+             batch_id \
+             from party_transactions where company_id = $1 order by id",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(party_txn_from_row).collect()
+    }
+
+    async fn all_tax_transactions(
+        &self,
+        company_id: Uuid,
+    ) -> Result<Vec<TaxTransaction>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, tax_type, tax, posting_date, base_amount, tax_amount, rate, \
+             party_type, party, voucher_type, voucher_no, is_reversal, batch_id \
+             from tax_transactions where company_id = $1 order by id",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(tax_txn_from_row).collect()
+    }
+
+    async fn all_settlements(&self, company_id: Uuid) -> Result<Vec<Settlement>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, id, payment_voucher_type, payment_voucher_no, \
+             invoice_voucher_type, invoice_voucher_no, party_type, party, allocated_amount, \
+             posting_date, is_reversal, batch_id \
+             from settlements where company_id = $1 order by id",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(settlement_from_row).collect()
+    }
+
+    async fn all_bins(&self, company_id: Uuid) -> Result<Vec<Bin>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, item, warehouse, actual_qty, valuation_rate, stock_value \
+             from bins where company_id = $1 order by item, warehouse",
+        )
+        .bind(company_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(Bin {
+                    company_id: row.try_get("company_id")?,
+                    item: row.try_get("item")?,
+                    warehouse: row.try_get("warehouse")?,
+                    actual_qty: row.try_get("actual_qty")?,
+                    valuation_rate: row.try_get("valuation_rate")?,
+                    stock_value: row.try_get("stock_value")?,
+                })
+            })
+            .collect()
     }
 }

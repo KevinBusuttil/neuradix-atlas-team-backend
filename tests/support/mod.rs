@@ -1,6 +1,16 @@
-//! Shared harness for the Phase 3 posting tests: the full router over
-//! `MemStore`, a bootstrapped company, per-role members with device tokens,
+//! Shared harness for the integration tests: the full router over either
+//! store, a bootstrapped company, per-role members with device tokens,
 //! command senders and ledger inspection helpers.
+//!
+//! # Store parameterization
+//!
+//! By default every test runs against [`MemStore`] — fast, no external
+//! dependencies. Setting `ATLAS_TEST_DATABASE_URL` (an admin URL of a
+//! disposable PostgreSQL server, e.g. `postgres://atlas:atlas@localhost/postgres`)
+//! makes the SAME tests run against [`PgStore`] instead: each test creates
+//! its own uniquely named database (so parallel tests stay isolated), runs
+//! the embedded migrations through `PgStore::connect`, and drops the
+//! database again when the test finishes.
 
 // Each test binary compiles this module independently and uses a different
 // subset of it.
@@ -12,26 +22,128 @@ use std::sync::Arc;
 use atlas_team_backend::posting::model::{
     Bin, GlEntry, PartyTransaction, StockLedgerEntry, TaxTransaction,
 };
-use atlas_team_backend::store::MemStore;
+use atlas_team_backend::store::{MemStore, PgStore, Store};
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use sqlx::Connection;
 use tower::ServiceExt;
 use uuid::Uuid;
+
+/// Admin database URL that switches the suite from MemStore to PgStore.
+pub const TEST_DB_ENV: &str = "ATLAS_TEST_DATABASE_URL";
 
 /// Numeric assertions tolerate sub-cent float noise (0.005, the same
 /// tolerance as the engine's JE balance guard).
 pub const TOLERANCE: f64 = 0.005;
 
+/// Guard for a per-test PostgreSQL database; dropping it drops the database.
+pub struct PgTestDb {
+    admin_url: String,
+    name: String,
+}
+
+impl Drop for PgTestDb {
+    fn drop(&mut self) {
+        let admin_url = self.admin_url.clone();
+        let name = self.name.clone();
+        // Drop needs its own runtime: the test's runtime is unusable from a
+        // synchronous Drop (and may itself be shutting down).
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("cleanup runtime");
+            runtime.block_on(async move {
+                if let Ok(mut conn) = sqlx::postgres::PgConnection::connect(&admin_url).await {
+                    // FORCE kills any connection the pool still holds.
+                    let _ = sqlx::query(&format!("drop database \"{name}\" with (force)"))
+                        .execute(&mut conn)
+                        .await;
+                    let _ = conn.close().await;
+                }
+            });
+        });
+        let _ = handle.join();
+    }
+}
+
+/// Builds the store under test: MemStore by default, or a PgStore over a
+/// fresh, isolated, fully migrated database when `ATLAS_TEST_DATABASE_URL`
+/// is set.
+pub async fn test_store() -> (Arc<dyn Store>, Option<PgTestDb>) {
+    match std::env::var(TEST_DB_ENV) {
+        Ok(admin_url) if !admin_url.trim().is_empty() => {
+            let (store, guard) = pg_test_store(admin_url.trim()).await;
+            (store, Some(guard))
+        }
+        _ => (Arc::new(MemStore::new()), None),
+    }
+}
+
+async fn pg_test_store(admin_url: &str) -> (Arc<dyn Store>, PgTestDb) {
+    let name = format!("atlas_test_{}", Uuid::new_v4().simple());
+    let mut conn = sqlx::postgres::PgConnection::connect(admin_url)
+        .await
+        .unwrap_or_else(|e| panic!("cannot connect to {TEST_DB_ENV}: {e}"));
+    // Postgres serializes CREATE DATABASE on the shared template; parallel
+    // tests briefly collide, so retry.
+    let mut attempts = 0;
+    loop {
+        match sqlx::query(&format!("create database \"{name}\""))
+            .execute(&mut conn)
+            .await
+        {
+            Ok(_) => break,
+            Err(e) if attempts < 50 => {
+                attempts += 1;
+                let _ = e;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("cannot create test database {name}: {e}"),
+        }
+    }
+    let _ = conn.close().await;
+    let guard = PgTestDb {
+        admin_url: admin_url.to_string(),
+        name: name.clone(),
+    };
+    let store = PgStore::connect(&database_url(admin_url, &name))
+        .await
+        .unwrap_or_else(|e| panic!("cannot migrate test database {name}: {e}"));
+    (Arc::new(store), guard)
+}
+
+/// The admin URL with its database path swapped for `name` (query string,
+/// if any, preserved).
+fn database_url(admin_url: &str, name: &str) -> String {
+    let (base, query) = match admin_url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (admin_url, None),
+    };
+    let authority_start = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let base = match base[authority_start..].rfind('/') {
+        Some(i) => &base[..authority_start + i],
+        None => base,
+    };
+    match query {
+        Some(query) => format!("{base}/{name}?{query}"),
+        None => format!("{base}/{name}"),
+    }
+}
+
 pub struct TestApp {
     pub router: Router,
-    pub store: Arc<MemStore>,
+    pub store: Arc<dyn Store>,
     pub company_id: String,
     pub owner_token: String,
+    pub owner_user_id: String,
     /// role -> device token (owner's created lazily too)
     device_tokens: HashMap<String, String>,
+    /// Keeps the per-test Postgres database alive for the test's lifetime.
+    _db: Option<PgTestDb>,
 }
 
 impl TestApp {
@@ -42,14 +154,16 @@ impl TestApp {
     /// A TestApp whose Stripe webhook secret is configured explicitly
     /// (`None` = unset, the webhook endpoint fails closed).
     pub async fn with_stripe_secret(secret: Option<&str>) -> Self {
-        let store = Arc::new(MemStore::new());
+        let (store, db) = test_store().await;
         let router = atlas_team_backend::router_with(store.clone(), secret.map(str::to_string));
         let mut app = Self {
             router,
             store,
             company_id: String::new(),
             owner_token: String::new(),
+            owner_user_id: String::new(),
             device_tokens: HashMap::new(),
+            _db: db,
         };
         let (status, body) = app
             .request(
@@ -66,11 +180,16 @@ impl TestApp {
         assert_eq!(status, StatusCode::CREATED, "bootstrap failed: {body}");
         app.company_id = body["company"]["id"].as_str().unwrap().to_string();
         app.owner_token = body["token"].as_str().unwrap().to_string();
+        app.owner_user_id = body["userId"].as_str().unwrap().to_string();
         app
     }
 
     pub fn company_uuid(&self) -> Uuid {
         self.company_id.parse().unwrap()
+    }
+
+    pub fn owner_uuid(&self) -> Uuid {
+        self.owner_user_id.parse().unwrap()
     }
 
     pub async fn request(
@@ -190,12 +309,23 @@ impl TestApp {
         .await
     }
 
-    // -- ledger inspection over MemStore ------------------------------------
+    // -- ledger inspection through the Store trait ---------------------------
+    //
+    // Everything goes through trait methods, so the same assertions verify
+    // whichever store the suite is parameterized over.
+
+    /// Every GL entry of the company.
+    pub async fn all_gl_entries(&self) -> Vec<GlEntry> {
+        self.store
+            .gl_entries_ordered(self.company_uuid())
+            .await
+            .unwrap()
+    }
 
     /// Σ(debit − credit) for an account across every posted GL entry.
-    pub fn account_balance(&self, account: &str) -> f64 {
-        self.store
-            .all_gl_entries(self.company_uuid())
+    pub async fn account_balance(&self, account: &str) -> f64 {
+        self.all_gl_entries()
+            .await
             .iter()
             .filter(|entry| entry.account == account)
             .map(|entry| entry.debit - entry.credit)
@@ -203,97 +333,109 @@ impl TestApp {
     }
 
     /// Σ(debit − credit) for an account scoped to one voucher.
-    pub fn voucher_account(&self, account: &str, voucher_no: &str) -> f64 {
+    pub async fn voucher_account(&self, account: &str, voucher_no: &str) -> f64 {
         self.store
-            .all_gl_entries(self.company_uuid())
+            .gl_for_voucher(self.company_uuid(), voucher_no)
+            .await
+            .unwrap()
             .iter()
-            .filter(|entry| entry.account == account && entry.voucher_no == voucher_no)
+            .filter(|entry| entry.account == account)
             .map(|entry| entry.debit - entry.credit)
             .sum()
     }
 
-    pub fn gl_count(&self, voucher_no: &str) -> usize {
+    pub async fn gl_count(&self, voucher_no: &str) -> usize {
         self.store
-            .all_gl_entries(self.company_uuid())
-            .iter()
-            .filter(|entry| entry.voucher_no == voucher_no)
-            .count()
+            .gl_for_voucher(self.company_uuid(), voucher_no)
+            .await
+            .unwrap()
+            .len()
     }
 
-    pub fn sle_count(&self, voucher_no: &str) -> usize {
+    pub async fn sle_count(&self, voucher_no: &str) -> usize {
         self.store
-            .all_stock_ledger_entries(self.company_uuid())
-            .iter()
-            .filter(|sle| sle.voucher_no == voucher_no)
-            .count()
+            .sles_for_voucher(self.company_uuid(), voucher_no)
+            .await
+            .unwrap()
+            .len()
     }
 
     /// A GL entry by its deterministic id.
-    pub fn gl_entry(&self, id: &str) -> Option<GlEntry> {
-        self.store
-            .all_gl_entries(self.company_uuid())
+    pub async fn gl_entry(&self, id: &str) -> Option<GlEntry> {
+        self.all_gl_entries()
+            .await
             .into_iter()
             .find(|entry| entry.id == id)
     }
 
     /// A stock ledger entry by its deterministic id.
-    pub fn stock_ledger_entry(&self, id: &str) -> Option<StockLedgerEntry> {
+    pub async fn stock_ledger_entry(&self, id: &str) -> Option<StockLedgerEntry> {
         self.store
             .all_stock_ledger_entries(self.company_uuid())
+            .await
+            .unwrap()
             .into_iter()
             .find(|sle| sle.id == id)
     }
 
     /// A customer/supplier subledger row by its deterministic id.
-    pub fn party_transaction(&self, id: &str) -> Option<PartyTransaction> {
+    pub async fn party_transaction(&self, id: &str) -> Option<PartyTransaction> {
         self.store
             .all_party_transactions(self.company_uuid())
+            .await
+            .unwrap()
             .into_iter()
             .find(|t| t.id == id)
     }
 
     /// A tax subledger row by its deterministic id.
-    pub fn tax_transaction(&self, id: &str) -> Option<TaxTransaction> {
+    pub async fn tax_transaction(&self, id: &str) -> Option<TaxTransaction> {
         self.store
             .all_tax_transactions(self.company_uuid())
+            .await
+            .unwrap()
             .into_iter()
             .find(|t| t.id == id)
     }
 
-    pub fn party_transaction_count(&self, voucher_no: &str) -> usize {
+    pub async fn party_transaction_count(&self, voucher_no: &str) -> usize {
         self.store
-            .all_party_transactions(self.company_uuid())
-            .iter()
-            .filter(|t| t.voucher_no == voucher_no)
-            .count()
+            .party_transactions_for_voucher(self.company_uuid(), voucher_no)
+            .await
+            .unwrap()
+            .len()
     }
 
-    pub fn tax_transaction_count(&self, voucher_no: &str) -> usize {
+    pub async fn tax_transaction_count(&self, voucher_no: &str) -> usize {
         self.store
-            .all_tax_transactions(self.company_uuid())
-            .iter()
-            .filter(|t| t.voucher_no == voucher_no)
-            .count()
+            .tax_transactions_for_voucher(self.company_uuid(), voucher_no)
+            .await
+            .unwrap()
+            .len()
     }
 
-    pub fn settlement_count(&self, payment_no: &str) -> usize {
+    pub async fn settlement_count(&self, payment_no: &str) -> usize {
         self.store
-            .all_settlements(self.company_uuid())
-            .iter()
-            .filter(|s| s.payment_voucher_no == payment_no)
-            .count()
+            .settlements_for_payment(self.company_uuid(), payment_no)
+            .await
+            .unwrap()
+            .len()
     }
 
-    pub fn bin(&self, item: &str, warehouse: &str) -> Option<Bin> {
+    pub async fn bin(&self, item: &str, warehouse: &str) -> Option<Bin> {
         self.store
             .all_bins(self.company_uuid())
+            .await
+            .unwrap()
             .into_iter()
             .find(|bin| bin.item == item && bin.warehouse == warehouse)
     }
 
-    pub fn outstanding(&self, doctype: &str, id: &str) -> Option<f64> {
+    pub async fn outstanding(&self, doctype: &str, id: &str) -> Option<f64> {
         self.store
-            .document(self.company_uuid(), doctype, id)
+            .posted_document(self.company_uuid(), doctype, id)
+            .await
+            .unwrap()
             .and_then(|doc| {
                 doc.payload
                     .get("outstanding_amount")

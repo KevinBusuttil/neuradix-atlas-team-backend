@@ -233,25 +233,25 @@ async fn run_fixture(file: &str) {
             );
         }
         if let Some(checks) = &action.expect {
-            assert_checks(&app, checks, Some(&body), &step);
+            assert_checks(&app, checks, Some(&body), &step).await;
         }
     }
 
     if let Some(checks) = &fixture.expect {
-        assert_checks(&app, checks, None, &format!("{label} final expectations"));
+        assert_checks(&app, checks, None, &format!("{label} final expectations")).await;
     }
 }
 
-fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step: &str) {
+async fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step: &str) {
     for (account, expected) in &checks.account_balances {
-        let actual = app.account_balance(account);
+        let actual = app.account_balance(account).await;
         assert!(
             approx(actual, *expected),
             "{step}: account {account} balance {actual}, expected {expected}"
         );
     }
     for check in &checks.voucher_accounts {
-        let actual = app.voucher_account(&check.account, &check.voucher);
+        let actual = app.voucher_account(&check.account, &check.voucher).await;
         assert!(
             approx(actual, check.balance),
             "{step}: {} on {} is {actual}, expected {}",
@@ -264,7 +264,7 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
         let (item, warehouse) = key
             .split_once('@')
             .unwrap_or_else(|| panic!("{step}: bin key {key} must be ITEM@WAREHOUSE"));
-        let bin = app.bin(item, warehouse);
+        let bin = app.bin(item, warehouse).await;
         let (qty, value, rate) = bin
             .as_ref()
             .map(|b| (b.actual_qty, b.stock_value, b.valuation_rate))
@@ -287,20 +287,21 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
         }
     }
     for (voucher, expected) in &checks.gl_count {
-        let actual = app.gl_count(voucher);
+        let actual = app.gl_count(voucher).await;
         assert_eq!(actual, *expected, "{step}: GL count for {voucher}");
     }
     for (voucher, expected) in &checks.sle_count {
-        let actual = app.sle_count(voucher);
+        let actual = app.sle_count(voucher).await;
         assert_eq!(actual, *expected, "{step}: SLE count for {voucher}");
     }
     for (payment, expected) in &checks.settlement_count {
-        let actual = app.settlement_count(payment);
+        let actual = app.settlement_count(payment).await;
         assert_eq!(actual, *expected, "{step}: settlement count for {payment}");
     }
     for check in &checks.gl_rows {
         let row = app
             .gl_entry(&check.id)
+            .await
             .unwrap_or_else(|| panic!("{step}: missing GL entry {}", check.id));
         if let Some(account) = &check.account {
             assert_eq!(&row.account, account, "{step}: account for {}", check.id);
@@ -361,6 +362,7 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
     for check in &checks.sle_rows {
         let row = app
             .stock_ledger_entry(&check.id)
+            .await
             .unwrap_or_else(|| panic!("{step}: missing stock ledger entry {}", check.id));
         assert!(
             approx(row.qty_change, check.qty_change),
@@ -388,6 +390,7 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
     for check in &checks.party_rows {
         let row = app
             .party_transaction(&check.id)
+            .await
             .unwrap_or_else(|| panic!("{step}: missing party subledger row {}", check.id));
         assert_eq!(
             row.kind.doctype(),
@@ -435,6 +438,7 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
     for check in &checks.tax_rows {
         let row = app
             .tax_transaction(&check.id)
+            .await
             .unwrap_or_else(|| panic!("{step}: missing tax subledger row {}", check.id));
         assert!(
             approx(row.base_amount, check.base_amount),
@@ -486,14 +490,14 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
         }
     }
     for (voucher, expected) in &checks.party_count {
-        let actual = app.party_transaction_count(voucher);
+        let actual = app.party_transaction_count(voucher).await;
         assert_eq!(
             actual, *expected,
             "{step}: party subledger count for {voucher}"
         );
     }
     for (voucher, expected) in &checks.tax_count {
-        let actual = app.tax_transaction_count(voucher);
+        let actual = app.tax_transaction_count(voucher).await;
         assert_eq!(
             actual, *expected,
             "{step}: tax subledger count for {voucher}"
@@ -505,6 +509,7 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
             .unwrap_or_else(|| panic!("{step}: outstanding key {key} must be Doctype/DocId"));
         let actual = app
             .outstanding(doctype, id)
+            .await
             .unwrap_or_else(|| panic!("{step}: {key} has no outstanding_amount"));
         assert!(
             approx(actual, *expected),
@@ -513,8 +518,8 @@ fn assert_checks(app: &TestApp, checks: &Checks, response: Option<&Value>, step:
     }
     if let Some(gp) = &checks.gross_profit {
         // Revenue is a credit balance, COGS a debit balance.
-        let revenue = -app.account_balance(&gp.income);
-        let cogs = app.account_balance(&gp.cogs);
+        let revenue = -app.account_balance(&gp.income).await;
+        let cogs = app.account_balance(&gp.cogs).await;
         let actual = revenue - cogs;
         assert!(
             approx(actual, gp.value),
