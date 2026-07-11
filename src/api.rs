@@ -866,6 +866,36 @@ pub(crate) fn headers_to_json(headers: &HeaderMap) -> Value {
     Value::Object(map)
 }
 
+/// Refuse intake when the stored backlog for `(kind, provider)` has reached
+/// `ATLAS_WEBHOOK_BACKLOG_MAX` (0 = unlimited). Intake persists every event,
+/// so without a bound an abuser could grow `webhook_events` without limit.
+/// Answering 429 is safe: serious providers retry with backoff — Stripe
+/// documents retrying failed deliveries for days — so once the operator
+/// prunes or raises the cap, refused events are redelivered, not lost.
+///
+/// The bound's dimension is the provider path, not the company: intake
+/// events carry no company attribution (that happens during processing,
+/// e.g. the Stripe processor resolving `client_reference_id`).
+pub(crate) async fn check_webhook_backlog(
+    state: &AppState,
+    kind: WebhookKind,
+    provider: &str,
+) -> Result<(), ApiError> {
+    let max = state.config.webhook_backlog_max;
+    if max <= 0 {
+        return Ok(());
+    }
+    let stored = state.store.count_webhook_events(kind, provider).await?;
+    if stored >= max {
+        tracing::warn!(provider, stored, max, "webhook backlog cap reached");
+        return Err(ApiError::TooManyRequests {
+            message: format!("webhook backlog for {provider} is full; retry later"),
+            retry_after_secs: 60,
+        });
+    }
+    Ok(())
+}
+
 async fn log_webhook(
     state: &AppState,
     kind: WebhookKind,
@@ -873,6 +903,7 @@ async fn log_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    check_webhook_backlog(state, kind, &provider).await?;
     state
         .store
         .insert_webhook_event(WebhookEvent {

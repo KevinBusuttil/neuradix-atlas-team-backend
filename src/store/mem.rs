@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::model::{
     AuditEntry, Company, Device, Invitation, Member, MutationRecord, PayLink, PortalLink, Role,
-    TokenIdentity, User, WebhookEvent,
+    TokenIdentity, User, WebhookEvent, WebhookKind,
 };
 use crate::posting::model::{
     format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction,
@@ -530,6 +530,19 @@ impl Store for MemStore {
         let mut inner = self.inner.lock().unwrap();
         inner.webhooks.push(event);
         Ok(())
+    }
+
+    async fn count_webhook_events(
+        &self,
+        kind: WebhookKind,
+        provider: &str,
+    ) -> Result<i64, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .webhooks
+            .iter()
+            .filter(|event| event.kind == kind && event.provider == provider)
+            .count() as i64)
     }
 
     // ------------------------------------------------------------------

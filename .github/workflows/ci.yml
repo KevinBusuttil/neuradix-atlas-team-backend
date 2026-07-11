@@ -1,7 +1,7 @@
 # Backend CI: format + lint gates, then the test suite against BOTH stores —
 # the default in-memory run and a `postgres:16` service container via
 # ATLAS_TEST_DATABASE_URL (see tests/support/mod.rs), so PgStore (what
-# production runs) is exercised by the same 86 tests that pin MemStore.
+# production runs) is exercised by the same tests that pin MemStore.
 name: CI
 
 on:

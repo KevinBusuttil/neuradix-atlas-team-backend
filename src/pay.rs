@@ -491,7 +491,10 @@ async fn stripe_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    // Durable intake first, exactly like the generic log-only route.
+    // Durable intake first, exactly like the generic log-only route — and
+    // behind the same backlog cap (Stripe retries refused deliveries with
+    // backoff, so a 429 defers the event instead of losing it).
+    crate::api::check_webhook_backlog(&state, WebhookKind::Payment, "stripe").await?;
     state
         .store
         .insert_webhook_event(WebhookEvent {

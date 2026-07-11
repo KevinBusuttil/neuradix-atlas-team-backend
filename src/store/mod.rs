@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::model::{
     AuditEntry, Company, Device, Invitation, Member, MutationRecord, PayLink, PortalLink, Role,
-    TokenIdentity, User, WebhookEvent,
+    TokenIdentity, User, WebhookEvent, WebhookKind,
 };
 use crate::posting::model::{
     Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction, PostedDocument,
@@ -181,6 +181,15 @@ pub trait Store: Send + Sync {
 
     // Webhook intake
     async fn insert_webhook_event(&self, event: WebhookEvent) -> Result<(), StoreError>;
+    /// How many intake events are currently stored for `(kind, provider)` —
+    /// the backlog `ATLAS_WEBHOOK_BACKLOG_MAX` bounds. Events have no company
+    /// attribution at intake time (attribution happens during processing), so
+    /// the bound's dimension is the provider path.
+    async fn count_webhook_events(
+        &self,
+        kind: WebhookKind,
+        provider: &str,
+    ) -> Result<i64, StoreError>;
 
     // ------------------------------------------------------------------
     // Posting authority (Phase 3)

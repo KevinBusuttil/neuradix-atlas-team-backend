@@ -57,6 +57,12 @@ pub struct AppConfig {
     /// Rate limit for the public token-in-path portal/pay pages, per client
     /// (env `ATLAS_RL_PUBLIC_PER_MIN`, default 60; 0 disables).
     pub rl_public_per_min: u32,
+    /// Cap on stored webhook events per (kind, provider path) — the durable
+    /// intake backlog an abuser could otherwise grow without bound (env
+    /// `ATLAS_WEBHOOK_BACKLOG_MAX`, default 1000; 0 disables). Intake past
+    /// the cap answers 429, which is safe: serious providers (Stripe
+    /// documented) retry with backoff for days.
+    pub webhook_backlog_max: i64,
 }
 
 impl Default for AppConfig {
@@ -69,6 +75,7 @@ impl Default for AppConfig {
             rl_auth_per_min: 20,
             rl_webhook_per_min: 120,
             rl_public_per_min: 60,
+            webhook_backlog_max: 1000,
         }
     }
 }
@@ -94,6 +101,10 @@ impl AppConfig {
             rl_auth_per_min: env_parse("ATLAS_RL_AUTH_PER_MIN", defaults.rl_auth_per_min),
             rl_webhook_per_min: env_parse("ATLAS_RL_WEBHOOK_PER_MIN", defaults.rl_webhook_per_min),
             rl_public_per_min: env_parse("ATLAS_RL_PUBLIC_PER_MIN", defaults.rl_public_per_min),
+            webhook_backlog_max: env_parse(
+                "ATLAS_WEBHOOK_BACKLOG_MAX",
+                defaults.webhook_backlog_max,
+            ),
         }
     }
 }

@@ -838,6 +838,21 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn count_webhook_events(
+        &self,
+        kind: WebhookKind,
+        provider: &str,
+    ) -> Result<i64, StoreError> {
+        let count: i64 = sqlx::query_scalar(
+            "select count(*) from webhook_events where kind = $1 and provider = $2",
+        )
+        .bind(kind.as_str())
+        .bind(provider)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     // ------------------------------------------------------------------
     // Posting authority (Phase 3)
     // ------------------------------------------------------------------

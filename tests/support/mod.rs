@@ -80,6 +80,7 @@ pub fn test_config() -> atlas_team_backend::AppConfig {
         rl_auth_per_min: 0,
         rl_webhook_per_min: 0,
         rl_public_per_min: 0,
+        webhook_backlog_max: 0,
         ..atlas_team_backend::AppConfig::default()
     }
 }

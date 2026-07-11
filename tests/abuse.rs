@@ -1,7 +1,8 @@
 //! Abuse protection (Phase 0 increment 0.9): the bootstrap gate on company
-//! creation and the token-bucket rate limits on the unauthenticated
-//! surfaces. Runs over `MemStore` by default; set `ATLAS_TEST_DATABASE_URL`
-//! to run the same tests over `PgStore` (see `tests/support/mod.rs`).
+//! creation, the token-bucket rate limits on the unauthenticated surfaces
+//! and the webhook backlog cap. Runs over `MemStore` by default; set
+//! `ATLAS_TEST_DATABASE_URL` to run the same tests over `PgStore` (see
+//! `tests/support/mod.rs`).
 //!
 //! These tests build their own routers with explicit [`AppConfig`]s instead
 //! of the shared harness — the knobs under test are exactly the ones the
@@ -367,4 +368,84 @@ async fn health_and_authenticated_traffic_are_never_rate_limited() {
         .await;
         assert_eq!(status, StatusCode::OK, "authenticated call {i}: {body}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook backlog cap (ATLAS_WEBHOOK_BACKLOG_MAX)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn webhook_backlog_cap_refuses_with_429_and_bounds_storage() {
+    let app = app_with(AppConfig {
+        webhook_backlog_max: 2,
+        ..support::test_config()
+    })
+    .await;
+    for i in 0..2 {
+        let (status, _, body) = send(
+            &app,
+            Method::POST,
+            "/webhooks/payments/paypal",
+            &[],
+            json!({ "n": i }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "intake {i}: {body}");
+    }
+    // The cap is reached: intake refuses (the provider retries with backoff)
+    // and carries Retry-After.
+    let (status, headers, body) = send(
+        &app,
+        Method::POST,
+        "/webhooks/payments/paypal",
+        &[],
+        json!({ "n": 2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("backlog"));
+    assert!(headers.get(header::RETRY_AFTER).is_some());
+    // Nothing past the cap was stored.
+    assert_eq!(app.store.webhook_events().await.unwrap().len(), 2);
+    // The cap is per (kind, provider): another provider path still ingests.
+    let (status, _, body) = send(
+        &app,
+        Method::POST,
+        "/webhooks/channels/shopify",
+        &[],
+        json!({ "n": 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn stripe_webhook_route_honours_the_backlog_cap() {
+    let app = app_with(AppConfig {
+        webhook_backlog_max: 1,
+        ..support::test_config()
+    })
+    .await;
+    // First delivery is intake-logged, then fails closed (no secret): 503.
+    let (status, _, body) = send(
+        &app,
+        Method::POST,
+        "/webhooks/payments/stripe",
+        &[],
+        json!({ "type": "checkout.session.completed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    // The second is refused before logging: the stripe backlog is full.
+    let (status, headers, body) = send(
+        &app,
+        Method::POST,
+        "/webhooks/payments/stripe",
+        &[],
+        json!({ "type": "checkout.session.completed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(headers.get(header::RETRY_AFTER).is_some());
+    assert_eq!(app.store.webhook_events().await.unwrap().len(), 1);
 }

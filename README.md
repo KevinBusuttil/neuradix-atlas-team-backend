@@ -83,6 +83,7 @@ All read once at startup.
 | `ATLAS_RL_AUTH_PER_MIN` | `20` | Per-client budget (requests/min) for the unauthenticated auth-ish endpoints: `POST /companies`, `POST /invitations/{token}/accept`. `0` disables |
 | `ATLAS_RL_WEBHOOK_PER_MIN` | `120` | Per-**provider-path** budget for webhook intake (`/webhooks/payments/{provider}`, `/webhooks/channels/{connector}`, incl. the verified Stripe route). `0` disables |
 | `ATLAS_RL_PUBLIC_PER_MIN` | `60` | Per-client budget for the public token-in-path portal/pay pages (`/portal/{token}…`, `/pay/{token}`). `0` disables |
+| `ATLAS_WEBHOOK_BACKLOG_MAX` | `1000` | Cap on **stored** webhook events per (kind, provider path). At the cap, intake answers 429 + `Retry-After` instead of persisting — safe, because serious providers (Stripe documented) retry with backoff for days. `0` disables |
 | `ATLAS_USER_TOKEN_TTL_DAYS` | `30` | Absolute lifetime of newly issued user tokens |
 | `ATLAS_SYNC_PULL_PAGE_SIZE` | `200` | Server-side cap on mutations per `/sync/pull` page |
 | `ATLAS_MAX_BLOB_MB` | `25` | Maximum accepted blob upload size (MiB) |
@@ -508,7 +509,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 86 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 99 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection); no DB required
 
 # The SAME suite over PgStore (what production runs): point the harness at a
 # disposable Postgres server's admin URL. Every test creates its own uniquely
