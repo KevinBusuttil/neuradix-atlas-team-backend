@@ -70,12 +70,18 @@ impl Drop for PgTestDb {
     }
 }
 
-/// Baseline configuration for the shared harness: no bootstrap gate and no
-/// Stripe secret. Abuse-protection knobs added by later config fields default
-/// off here — the suite runs massively in parallel and must never trip them;
-/// dedicated tests construct apps with tiny limits instead.
+/// Baseline configuration for the shared harness: no bootstrap gate, no
+/// Stripe secret, and every rate limit at 0 (disabled) — the suite runs
+/// massively in parallel and in-process requests all share one limiter key,
+/// so real limits would trip constantly. Dedicated tests (`tests/abuse.rs`)
+/// construct apps with tiny limits instead.
 pub fn test_config() -> atlas_team_backend::AppConfig {
-    atlas_team_backend::AppConfig::default()
+    atlas_team_backend::AppConfig {
+        rl_auth_per_min: 0,
+        rl_webhook_per_min: 0,
+        rl_public_per_min: 0,
+        ..atlas_team_backend::AppConfig::default()
+    }
 }
 
 /// Builds the store under test: MemStore by default, or a PgStore over a

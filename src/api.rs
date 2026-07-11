@@ -76,14 +76,40 @@ fn user_token_expires_at() -> chrono::DateTime<Utc> {
 }
 
 pub fn router(state: AppState) -> Router {
+    use axum::middleware::from_fn_with_state;
+
+    // Rate-limited unauthenticated surfaces (see `crate::limit`). Grouped so
+    // `route_layer` wraps exactly these routes: authenticated traffic —
+    // notably device sync polling — is deliberately never rate-limited, and
+    // neither is `/health`.
+    let auth_limited = Router::new()
+        .route("/companies", post(create_company))
+        .route("/invitations/{token}/accept", post(accept_invitation))
+        .route_layer(from_fn_with_state(state.clone(), crate::limit::limit_auth));
+    let webhook_limited = Router::new()
+        .route("/webhooks/payments/{provider}", post(webhook_payment))
+        .route("/webhooks/channels/{connector}", post(webhook_channel))
+        // Verified Stripe processing lives on the same frozen /webhooks/...
+        // surface and shares the per-provider-path budget.
+        .merge(crate::pay::webhook_routes())
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            crate::limit::limit_webhook,
+        ));
+    // The token-in-path portal/pay planes: public surface, client-keyed.
+    let public_limited = crate::portal::public_routes()
+        .merge(crate::pay::public_routes())
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            crate::limit::limit_public,
+        ));
+
     Router::new()
         .route("/health", get(health))
-        .route("/companies", post(create_company))
         .route(
             "/companies/{company_id}/invitations",
             post(create_invitation),
         )
-        .route("/invitations/{token}/accept", post(accept_invitation))
         .route(
             "/companies/{company_id}/devices",
             post(register_device).get(list_devices),
@@ -114,8 +140,6 @@ pub fn router(state: AppState) -> Router {
                 // router-wide JSON cap below.
                 .layer(DefaultBodyLimit::max(max_blob_bytes())),
         )
-        .route("/webhooks/payments/{provider}", post(webhook_payment))
-        .route("/webhooks/channels/{connector}", post(webhook_channel))
         .route("/companies/{company_id}/audit", get(read_audit))
         .route(
             "/companies/{company_id}/settings",
@@ -130,10 +154,13 @@ pub fn router(state: AppState) -> Router {
             "/companies/{company_id}/commands/cancel-document",
             post(cancel_document),
         )
-        // Portal-link management + the token-scoped portal plane.
-        .merge(crate::portal::routes())
-        // Pay-link management + the token-scoped pay plane.
-        .merge(crate::pay::routes())
+        // Portal-link + pay-link management (bearer auth, not rate-limited).
+        .merge(crate::portal::management_routes())
+        .merge(crate::pay::management_routes())
+        // The rate-limited unauthenticated groups built above.
+        .merge(auth_limited)
+        .merge(webhook_limited)
+        .merge(public_limited)
         // Explicit request-body cap on every route registered above (blob
         // upload carries its own higher per-route limit). An oversized body
         // is rejected by the extractor with a plain 413, before any handler

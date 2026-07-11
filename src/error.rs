@@ -28,6 +28,13 @@ pub enum ApiError {
     Gone(String),
     #[error("{0}")]
     Unprocessable(String),
+    /// 429 with a `Retry-After` header — a rate limit or intake cap tripped;
+    /// the request is safe to retry after the given number of seconds.
+    #[error("{message}")]
+    TooManyRequests {
+        message: String,
+        retry_after_secs: u64,
+    },
     /// 503 — a required piece of configuration is missing (e.g. the Stripe
     /// webhook secret); the request may succeed once the operator fixes it.
     #[error("{0}")]
@@ -47,6 +54,7 @@ impl ApiError {
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Gone(_) => StatusCode::GONE,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -59,7 +67,16 @@ impl IntoResponse for ApiError {
             tracing::error!(error = %err, "internal error");
         }
         let status = self.status();
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        let mut response = (status, Json(json!({ "error": self.to_string() }))).into_response();
+        if let ApiError::TooManyRequests {
+            retry_after_secs, ..
+        } = self
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, retry_after_secs.into());
+        }
+        response
     }
 }
 

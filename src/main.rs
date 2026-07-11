@@ -27,6 +27,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(8080);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("atlas-team-backend listening on port {port}");
-    axum::serve(listener, atlas_team_backend::router(store)).await?;
+    // ConnectInfo gives the rate limiter the socket peer address to key on
+    // when ATLAS_TRUST_PROXY=0 (no proxy in front appending X-Forwarded-For).
+    axum::serve(
+        listener,
+        atlas_team_backend::router(store)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

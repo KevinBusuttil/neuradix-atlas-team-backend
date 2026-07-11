@@ -65,7 +65,8 @@ pub const PAYMENTS_DEVICE_ID: &str = "atlas-payments";
 /// tolerance): staler events are rejected as possible replays.
 const MAX_SIGNATURE_SKEW_SECONDS: i64 = 300;
 
-pub fn routes() -> Router<AppState> {
+/// Management-plane routes (existing bearer auth, owner/admin/sales/accountant).
+pub fn management_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/companies/{company_id}/pay-links",
@@ -75,11 +76,21 @@ pub fn routes() -> Router<AppState> {
             "/companies/{company_id}/pay-links/{link_id}",
             delete(revoke_link),
         )
-        .route("/pay/{token}", get(pay_page))
-        // Signature-verified Stripe processing; the path is frozen under the
-        // /webhooks/... surface (domain doc §9) and takes precedence over the
-        // generic log-only /webhooks/payments/{provider} intake route.
-        .route("/webhooks/payments/stripe", post(stripe_webhook))
+}
+
+/// The public token-in-path pay page. Registered separately so the router
+/// can wrap exactly this route in the public rate limiter.
+pub fn public_routes() -> Router<AppState> {
+    Router::new().route("/pay/{token}", get(pay_page))
+}
+
+/// Signature-verified Stripe processing; the path is frozen under the
+/// /webhooks/... surface (domain doc §9) and takes precedence over the
+/// generic log-only /webhooks/payments/{provider} intake route. Registered
+/// separately so the router can wrap it in the per-provider webhook rate
+/// limiter alongside the generic intake routes.
+pub fn webhook_routes() -> Router<AppState> {
+    Router::new().route("/webhooks/payments/stripe", post(stripe_webhook))
 }
 
 // ---------------------------------------------------------------------------

@@ -79,9 +79,20 @@ All read once at startup.
 | `PORT` | `8080` | Listen port |
 | `STRIPE_WEBHOOK_SECRET` | unset | Stripe webhook signing secret. Unset ⇒ `/webhooks/payments/stripe` fails **closed** (503, events logged but never processed) |
 | `ATLAS_BOOTSTRAP_TOKEN` | unset | When set, `POST /companies` requires the matching `X-Atlas-Bootstrap-Token` header (constant-time comparison; 403 otherwise). Unset ⇒ company creation stays open (self-hoster default) and startup logs a WARN saying so |
+| `ATLAS_TRUST_PROXY` | `1` | `1` ⇒ the rate limiter keys clients by the **first** `X-Forwarded-For` address (correct behind nginx, which appends the real peer). Self-hosters exposing the port **directly** must set `0` — otherwise clients can forge the header to dodge buckets — which switches keying to the socket peer address |
+| `ATLAS_RL_AUTH_PER_MIN` | `20` | Per-client budget (requests/min) for the unauthenticated auth-ish endpoints: `POST /companies`, `POST /invitations/{token}/accept`. `0` disables |
+| `ATLAS_RL_WEBHOOK_PER_MIN` | `120` | Per-**provider-path** budget for webhook intake (`/webhooks/payments/{provider}`, `/webhooks/channels/{connector}`, incl. the verified Stripe route). `0` disables |
+| `ATLAS_RL_PUBLIC_PER_MIN` | `60` | Per-client budget for the public token-in-path portal/pay pages (`/portal/{token}…`, `/pay/{token}`). `0` disables |
 | `ATLAS_USER_TOKEN_TTL_DAYS` | `30` | Absolute lifetime of newly issued user tokens |
 | `ATLAS_SYNC_PULL_PAGE_SIZE` | `200` | Server-side cap on mutations per `/sync/pull` page |
 | `ATLAS_MAX_BLOB_MB` | `25` | Maximum accepted blob upload size (MiB) |
+
+Rate limiting is an in-process token bucket (capacity = the per-minute
+budget, continuous refill). Over-limit requests get **429** with a JSON
+`{"error": ...}` body and a `Retry-After` header. Authenticated traffic —
+notably device sync polling — and `/health` are deliberately **never**
+rate-limited: devices poll frequently by design, and authenticated calls are
+attributable and revocable per token.
 
 ### Backup / restore
 

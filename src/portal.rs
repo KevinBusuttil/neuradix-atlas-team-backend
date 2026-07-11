@@ -49,7 +49,8 @@ const SALES_INVOICE: &str = "Sales Invoice";
 /// Doctypes a customer link may read.
 const CUSTOMER_DOCTYPES: [&str; 2] = [QUOTATION, SALES_INVOICE];
 
-pub fn routes() -> Router<AppState> {
+/// Management-plane routes (existing bearer auth, owner/admin).
+pub fn management_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/companies/{company_id}/portal-links",
@@ -59,6 +60,12 @@ pub fn routes() -> Router<AppState> {
             "/companies/{company_id}/portal-links/{link_id}",
             delete(revoke_link),
         )
+}
+
+/// The public token-in-path portal plane. Registered separately so the
+/// router can wrap exactly these routes in the public rate limiter.
+pub fn public_routes() -> Router<AppState> {
+    Router::new()
         .route("/portal/{token}", get(portal_summary))
         .route(
             "/portal/{token}/documents/{doctype}/{document_id}",
