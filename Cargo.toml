@@ -17,6 +17,9 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Constant-time equality for shared-secret comparison (already in the tree
+# via rustls/hmac; taking it directly keeps the comparison explicit).
+subtle = "2"
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

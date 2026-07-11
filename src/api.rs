@@ -15,7 +15,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::auth::{generate_token, hash_token, require_membership, require_role, AuthContext};
+use crate::auth::{
+    constant_time_eq, generate_token, hash_token, require_membership, require_role, AuthContext,
+};
 use crate::error::ApiError;
 use crate::model::{
     AuditEntry, Device, Invitation, MutationRecord, Role, WebhookEvent, WebhookKind,
@@ -183,12 +185,36 @@ struct CreateCompanyRequest {
     owner_name: String,
 }
 
+/// The header carrying the bootstrap shared secret when `ATLAS_BOOTSTRAP_TOKEN`
+/// gates company creation.
+pub const BOOTSTRAP_TOKEN_HEADER: &str = "x-atlas-bootstrap-token";
+
 /// Bootstrap: create company + owner user + owner membership, return a user
 /// token (roadmap §6 criterion 1).
+///
+/// When the operator configured `ATLAS_BOOTSTRAP_TOKEN`, the request must
+/// carry the matching [`BOOTSTRAP_TOKEN_HEADER`] (compared in constant time);
+/// otherwise creation stays open — the self-hoster default, warned about at
+/// startup.
 async fn create_company(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateCompanyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(expected) = state.config.bootstrap_token.as_deref() {
+        let provided = headers
+            .get(BOOTSTRAP_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !constant_time_eq(provided, expected) {
+            return Err(ApiError::ForbiddenReason(
+                "company creation is gated on this instance: send the correct \
+                 X-Atlas-Bootstrap-Token header (the operator-configured \
+                 ATLAS_BOOTSTRAP_TOKEN value)"
+                    .into(),
+            ));
+        }
+    }
     if req.name.trim().is_empty() || req.owner_email.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "name and owner_email are required".into(),

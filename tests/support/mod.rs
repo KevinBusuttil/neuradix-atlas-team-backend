@@ -70,6 +70,14 @@ impl Drop for PgTestDb {
     }
 }
 
+/// Baseline configuration for the shared harness: no bootstrap gate and no
+/// Stripe secret. Abuse-protection knobs added by later config fields default
+/// off here — the suite runs massively in parallel and must never trip them;
+/// dedicated tests construct apps with tiny limits instead.
+pub fn test_config() -> atlas_team_backend::AppConfig {
+    atlas_team_backend::AppConfig::default()
+}
+
 /// Builds the store under test: MemStore by default, or a PgStore over a
 /// fresh, isolated, fully migrated database when `ATLAS_TEST_DATABASE_URL`
 /// is set.
@@ -155,7 +163,11 @@ impl TestApp {
     /// (`None` = unset, the webhook endpoint fails closed).
     pub async fn with_stripe_secret(secret: Option<&str>) -> Self {
         let (store, db) = test_store().await;
-        let router = atlas_team_backend::router_with(store.clone(), secret.map(str::to_string));
+        let config = atlas_team_backend::AppConfig {
+            stripe_webhook_secret: secret.map(str::to_string),
+            ..test_config()
+        };
+        let router = atlas_team_backend::router_with(store.clone(), config);
         let mut app = Self {
             router,
             store,

@@ -49,6 +49,16 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Constant-time equality for shared secrets presented in headers (the
+/// bootstrap gate). Both sides are hashed first, so neither the length nor a
+/// matching prefix of the configured secret leaks through timing.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let a = Sha256::digest(a.as_bytes());
+    let b = Sha256::digest(b.as_bytes());
+    a.as_slice().ct_eq(b.as_slice()).into()
+}
+
 /// Authenticated caller, resolved from the `Authorization: Bearer` header.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthContext(pub TokenIdentity);

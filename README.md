@@ -69,6 +69,20 @@ non-local. A Caddy TLS proxy stub is provided (`Caddyfile` + the commented
 
 Running against an existing Postgres instead: `DATABASE_URL=postgres://... cargo run`.
 
+### Configuration (environment variables)
+
+All read once at startup.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | — (required unless `--mem`) | Postgres connection string; migrations are applied on startup |
+| `PORT` | `8080` | Listen port |
+| `STRIPE_WEBHOOK_SECRET` | unset | Stripe webhook signing secret. Unset ⇒ `/webhooks/payments/stripe` fails **closed** (503, events logged but never processed) |
+| `ATLAS_BOOTSTRAP_TOKEN` | unset | When set, `POST /companies` requires the matching `X-Atlas-Bootstrap-Token` header (constant-time comparison; 403 otherwise). Unset ⇒ company creation stays open (self-hoster default) and startup logs a WARN saying so |
+| `ATLAS_USER_TOKEN_TTL_DAYS` | `30` | Absolute lifetime of newly issued user tokens |
+| `ATLAS_SYNC_PULL_PAGE_SIZE` | `200` | Server-side cap on mutations per `/sync/pull` page |
+| `ATLAS_MAX_BLOB_MB` | `25` | Maximum accepted blob upload size (MiB) |
+
 ### Backup / restore
 
 ```sh
@@ -91,7 +105,7 @@ missing or unknown).
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | Liveness: `{"status":"ok"}` |
-| POST | `/companies` | none (bootstrap) | `{name, owner_email, owner_name}` → company + owner + owner membership; returns a user token |
+| POST | `/companies` | none (bootstrap; `X-Atlas-Bootstrap-Token` when `ATLAS_BOOTSTRAP_TOKEN` is set) | `{name, owner_email, owner_name}` → company + owner + owner membership; returns a user token |
 | POST | `/companies/{id}/invitations` | user/device token, **owner or admin** | `{email, role}` → `{token, expiresAt}` (7-day expiry) |
 | POST | `/invitations/{token}/accept` | none (token is the credential) | `{display_name}` → creates/joins user + membership; returns a user token |
 | POST | `/companies/{id}/devices` | user token | `{name}` → `{deviceId, deviceToken}` |

@@ -495,7 +495,7 @@ async fn stripe_webhook(
 
     // Fail closed: without a secret nothing can be verified, and unverified
     // events are never processed.
-    let Some(secret) = state.stripe_webhook_secret.as_deref() else {
+    let Some(secret) = state.config.stripe_webhook_secret.as_deref() else {
         tracing::error!(
             "STRIPE_WEBHOOK_SECRET is not configured; refusing to process the Stripe event"
         );

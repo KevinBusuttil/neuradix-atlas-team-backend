@@ -26,7 +26,7 @@ struct App {
 impl App {
     async fn new() -> Self {
         let (store, db) = support::test_store().await;
-        let router = atlas_team_backend::router(store.clone());
+        let router = atlas_team_backend::router_with(store.clone(), support::test_config());
         Self {
             router,
             store,

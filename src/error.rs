@@ -13,6 +13,11 @@ pub enum ApiError {
     Unauthorized,
     #[error("forbidden")]
     Forbidden,
+    /// 403 with a caller-actionable message (the bare [`ApiError::Forbidden`]
+    /// stays a plain "forbidden" — use this when the caller needs to know
+    /// *why*, e.g. the bootstrap gate).
+    #[error("{0}")]
+    ForbiddenReason(String),
     #[error("not found")]
     NotFound,
     #[error("{0}")]
@@ -36,6 +41,7 @@ impl ApiError {
         match self {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden => StatusCode::FORBIDDEN,
+            ApiError::ForbiddenReason(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
