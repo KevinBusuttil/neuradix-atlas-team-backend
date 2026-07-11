@@ -222,7 +222,8 @@ async fn expired_pay_links_are_not_found() {
             company_id: app.company_uuid(),
             invoice_id: "SINV-E1".into(),
             token_hash: hash_token(&token),
-            created_by: Uuid::new_v4(),
+            // A real user: PgStore enforces the created_by foreign key.
+            created_by: app.owner_uuid(),
             created_at: Utc::now() - Duration::days(61),
             expires_at,
             revoked_at: None,

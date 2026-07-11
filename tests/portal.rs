@@ -542,7 +542,8 @@ async fn expired_links_are_not_found() {
             party: Some("CUST-A".into()),
             label: None,
             token_hash: hash_token(&token),
-            created_by: Uuid::new_v4(),
+            // A real user: PgStore enforces the created_by foreign key.
+            created_by: app.owner_uuid(),
             created_at: Utc::now() - Duration::days(91),
             expires_at,
             revoked_at: None,
