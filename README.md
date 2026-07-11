@@ -483,7 +483,13 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 60 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+cargo test          # 86 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments); no DB required
+
+# The SAME suite over PgStore (what production runs): point the harness at a
+# disposable Postgres server's admin URL. Every test creates its own uniquely
+# named database, migrates it via PgStore::connect and drops it afterwards,
+# so parallel tests stay isolated and nothing is left behind. CI runs both.
+ATLAS_TEST_DATABASE_URL=postgres://atlas:atlas@localhost:5432/atlas cargo test
 ```
 
 Schema lives in `migrations/` (applied by `PgStore::connect` via embedded SQLx
