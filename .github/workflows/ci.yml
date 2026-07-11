@@ -1,0 +1,57 @@
+# Backend CI: format + lint gates, then the test suite against BOTH stores —
+# the default in-memory run and a `postgres:16` service container via
+# ATLAS_TEST_DATABASE_URL (see tests/support/mod.rs), so PgStore (what
+# production runs) is exercised by the same 86 tests that pin MemStore.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-mem:
+    name: fmt, clippy, tests (MemStore)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rust-toolchain.toml channel)
+        run: rustup show active-toolchain && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: tests (in-memory store)
+        run: cargo test
+
+  test-postgres:
+    name: tests (PgStore, postgres:16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: atlas
+          POSTGRES_PASSWORD: atlas
+          POSTGRES_DB: atlas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atlas -d atlas"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rust-toolchain.toml channel)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: tests (Postgres store)
+        env:
+          # Admin URL; every test creates and drops its own database.
+          ATLAS_TEST_DATABASE_URL: postgres://atlas:atlas@localhost:5432/atlas
+        run: cargo test
