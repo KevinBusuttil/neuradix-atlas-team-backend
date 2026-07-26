@@ -401,11 +401,20 @@ async fn accept_invitation(
             at: Utc::now(),
         })
         .await?;
+    // The joining client stores the session from this response alone; give
+    // it the company NAME too, or its Connected card can only show the id.
+    let company_name = state
+        .store
+        .company(invitation.company_id)
+        .await?
+        .map(|company| company.name)
+        .unwrap_or_default();
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "userId": user.id,
             "companyId": invitation.company_id,
+            "companyName": company_name,
             "role": invitation.role,
             "token": user_token,
         })),

@@ -147,6 +147,12 @@ async fn join_member(app: &App, boot: &Boot, email: &str, role: &str) -> (String
         .await;
     assert_eq!(status, StatusCode::CREATED, "accept failed: {body}");
     assert_eq!(body["companyId"].as_str().unwrap(), boot.company_id);
+    // The joining client builds its stored session from this response
+    // alone — the company NAME must ride along (Connected-card fix).
+    assert!(
+        !body["companyName"].as_str().unwrap().is_empty(),
+        "accept response without companyName: {body}"
+    );
     assert_eq!(body["role"].as_str().unwrap(), role);
     (
         body["userId"].as_str().unwrap().to_string(),
