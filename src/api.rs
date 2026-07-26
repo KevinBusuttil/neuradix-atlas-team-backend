@@ -559,7 +559,10 @@ async fn rotate_user_token(
             Some(expires_at),
         )
         .await?;
-    state.store.delete_user_token(&hash_token(presented)).await?;
+    state
+        .store
+        .delete_user_token(&hash_token(presented))
+        .await?;
     audit(
         &state,
         company_id,
