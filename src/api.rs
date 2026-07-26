@@ -628,10 +628,8 @@ async fn remove_member(
                 ));
             }
         }
-        Role::Admin => {
-            if role == Role::Admin && user_id != auth.user_id() {
-                return Err(ApiError::Forbidden);
-            }
+        Role::Admin if role == Role::Admin && user_id != auth.user_id() => {
+            return Err(ApiError::Forbidden);
         }
         _ => {}
     }
