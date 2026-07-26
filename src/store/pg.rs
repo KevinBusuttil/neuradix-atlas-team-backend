@@ -505,6 +505,14 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn delete_user_token(&self, token_hash: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("delete from user_tokens where token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn resolve_token(&self, token_hash: &str) -> Result<Option<TokenIdentity>, StoreError> {
         let device = sqlx::query(
             "select id, user_id, company_id from devices \

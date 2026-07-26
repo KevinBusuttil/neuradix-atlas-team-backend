@@ -945,6 +945,89 @@ async fn every_mutating_action_writes_an_audit_row() {
 }
 
 // ---------------------------------------------------------------------------
+// Credential lifecycle: user-token rotation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn user_token_rotation_swaps_the_credential() {
+    let app = App::new().await;
+    let boot = bootstrap(&app).await;
+    let rotate = format!("/companies/{}/tokens/rotate", boot.company_id);
+    let members = format!("/companies/{}/members", boot.company_id);
+    // Invite the member while the owner token is still live — rotation
+    // comes next.
+    let (_, sales_token) = join_member(&app, &boot, "sales@example.com", "sales").await;
+
+    // Rotating with the owner token mints a fresh one with an expiry.
+    let (status, body) = app
+        .json(Method::POST, &rotate, Some(&boot.owner_token), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "rotate failed: {body}");
+    let new_token = body["token"].as_str().unwrap().to_string();
+    assert_ne!(new_token, boot.owner_token);
+    assert!(body["expiresAt"].is_string());
+
+    // The presented (old) token no longer resolves…
+    let (status, _) = app.get(&members, Some(&boot.owner_token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // …while the new one carries the same owner identity and role.
+    let (status, body) = app.get(&members, Some(&new_token)).await;
+    assert_eq!(status, StatusCode::OK, "new token rejected: {body}");
+    let me = body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["userId"].as_str().unwrap() == boot.owner_user_id)
+        .unwrap()
+        .clone();
+    assert_eq!(me["role"].as_str().unwrap(), "owner");
+
+    // Rotating again with the new token also works (repeatable operation)…
+    let (status, body) = app
+        .json(Method::POST, &rotate, Some(&new_token), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "second rotate failed: {body}");
+    let third_token = body["token"].as_str().unwrap().to_string();
+    let (status, _) = app.get(&members, Some(&new_token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = app.get(&members, Some(&third_token)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // …a member (not just the owner) may rotate their own token…
+    let (status, body) = app
+        .json(Method::POST, &rotate, Some(&sales_token), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "member rotate failed: {body}");
+    let (status, _) = app.get(&members, Some(&sales_token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // …and a DEVICE token cannot rotate: devices re-register or revoke.
+    let (_, device_token) =
+        register_device(&app, &boot.company_id, &third_token, "Front desk").await;
+    let (status, body) = app
+        .json(Method::POST, &rotate, Some(&device_token), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "device rotate: {body}");
+
+    // The rotation is on the audit trail.
+    let (_, body) = app
+        .get(
+            &format!("/companies/{}/audit", boot.company_id),
+            Some(&third_token),
+        )
+        .await;
+    assert!(
+        body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == json!("token.rotate")),
+        "no token.rotate audit row: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Credential lifecycle (increment 0.5): device management
 // ---------------------------------------------------------------------------
 

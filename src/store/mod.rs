@@ -100,6 +100,10 @@ pub trait Store: Send + Sync {
     /// Resolves a member/device bearer token. Revoked device tokens and
     /// expired user tokens do not resolve.
     async fn resolve_token(&self, token_hash: &str) -> Result<Option<TokenIdentity>, StoreError>;
+    /// Deletes a USER token (rotation: the new token is inserted first, then
+    /// the presented one is deleted). Returns whether a row existed. Device
+    /// tokens are never touched here — they revoke via `revoke_device`.
+    async fn delete_user_token(&self, token_hash: &str) -> Result<bool, StoreError>;
 
     // Invitations (tokens stored hashed, like every other credential)
     async fn create_invitation(&self, invitation: Invitation) -> Result<(), StoreError>;

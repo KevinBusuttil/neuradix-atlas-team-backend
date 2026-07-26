@@ -319,6 +319,11 @@ impl Store for MemStore {
             }))
     }
 
+    async fn delete_user_token(&self, token_hash: &str) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner.user_tokens.remove(token_hash).is_some())
+    }
+
     async fn create_invitation(&self, invitation: Invitation) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
         if inner

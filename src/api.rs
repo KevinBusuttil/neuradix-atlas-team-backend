@@ -118,6 +118,10 @@ pub fn router(state: AppState) -> Router {
             "/companies/{company_id}/devices/{device_id}/revoke",
             post(revoke_device),
         )
+        .route(
+            "/companies/{company_id}/tokens/rotate",
+            post(rotate_user_token),
+        )
         .route("/companies/{company_id}/members", get(list_members))
         .route(
             "/companies/{company_id}/members/{user_id}",
@@ -518,6 +522,53 @@ async fn revoke_device(
     Ok(Json(
         json!({ "id": device.id, "revokedAt": device.revoked_at }),
     ))
+}
+
+/// Rotate the CALLING user token: mint a replacement for the same user and
+/// company, then delete the presented one — after this response, the old
+/// token no longer resolves. Any member may rotate their own token; device
+/// tokens cannot rotate (a device re-registers or is revoked instead).
+/// Insert-before-delete: a failure between the two steps leaves both tokens
+/// valid rather than locking the user out.
+async fn rotate_user_token(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    headers: HeaderMap,
+    Path(company_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    if auth.device_id().is_some() {
+        return Err(ApiError::BadRequest(
+            "only a user token can rotate itself; devices re-register or are revoked".into(),
+        ));
+    }
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+
+    let new_token = generate_token();
+    let expires_at = user_token_expires_at();
+    state
+        .store
+        .insert_user_token(
+            &hash_token(&new_token),
+            auth.user_id(),
+            company_id,
+            Some(expires_at),
+        )
+        .await?;
+    state.store.delete_user_token(&hash_token(presented)).await?;
+    audit(
+        &state,
+        company_id,
+        Some(&auth),
+        "token.rotate",
+        json!({ "userId": auth.user_id() }),
+    )
+    .await?;
+    Ok(Json(json!({ "token": new_token, "expiresAt": expires_at })))
 }
 
 // ---------------------------------------------------------------------------
