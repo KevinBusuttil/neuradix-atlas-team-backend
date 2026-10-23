@@ -218,9 +218,11 @@ attributed) inside the same transaction as the posting.
 contract** (plan §5): each file is `{setup, actions, expect}`, driven here over
 the command API + `MemStore` by `tests/fixtures.rs`. Fixture
 `0001-mandatory-perpetual-inventory.json` is the mandatory acceptance scenario
-verbatim; the Dart side runs the same scenario today as
-`mercantis.hub.flutter/test/stock_cogs_acceptance_test.dart` (JSON-driving the
-Dart engine from these files is future work). The rest: `0002` FIFO costing
+verbatim. The hub drives **the same files** through the Solo engine
+(`mercantis.hub.flutter/test/accounting_contract_test.dart`, copies in
+`test/fixtures/accounting_contract`, drift check
+`tool/check_accounting_contract.sh`). All 12 pass on both engines, and a
+fixture change here must be synced there. The rest: `0002` FIFO costing
 incl. shortfall fallback, `0003` negative-stock rejection, `0004` adjustment
 up/down, `0005` payment settlement + outstanding, `0006` period lock, `0007`
 role rejection, `0008` value-neutral transfer.
