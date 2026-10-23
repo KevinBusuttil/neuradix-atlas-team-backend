@@ -137,7 +137,7 @@ missing or unknown).
 | POST | `/webhooks/channels/{connector}` | none (verification is later work) | Same log-only intake, `kind = channel` |
 | GET | `/companies/{id}/audit?limit=n` | **owner, admin or accountant** | Recent audit rows (newest first) |
 | GET / PUT | `/companies/{id}/settings` | member / **owner, admin or accountant** | Company posting settings (merge-patch): `allow_negative_stock`, `books_lock_date`, default posting accounts |
-| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}` |
+| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}`. Optional: an item missing from the registry is read from the synced `Item` document (same fields, `uoms` child table) |
 | POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, party_transactions, tax_transactions, bins, settlements}` |
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 
@@ -561,7 +561,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 119 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation); no DB required
+cargo test          # 120 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation); no DB required
 
 # The SAME suite over PgStore (what production runs): point the harness at a
 # disposable Postgres server's admin URL. Every test creates its own uniquely

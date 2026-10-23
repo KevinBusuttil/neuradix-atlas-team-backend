@@ -21,7 +21,8 @@ use uuid::Uuid;
 use crate::model::AuditEntry;
 use crate::posting::model::{
     series_key, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
-    PostingBatch, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction, POSTED_DOCTYPES,
+    PostingBatch, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction, UomConversion,
+    POSTED_DOCTYPES,
 };
 use crate::posting::stock::{compute_balance, issue_rate, LedgerRow};
 use crate::posting::values::{
@@ -1642,11 +1643,80 @@ async fn load_items(
     }
     ids.sort();
     ids.dedup();
-    let items = store.items(company_id, &ids).await?;
-    Ok(items
+    let mut items: HashMap<String, Item> = store
+        .items(company_id, &ids)
+        .await?
         .into_iter()
         .map(|item| (item.id.clone(), item))
-        .collect())
+        .collect();
+    // The registry is optional: clients sync their Item master as ordinary
+    // documents, so an id the registry lacks is read from that synced master
+    // (stock/service, valuation method, stock UOM and conversions). Without
+    // this a service line would post SLEs and split to GRNI, and a FIFO or
+    // alternative-UOM item would be costed as Moving Average in stock units.
+    let missing: Vec<String> = ids
+        .into_iter()
+        .filter(|id| !items.contains_key(id))
+        .collect();
+    for id in missing {
+        if let Some(doc) = store.company_document(company_id, "Item", &id).await? {
+            items.insert(id.clone(), item_from_master(&id, &doc));
+        }
+    }
+    Ok(items)
+}
+
+/// Maps a synced Item document (the `company_documents` read model) to the
+/// posting engine's item settings, with the Dart `isStockItem` / `uomFactor`
+/// semantics: `item_type` wins, the legacy `is_stock_item` flag is the
+/// fallback, and conversions come from the `uoms` child table.
+fn item_from_master(id: &str, doc: &crate::projection::CompanyDocument) -> Item {
+    let fields = doc.payload.as_object().cloned().unwrap_or_default();
+    let item_type = match as_non_empty(fields.get("item_type")) {
+        Some(kind) => kind,
+        None if fields.get("is_stock_item").is_some() && !is_true(fields.get("is_stock_item")) => {
+            "Service".to_string()
+        }
+        None => "Stock".to_string(),
+    };
+    let uoms = doc
+        .children
+        .as_ref()
+        .and_then(|children| children.get("uoms"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    // Child rows carry their fields as a JSON-encoded string
+                    // (the Dart envelope) or, from other writers, an object.
+                    let fields = match row.get("payload") {
+                        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).ok()?,
+                        Some(other) => other.clone(),
+                        None => row.clone(),
+                    };
+                    let uom = as_non_empty(fields.get("uom"))?;
+                    let factor = fields.get("conversion_factor").and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })?;
+                    (factor > 0.0).then_some(UomConversion {
+                        uom,
+                        conversion_factor: factor,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Item {
+        id: id.to_string(),
+        item_type,
+        valuation_method: as_non_empty(fields.get("valuation_method")),
+        stock_uom: as_non_empty(fields.get("stock_uom")),
+        uoms,
+        inventory_account: as_non_empty(fields.get("inventory_account")),
+        cogs_account: as_non_empty(fields.get("cogs_account")),
+        stock_adjustment_account: as_non_empty(fields.get("stock_adjustment_account")),
+    }
 }
 
 /// Costs the voucher's outgoing rows at the item's valuation method (issues

@@ -480,3 +480,95 @@ async fn pull_reports_the_log_head_so_clients_detect_a_restored_server() {
     assert_eq!(body["mutations"], json!([]));
     assert_eq!(body["head"], 2);
 }
+
+/// An Item master synced by a device the way the hub saves it: fields in the
+/// JSON-encoded inner payload, the UOM table under `__children`.
+fn item_master(id: &str, fields: Value, uoms: &[(&str, f64)]) -> Value {
+    let rows: Vec<Value> = uoms
+        .iter()
+        .enumerate()
+        .map(|(i, (uom, factor))| {
+            json!({
+                "id": format!("{id}-uoms-{i}"), "parent_id": id, "parent_doctype": "Item",
+                "table_name": "uoms", "row_index": i,
+                "payload": json!({ "uom": uom, "conversion_factor": factor }).to_string(),
+            })
+        })
+        .collect();
+    json!({
+        "id": format!("m-item-{id}"),
+        "type": "createDocument",
+        "docType": "Item",
+        "documentId": id,
+        "payload": {
+            "id": id, "doctype": "Item", "docstatus": 0,
+            "payload": fields.to_string(),
+            "__children": { "uoms": rows },
+        },
+        "deviceId": "till-1",
+        "userId": "u",
+        "localTimestamp": 1i64,
+        "syncVersion": null,
+        "status": "pending"
+    })
+}
+
+#[tokio::test]
+async fn posting_reads_the_synced_item_master_when_the_registry_lacks_the_item() {
+    // The hub never calls the item registry; it syncs its Item master as
+    // ordinary documents. Posting must still know a service from a stock item
+    // and convert alternative UOMs, or service lines would move stock and
+    // split to GRNI and a box of twelve would post as one unit.
+    let mut app = TestApp::new().await;
+    let (status, body) = push(
+        &mut app,
+        "owner",
+        vec![
+            item_master(
+                "SVC-SYNC",
+                json!({ "item_name": "Install", "item_type": "Service" }),
+                &[],
+            ),
+            item_master(
+                "BOX-SYNC",
+                json!({ "item_name": "Bottle", "item_type": "Stock", "stock_uom": "Nos" }),
+                &[("Box", 12.0)],
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "item sync failed: {body}");
+
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            json!({
+                "doctype": "Purchase Invoice",
+                "document_id": "PINV-SYNC-1",
+                "payload": {
+                    "supplier": "SUPP-1", "posting_date": "2026-07-06",
+                    "update_stock": 1, "set_warehouse": "WH"
+                },
+                "items": [
+                    { "item": "SVC-SYNC", "qty": 1, "rate": 80 },
+                    { "item": "BOX-SYNC", "qty": 2, "uom": "Box", "rate": 60 }
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "submit failed: {body}");
+
+    // Only the stock line moves stock, in stock units.
+    assert_eq!(app.sle_count("PINV-SYNC-1").await, 1);
+    assert!(
+        app.bin("SVC-SYNC", "WH").await.is_none(),
+        "a service item has no bin"
+    );
+    let bin = app.bin("BOX-SYNC", "WH").await.unwrap();
+    assert!(approx(bin.actual_qty, 24.0), "bin qty {}", bin.actual_qty);
+    assert!(
+        approx(bin.stock_value, 120.0),
+        "bin value {}",
+        bin.stock_value
+    );
+}
