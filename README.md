@@ -95,17 +95,22 @@ notably device sync polling — and `/health` are deliberately **never**
 rate-limited: devices poll frequently by design, and authenticated calls are
 attributable and revocable per token.
 
-### Backup / restore
+### Backup, restore drill, monitoring
 
 ```sh
-scripts/backup.sh                     # pg_dump -> backups/atlas-<UTC stamp>.sql
-scripts/restore.sh backups/atlas-....sql atlas_drill   # drill into a scratch DB
-scripts/restore.sh backups/atlas-....sql               # restore the live DB
+scripts/backup.sh                          # encrypted (age) pg_dump + checksum, optional off-site copy
+scripts/restore_drill.sh backups/atlas-<stamp>.dump.age   # restore into an ISOLATED instance + verify
+scripts/restore.sh backups/atlas-<stamp>.dump.age         # real recovery into the compose database
+scripts/monitor.sh                         # /ready + backup-age alerting (cron)
 ```
 
-Both scripts run the tools inside the compose `postgres` service. Drill the
-restore on a copy regularly — that is part of the acceptance criterion, not an
-afterthought.
+The full runbook (RPO/RTO, schedules, off-site retention, migrations and
+rollback, monitoring, secret rotation, incident response) is
+[docs/OPERATIONS.md](docs/OPERATIONS.md). CI's `restore-drill` job seeds a
+company through the API, takes an encrypted backup, restores it into a fresh
+`initdb` PostgreSQL instance, checks the accounting/stock/numbering/log
+invariants (`scripts/verify_restore.sql`) and row counts, boots the backend on
+the restored data and resyncs a device's whole log through it.
 
 ## API surface
 
@@ -117,12 +122,13 @@ missing or unknown).
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | Liveness: `{"status":"ok"}` |
+| GET | `/ready` | none | Readiness: 503 unless the database answers; reports `schemaVersion` |
 | POST | `/companies` | none (bootstrap; `X-Atlas-Bootstrap-Token` when `ATLAS_BOOTSTRAP_TOKEN` is set) | `{name, owner_email, owner_name}` → company + owner + owner membership; returns a user token |
 | POST | `/companies/{id}/invitations` | user/device token, **owner or admin** | `{email, role}` → `{token, expiresAt}` (7-day expiry) |
 | POST | `/invitations/{token}/accept` | none (token is the credential) | `{display_name}` → creates/joins user + membership; returns a user token |
 | POST | `/companies/{id}/devices` | user token | `{name}` → `{deviceId, deviceToken}` |
 | POST | `/companies/{id}/sync/push` | **device token** | `{mutations: [MutationRecord…]}` → `{versions: {id: version}}`; idempotent on mutation id |
-| GET | `/companies/{id}/sync/pull?after={v}` | **device token** | `{mutations: […]}` with `syncVersion` set, ordered by version; `after` omitted = from 0 |
+| GET | `/companies/{id}/sync/pull?after={v}` | **device token** | `{mutations: […], hasMore, head}` with `syncVersion` set, ordered by version; `after` omitted = from 0; `head` = newest version (a cursor beyond it means the server was restored) |
 | POST | `/companies/{id}/sync/ack` | **device token** | `{ids: […]}` → `{acknowledged: n}` |
 | PUT | `/companies/{id}/blobs/{sha256}` | member | Raw bytes body; 201, or **422** if the body's SHA-256 ≠ path |
 | GET / HEAD | `/companies/{id}/blobs/{sha256}` | member | Bytes / existence; 404 when absent |
@@ -131,7 +137,7 @@ missing or unknown).
 | POST | `/webhooks/channels/{connector}` | none (verification is later work) | Same log-only intake, `kind = channel` |
 | GET | `/companies/{id}/audit?limit=n` | **owner, admin or accountant** | Recent audit rows (newest first) |
 | GET / PUT | `/companies/{id}/settings` | member / **owner, admin or accountant** | Company posting settings (merge-patch): `allow_negative_stock`, `books_lock_date`, default posting accounts |
-| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}` |
+| POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}`. Optional: an item missing from the registry is read from the synced `Item` document (same fields, `uoms` child table) |
 | POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, party_transactions, tax_transactions, bins, settlements}` |
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 
@@ -212,9 +218,11 @@ attributed) inside the same transaction as the posting.
 contract** (plan §5): each file is `{setup, actions, expect}`, driven here over
 the command API + `MemStore` by `tests/fixtures.rs`. Fixture
 `0001-mandatory-perpetual-inventory.json` is the mandatory acceptance scenario
-verbatim; the Dart side runs the same scenario today as
-`mercantis.hub.flutter/test/stock_cogs_acceptance_test.dart` (JSON-driving the
-Dart engine from these files is future work). The rest: `0002` FIFO costing
+verbatim. The hub drives **the same files** through the Solo engine
+(`mercantis.hub.flutter/test/accounting_contract_test.dart`, copies in
+`test/fixtures/accounting_contract`, drift check
+`tool/check_accounting_contract.sh`). All 12 pass on both engines, and a
+fixture change here must be synced there. The rest: `0002` FIFO costing
 incl. shortfall fallback, `0003` negative-stock rejection, `0004` adjustment
 up/down, `0005` payment settlement + outstanding, `0006` period lock, `0007`
 role rejection, `0008` value-neutral transfer.
@@ -311,6 +319,52 @@ refinement): no receipt↔invoice line-linkage variance posting (the
 two-document flow clears GRNI at matching values). POS *session close*
 remains Phase 6 client-side work — the POS Invoice posting itself is
 supported here.
+
+## Posting authority on the sync plane
+
+The mutation log replicates whatever a device pushes, and the client applies
+pulled rows verbatim. `sync/push` therefore refuses with **422** (the whole
+batch, so nothing partial lands) any client mutation that would publish
+official state (`src/authority.rs`, `tests/authority_guard.rs`):
+
+- **Ledger rows.** GL Entry, Stock Ledger Entry, Bin, Settlement, and the
+  Customer, Supplier and Tax Transaction rows are authored only by posting
+  commits.
+- **Official lifecycle.** `submitDocument` / `cancelDocument`, or a row
+  envelope with `docstatus >= 1`, on any server-authority doctype: Sales /
+  Purchase Invoice, Purchase Receipt, Delivery Note, Payment Entry, Stock
+  Entry, and Journal Entry, Expense and Customer Deposit. The backend cannot
+  post the last three yet, so they cannot be made official in a Team company
+  at all.
+- **System provenance.** The reserved device ids (`atlas-backend`,
+  `atlas-payments`, `atlas-portal`) and mutation-id prefixes (`postmut-`,
+  `portal-`). A squatted deterministic id would otherwise silently swallow
+  the real replication.
+
+Drafts and masters sync as before. Device tokens are bound to the company
+they were registered in (403 elsewhere, even when the user belongs to both
+companies). An idempotency key replays only the command it was first used
+for; reusing it for another document is a 409. Tenant isolation is proven
+negatively in `tests/tenant_isolation.rs`, which attacks every company-scoped
+route with another company's user and device credentials and probes for
+confused-deputy access by id.
+
+### Offline POS confirmation (`offline_fiscal`)
+
+POS is the deliberate local-posting exception: a till completes the sale
+offline under its own receipt number (`POS-{till_series}-####`), and that
+local fiscal sale replicates as a document. Its **Team-wide accounting** comes
+from `submit-document` with `"offline_fiscal": true`:
+
+- The receipt number becomes the official number. It must be unique per
+  company, and it must have been minted from the sale's `till_series`.
+- A till series is bound to the first device that confirms with it. A second
+  register using the same series gets a 409.
+- Stock is never a reason to refuse a sale that already happened. A shortfall
+  is posted, returned as `stock_shortfalls` and written to the audit row for
+  the warehouse to reconcile. Online documents still cannot consume stock
+  that is not there.
+- Role, period lock, totals and tax rows are enforced as for any submit.
 
 ## Validation — the posting authority never trusts client money
 
@@ -509,7 +563,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 99 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection); no DB required
+cargo test          # 120 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation); no DB required
 
 # The SAME suite over PgStore (what production runs): point the harness at a
 # disposable Postgres server's admin URL. Every test creates its own uniquely
@@ -527,5 +581,8 @@ company_settings, idempotency_keys), `0003_portal.sql` for the portal
 (portal_links, the company_documents read model), `0004_payments.sql` for
 the payment plane (pay_links), `0005_subledgers.sql` for the customer /
 supplier / tax subledger rows (party_transactions, tax_transactions),
-`0006_sle_uom.sql` for the stock ledger's transaction-UOM column and
-`0007_base_stamping.sql` for the GL multi-currency base columns.
+`0006_sle_uom.sql` for the stock ledger's transaction-UOM column,
+`0007_base_stamping.sql` for the GL multi-currency base columns, and
+`0011_official_number_unique.sql` for unique official numbers plus the
+till-series lookup. Migrations are additive by policy, so a previous release
+still starts against a newer schema (rollback, docs/OPERATIONS.md).

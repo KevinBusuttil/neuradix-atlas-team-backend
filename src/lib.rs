@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod authority;
 pub mod error;
 pub mod limit;
 pub mod model;

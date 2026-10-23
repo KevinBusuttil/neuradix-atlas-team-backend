@@ -4,11 +4,18 @@ use atlas_team_backend::store::{MemStore, PgStore, Store};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // ATLAS_LOG_FORMAT=json emits one JSON object per line for log
+    // shippers/alerting; the default stays human-readable.
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if std::env::var("ATLAS_LOG_FORMAT").is_ok_and(|format| format.eq_ignore_ascii_case("json")) {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let mem_mode = std::env::args().any(|arg| arg == "--mem");
     let store: Arc<dyn Store> = if mem_mode {

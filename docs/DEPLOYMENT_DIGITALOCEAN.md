@@ -257,28 +257,11 @@ be reachable from the internet even with ufw "blocking" it.
 
 ## 10. Backups — do this before you rely on the system
 
-The repo ships working scripts that run `pg_dump` inside the container:
-
-```bash
-cd /opt/neuradix-atlas-team-backend
-sudo scripts/backup.sh                 # writes backups/atlas-<timestamp>.sql
-```
-
-Schedule nightly (root crontab, `crontab -e`):
-
-```cron
-15 2 * * * cd /opt/neuradix-atlas-team-backend && ./scripts/backup.sh >> /var/log/atlas-backup.log 2>&1
-```
-
-Practice the restore drill once, into a scratch database — never test on
-the live one first:
-
-```bash
-sudo scripts/restore.sh backups/atlas-YYYYMMDD-HHMMSS.sql atlas_drill
-```
-
-And copy `backups/` off the droplet (DigitalOcean Spaces / `rclone`, or at
-minimum droplet snapshots) — a backup on the same disk is not a backup.
+Follow [OPERATIONS.md](OPERATIONS.md) § Backups and § Restore drill:
+encrypted nightly `scripts/backup.sh` with an off-site copy, `scripts/monitor.sh`
+every five minutes, and a monthly `scripts/restore_drill.sh` of the
+production backup into an isolated instance. A backup on the same disk is not
+a backup, and a backup that has never been restored is not proven.
 
 ---
 
@@ -320,8 +303,10 @@ connect.atlas.neuradix.app/webhooks/shopify
 ```bash
 cd /opt/neuradix-atlas-team-backend
 sudo git pull
+sudo scripts/backup.sh                # always back up before an upgrade
 sudo docker compose up -d --build     # rebuild + restart; new migrations apply on boot
-curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/ready   # schemaVersion = newest migration
+# rollback = check out the previous tag and rebuild (OPERATIONS.md § Migrations)
 ```
 
 Postgres data lives in the `pgdata` named volume — rebuilds never touch it.
@@ -339,7 +324,8 @@ Postgres data lives in the `pgdata` named volume — rebuilds never touch it.
 | Restart backend only | `sudo docker compose restart backend` |
 | psql shell | `sudo docker compose exec postgres psql -U atlas -d atlas` |
 | Manual backup | `sudo scripts/backup.sh` |
-| Restore drill | `sudo scripts/restore.sh <file.sql> atlas_drill` |
+| Restore drill (isolated) | `sudo scripts/restore_drill.sh backups/atlas-<stamp>.dump.age` |
+| Readiness | `curl -s http://127.0.0.1:8080/ready` |
 | Audit feed | `GET /companies/{id}/audit` (owner/admin/accountant token) |
 
 Notes:

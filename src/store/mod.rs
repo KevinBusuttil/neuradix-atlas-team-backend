@@ -48,10 +48,21 @@ pub struct MutationPage {
     /// Whether mutations exist past the last returned version. Exact — never
     /// a heuristic — so clients can stop looping the moment it is `false`.
     pub has_more: bool,
+    /// The company's newest sync version (0 for an empty log). A client
+    /// whose cursor is ahead of it is holding a cursor from before a server
+    /// restore and must re-pull from 0.
+    pub head: i64,
 }
 
 #[async_trait]
 pub trait Store: Send + Sync {
+    /// Readiness probe: the store can serve a query right now, and reports
+    /// the newest applied schema migration (None for the in-memory store).
+    /// Backs `GET /ready`, which monitoring polls.
+    async fn readiness(&self) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
+
     // Identity
     async fn create_company(&self, name: &str) -> Result<Company, StoreError>;
     async fn company(&self, company_id: Uuid) -> Result<Option<Company>, StoreError>;

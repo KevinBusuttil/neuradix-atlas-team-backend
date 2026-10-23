@@ -413,6 +413,13 @@ pub struct PostingCommit {
     /// Present on submit: allocate the next value of this series and stamp
     /// `document.official_number` + the response's `number` field.
     pub series_key: Option<String>,
+    /// Offline-fiscal POS confirmation: the till's receipt number, used as
+    /// the official number instead of a series allocation. The store refuses
+    /// it (409) when another document of the doctype already carries it.
+    pub preassigned_number: Option<String>,
+    /// Offline-fiscal POS confirmation: (till series, device id). The store
+    /// refuses it (409) when the series is already bound to another device.
+    pub till_binding: Option<(String, String)>,
     pub gl_entries: Vec<GlEntry>,
     pub stock_ledger_entries: Vec<StockLedgerEntry>,
     pub party_transactions: Vec<PartyTransaction>,
