@@ -443,6 +443,11 @@ impl Store for MemStore {
         limit: i64,
     ) -> Result<MutationPage, StoreError> {
         let inner = self.inner.lock().unwrap();
+        let head = inner
+            .mutations
+            .get(&company_id)
+            .and_then(|log| log.iter().map(|m| m.version).max())
+            .unwrap_or(0);
         let mut out: Vec<(i64, MutationRecord)> = inner
             .mutations
             .get(&company_id)
@@ -464,6 +469,7 @@ impl Store for MemStore {
         Ok(MutationPage {
             mutations: out.into_iter().map(|(_, record)| record).collect(),
             has_more,
+            head,
         })
     }
 
@@ -801,9 +807,49 @@ impl Store for MemStore {
             }
         }
 
+        // Offline-fiscal POS confirmation: the till's receipt number must be
+        // unique among the doctype's official numbers, and its till series
+        // must not already belong to another device.
+        if let Some(number) = &commit.preassigned_number {
+            let taken = inner.documents.iter().any(|((c, doctype, _), doc)| {
+                *c == company
+                    && doctype == &document.doctype
+                    && doc.official_number.as_deref() == Some(number.as_str())
+            });
+            if taken {
+                return Err(StoreError::Conflict(format!(
+                    "official number {number} is already used by another {}",
+                    document.doctype
+                )));
+            }
+        }
+        if let Some((series, device)) = &commit.till_binding {
+            let bound_elsewhere = inner.documents.iter().any(|((c, doctype, _), doc)| {
+                *c == company
+                    && doctype == &document.doctype
+                    && doc.payload.get("till_series").and_then(Value::as_str)
+                        == Some(series.as_str())
+                    && doc
+                        .payload
+                        .get("till_device")
+                        .and_then(Value::as_str)
+                        .is_some_and(|d| d != device)
+            });
+            if bound_elsewhere {
+                return Err(StoreError::Conflict(format!(
+                    "till series {series} is bound to another device; \
+                     give this register its own receipt series"
+                )));
+            }
+        }
+
         // Gap-free official number: allocated only here, inside the same
         // atomic step that persists the posting.
         let mut response = commit.response;
+        if let Some(number) = &commit.preassigned_number {
+            document.official_number = Some(number.clone());
+            response["number"] = json!(number);
+        }
         if let Some(series) = &commit.series_key {
             let next = inner.series.entry((company, series.clone())).or_insert(0);
             *next += 1;

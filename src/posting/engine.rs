@@ -112,7 +112,25 @@ pub struct SubmitCommand {
     pub payload: Map<String, Value>,
     pub items: Vec<Value>,
     pub idempotency_key: Option<String>,
+    /// Team POS policy: the till already completed this sale offline under
+    /// its own receipt number (the document id, minted from the till's
+    /// `till_series`). The backend confirms it for Team-wide accounting
+    /// instead of allocating a number — see [`OFFLINE_FISCAL_DOCTYPE`].
+    pub offline_fiscal: bool,
 }
+
+/// The only doctype a device may post locally and confirm afterwards
+/// (`offline_fiscal`). A completed till sale cannot be refused hours later —
+/// the customer has left with the goods — so the confirmation:
+///
+/// * keeps the till's receipt number as the official number (unique per
+///   company, and the till series is bound to the first device confirming
+///   with it, so two registers can never share one series);
+/// * never fails on stock: a shortfall is posted and *reported*
+///   (`stock_shortfalls` in the response and the audit row) for the
+///   warehouse to reconcile, instead of rejecting a sale that happened;
+/// * still enforces everything else (role, period lock, totals, tax rows).
+pub const OFFLINE_FISCAL_DOCTYPE: &str = "POS Invoice";
 
 #[derive(Debug, Clone)]
 pub struct CancelCommand {
@@ -203,8 +221,11 @@ pub async fn submit_document(
             cmd.doctype
         )));
     }
+    if cmd.offline_fiscal {
+        validate_offline_fiscal(&cmd, actor)?;
+    }
     if let Some(outcome) = replay(store, company_id, cmd.idempotency_key.as_deref()).await? {
-        return Ok(outcome);
+        return bound_replay(outcome, &cmd.doctype, cmd.document_id.as_deref());
     }
     // Fixed across retries so a stale-state recompute posts the same document.
     let document_id = cmd
@@ -214,6 +235,9 @@ pub async fn submit_document(
     for _ in 0..MAX_RETRIES {
         let commit = build_submit(store, company_id, &cmd, &document_id, actor).await?;
         match store.posting_commit(commit).await {
+            Ok(outcome) if outcome.replayed => {
+                return bound_replay(outcome, &cmd.doctype, Some(&document_id))
+            }
             Ok(outcome) => return Ok(outcome),
             Err(StoreError::Stale(_)) => continue,
             Err(err) => return Err(err.into()),
@@ -231,11 +255,14 @@ pub async fn cancel_document(
     actor: Actor,
 ) -> Result<CommitOutcome, PostingError> {
     if let Some(outcome) = replay(store, company_id, cmd.idempotency_key.as_deref()).await? {
-        return Ok(outcome);
+        return bound_replay(outcome, &cmd.doctype, Some(&cmd.document_id));
     }
     for _ in 0..MAX_RETRIES {
         let commit = build_cancel(store, company_id, &cmd, actor).await?;
         match store.posting_commit(commit).await {
+            Ok(outcome) if outcome.replayed => {
+                return bound_replay(outcome, &cmd.doctype, Some(&cmd.document_id))
+            }
             Ok(outcome) => return Ok(outcome),
             Err(StoreError::Stale(_)) => continue,
             Err(err) => return Err(err.into()),
@@ -244,6 +271,73 @@ pub async fn cancel_document(
     Err(PostingError::Conflict(
         "posting contention: stock ledger kept moving; retry".into(),
     ))
+}
+
+/// An idempotency key replays only the command it was first used for: a
+/// key reused for a different document (a client bug, or a device probing
+/// another document's outcome) is a 409, never someone else's response — a
+/// silent replay there would tell the caller its document posted when it
+/// never did.
+fn bound_replay(
+    outcome: CommitOutcome,
+    doctype: &str,
+    document_id: Option<&str>,
+) -> Result<CommitOutcome, PostingError> {
+    let response = &outcome.response;
+    let same_doctype = response
+        .get("doctype")
+        .and_then(Value::as_str)
+        .is_none_or(|stored| stored == doctype);
+    let same_document = match document_id {
+        Some(id) => response.get("document_id").and_then(Value::as_str) == Some(id),
+        None => true,
+    };
+    if same_doctype && same_document {
+        Ok(outcome)
+    } else {
+        Err(PostingError::Conflict(
+            "idempotency_key was already used for a different command".into(),
+        ))
+    }
+}
+
+/// Preconditions of an `offline_fiscal` confirmation (see
+/// [`OFFLINE_FISCAL_DOCTYPE`]): only POS Invoices, only from a device (the
+/// till series is bound to it), and the document id must be the receipt
+/// number minted from the sale's own `till_series`.
+fn validate_offline_fiscal(cmd: &SubmitCommand, actor: Actor) -> Result<(), PostingError> {
+    if cmd.doctype != OFFLINE_FISCAL_DOCTYPE {
+        return Err(PostingError::Validation(format!(
+            "offline_fiscal confirmation is only available for {OFFLINE_FISCAL_DOCTYPE}"
+        )));
+    }
+    if actor.device_id.is_none() {
+        return Err(PostingError::Validation(
+            "offline_fiscal confirmation must come from the till's device".into(),
+        ));
+    }
+    let Some(id) = cmd
+        .document_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Err(PostingError::Validation(
+            "offline_fiscal confirmation needs the till receipt number as document_id".into(),
+        ));
+    };
+    let Some(series) = as_non_empty(cmd.payload.get("till_series")) else {
+        return Err(PostingError::Validation(
+            "offline_fiscal POS sales need a till receipt series (till_series); \
+             a shared series cannot stay unique across registers"
+                .into(),
+        ));
+    };
+    if !id.contains(series.as_str()) || id.len() > 120 {
+        return Err(PostingError::Validation(format!(
+            "receipt number {id:?} was not minted from till series {series:?}"
+        )));
+    }
+    Ok(())
 }
 
 async fn replay(
@@ -347,7 +441,13 @@ async fn build_submit(
     }
 
     check_balanced(&gl)?;
-    check_negative_stock(&settings, &ledgers)?;
+    let stock_shortfalls = if cmd.offline_fiscal {
+        // The sale already happened at the till: report, never refuse.
+        stock_shortfalls(&ledgers)
+    } else {
+        check_negative_stock(&settings, &ledgers)?;
+        Vec::new()
+    };
 
     // Settlements + invoice outstanding maintenance.
     let mut settlements = Vec::new();
@@ -360,6 +460,14 @@ async fn build_submit(
     }
 
     let bins = recompute_bins(company_id, &ledgers);
+    let till_binding = if cmd.offline_fiscal {
+        let device = actor.device_id.map(|id| id.to_string()).unwrap_or_default();
+        payload.insert("offline_fiscal".into(), json!(true));
+        payload.insert("till_device".into(), json!(device));
+        as_non_empty(payload.get("till_series")).map(|series| (series, device))
+    } else {
+        None
+    };
     let document = crate::posting::model::PostedDocument {
         id: document_id.to_string(),
         company_id,
@@ -370,7 +478,8 @@ async fn build_submit(
         created_at: Utc::now(),
     };
     let (party_rows, tax_rows) = subledger_response_rows(&party_transactions, &tax_transactions);
-    let response = json!({
+    let mut response = json!({
+        "doctype": doctype,
         "document_id": document_id,
         "number": Value::Null, // stamped by the store after allocation
         "docstatus": 1,
@@ -381,6 +490,13 @@ async fn build_submit(
         "bins": &bins,
         "settlements": &settlements,
     });
+    let mut audit_detail = json!({ "doctype": doctype, "documentId": document_id });
+    if cmd.offline_fiscal {
+        response["offline_fiscal"] = json!(true);
+        response["stock_shortfalls"] = json!(&stock_shortfalls);
+        audit_detail["offlineFiscal"] = json!(true);
+        audit_detail["stockShortfalls"] = json!(&stock_shortfalls);
+    }
 
     Ok(PostingCommit {
         company_id,
@@ -388,7 +504,14 @@ async fn build_submit(
         batch,
         document,
         document_is_new: true,
-        series_key: series_key(doctype).map(str::to_string),
+        // An offline-fiscal sale keeps the till's receipt number.
+        series_key: if cmd.offline_fiscal {
+            None
+        } else {
+            series_key(doctype).map(str::to_string)
+        },
+        preassigned_number: cmd.offline_fiscal.then(|| document_id.to_string()),
+        till_binding,
         gl_entries: gl,
         stock_ledger_entries: sles,
         party_transactions,
@@ -398,12 +521,7 @@ async fn build_submit(
         outstanding_updates,
         sle_expectations: ledgers.expectations(),
         replication_device_id: actor.replication_device_id,
-        audit: audit_row(
-            company_id,
-            actor,
-            "command.submit-document",
-            json!({ "doctype": doctype, "documentId": document_id }),
-        ),
+        audit: audit_row(company_id, actor, "command.submit-document", audit_detail),
         response,
     })
 }
@@ -579,6 +697,7 @@ async fn build_cancel(
     document.docstatus = 2;
     let (party_rows, tax_rows) = subledger_response_rows(&party_transactions, &tax_transactions);
     let response = json!({
+        "doctype": cmd.doctype,
         "document_id": document_id,
         "number": &document.official_number,
         "docstatus": 2,
@@ -597,6 +716,8 @@ async fn build_cancel(
         document,
         document_is_new: false,
         series_key: None, // cancellation never consumes a number
+        preassigned_number: None,
+        till_binding: None,
         gl_entries: gl,
         stock_ledger_entries: sles,
         party_transactions,
@@ -1870,6 +1991,22 @@ fn check_negative_stock(settings: &CompanySettings, ledgers: &Ledgers) -> Result
         }
     }
     Ok(())
+}
+
+/// Every touched (item, warehouse) whose balance this posting drives below
+/// zero, with the resulting quantity — the offline-fiscal report that
+/// replaces [`check_negative_stock`]'s rejection.
+fn stock_shortfalls(ledgers: &Ledgers) -> Vec<Value> {
+    ledgers
+        .rows
+        .iter()
+        .filter_map(|((item, warehouse), rows)| {
+            let snap = compute_balance(rows);
+            (snap.actual_qty < -EPS).then(
+                || json!({ "item": item, "warehouse": warehouse, "actual_qty": snap.actual_qty }),
+            )
+        })
+        .collect()
 }
 
 /// The recomputed bins for every pair this posting touched (prior rows plus

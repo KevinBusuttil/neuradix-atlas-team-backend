@@ -114,11 +114,19 @@ impl FromRequestParts<AppState> for AuthContext {
 }
 
 /// The caller must be a member of `company_id`; returns their role.
+///
+/// A device token is additionally bound to the company it was registered
+/// in: a user who belongs to several companies cannot point one company's
+/// device credential at another company (403), so revoking a device — or
+/// removing the member from that company — really ends that device's access.
 pub async fn require_membership(
     state: &AppState,
     auth: &AuthContext,
     company_id: Uuid,
 ) -> Result<Role, ApiError> {
+    if auth.device_id().is_some() && auth.0.company_id != company_id {
+        return Err(ApiError::Forbidden);
+    }
     state
         .store
         .membership_role(auth.user_id(), company_id)

@@ -55,3 +55,64 @@ jobs:
           # Admin URL; every test creates and drops its own database.
           ATLAS_TEST_DATABASE_URL: postgres://atlas:atlas@localhost:5432/atlas
         run: cargo test
+
+  # Disaster recovery, proven on every change: seed a company through the
+  # real API on PostgreSQL, take an encrypted backup with scripts/backup.sh,
+  # then scripts/restore_drill.sh restores it into a separate, freshly
+  # initdb'd PostgreSQL instance, checks the accounting/stock/numbering/log
+  # invariants and row counts, boots the backend on the restored data and
+  # resyncs a device's full log through it.
+  restore-drill:
+    name: restore drill (backup → isolated PostgreSQL → verify)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: atlas
+          POSTGRES_PASSWORD: atlas
+          POSTGRES_DB: atlas
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U atlas -d atlas"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://atlas:atlas@localhost:5432/atlas
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (rust-toolchain.toml channel)
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Tools (age; PostgreSQL 16 server binaries for the isolated instance)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age postgresql-16 postgresql-client-16
+      - name: Build
+        run: cargo build --release
+      - name: Run the backend and seed a company through the API
+        run: |
+          ATLAS_BOOTSTRAP_TOKEN=ci PORT=8080 RUST_LOG=warn target/release/atlas-team-backend &
+          for _ in $(seq 60); do curl -fsS localhost:8080/ready && break; sleep 1; done
+          python3 scripts/drill_seed.py http://127.0.0.1:8080 ci > seed.json
+      - name: Encrypted backup
+        run: |
+          age-keygen -o "$RUNNER_TEMP/identity.txt"
+          age-keygen -y "$RUNNER_TEMP/identity.txt" > "$RUNNER_TEMP/recipients.txt"
+          ATLAS_BACKUP_AGE_RECIPIENTS="$RUNNER_TEMP/recipients.txt" scripts/backup.sh backups
+      - name: Restore drill into an isolated instance
+        run: |
+          export PG_BIN=/usr/lib/postgresql/16/bin
+          export ATLAS_BACKUP_AGE_IDENTITY="$RUNNER_TEMP/identity.txt"
+          export SOURCE_DATABASE_URL="$DATABASE_URL"
+          export ATLAS_DRILL_COMPANY_ID="$(python3 -c 'import json;print(json.load(open("seed.json"))["company_id"])')"
+          export ATLAS_DRILL_DEVICE_TOKEN="$(python3 -c 'import json;print(json.load(open("seed.json"))["device_token"])')"
+          scripts/restore_drill.sh backups/atlas-*.dump.age
+      - name: Keep the drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-drill-report
+          path: drill-reports/

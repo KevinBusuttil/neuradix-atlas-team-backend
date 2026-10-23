@@ -106,6 +106,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route(
             "/companies/{company_id}/invitations",
             post(create_invitation),
@@ -170,7 +171,52 @@ pub fn router(state: AppState) -> Router {
         // is rejected by the extractor with a plain 413, before any handler
         // (and thus any `ApiError` mapping) runs.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT_BYTES))
+        .layer(axum::middleware::from_fn(request_log))
         .with_state(state)
+}
+
+/// One structured log line per request — method, path (credential path
+/// segments redacted), status, latency and a request id that is also
+/// returned as `x-request-id`, so a client-reported failure can be matched
+/// to its server log line. 5xx log at ERROR, 4xx at WARN.
+async fn request_log(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let path = redact_path(request.uri().path());
+    let started = std::time::Instant::now();
+    let mut response = next.run(request).await;
+    let status = response.status().as_u16();
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if status >= 500 {
+        tracing::error!(%request_id, %method, %path, status, latency_ms, "request");
+    } else if status >= 400 {
+        tracing::warn!(%request_id, %method, %path, status, latency_ms, "request");
+    } else {
+        tracing::info!(%request_id, %method, %path, status, latency_ms, "request");
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// Paths whose second segment IS a credential (portal, pay and invitation
+/// tokens) must never reach the logs.
+pub(crate) fn redact_path(path: &str) -> String {
+    let mut segments: Vec<&str> = path.split('/').collect();
+    if segments.len() > 2 && matches!(segments[1], "portal" | "pay" | "invitations") {
+        segments[2] = "<token>";
+    }
+    segments.join("/")
 }
 
 async fn audit(
@@ -201,6 +247,24 @@ async fn audit(
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// Readiness, for monitoring and deploy gates: unlike `/health` (process
+/// liveness), this answers 503 when the database cannot serve a query, and
+/// reports the applied schema version so a deploy can confirm its
+/// migrations ran before traffic moves to it.
+async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    match state.store.readiness().await {
+        Ok(schema_version) => Ok(Json(json!({
+            "status": "ready",
+            "schemaVersion": schema_version,
+            "version": env!("CARGO_PKG_VERSION"),
+        }))),
+        Err(err) => {
+            tracing::error!(error = %err, "readiness check failed");
+            Err(ApiError::Unavailable("database unavailable".into()))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -734,6 +798,12 @@ async fn sync_push(
 ) -> Result<Json<Value>, ApiError> {
     require_membership(&state, &auth, company_id).await?;
     auth.require_device()?;
+    // Posting authority on the sync plane: devices may not publish ledger
+    // rows, official lifecycle transitions or system-authored provenance
+    // (see `authority`). The batch is refused whole, so nothing partial lands.
+    for mutation in &req.mutations {
+        crate::authority::check_client_mutation(mutation).map_err(ApiError::Unprocessable)?;
+    }
     // Immutability (roadmap §6 criterion 7): once a posted-doctype document is
     // official (submitted or cancelled), the sync plane may not touch it —
     // changes must go through the command API, which posts reversals instead
@@ -787,6 +857,9 @@ struct PullQuery {
 /// ≤ 0 means the server max (default 200, env `ATLAS_SYNC_PULL_PAGE_SIZE`).
 /// `hasMore` reports exactly whether mutations remain past the page; clients
 /// loop with `after` = the last returned `syncVersion` until it is `false`.
+/// `head` is the company's newest version: a client cursor beyond it means
+/// the server was restored from a backup older than the device's last sync,
+/// and the client re-pulls from 0 (applying is idempotent).
 async fn sync_pull(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -805,7 +878,7 @@ async fn sync_pull(
         .pull_mutations(company_id, query.after.unwrap_or(0), limit)
         .await?;
     Ok(Json(
-        json!({ "mutations": page.mutations, "hasMore": page.has_more }),
+        json!({ "mutations": page.mutations, "hasMore": page.has_more, "head": page.head }),
     ))
 }
 
@@ -1117,6 +1190,10 @@ struct SubmitDocumentRequest {
     items: Vec<Value>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    /// Confirm a POS sale the till already completed offline (see
+    /// `posting::engine::OFFLINE_FISCAL_DOCTYPE`).
+    #[serde(default)]
+    offline_fiscal: bool,
 }
 
 /// Official submission (roadmap §6 criteria 5–6, 11): validates, allocates
@@ -1142,6 +1219,7 @@ async fn submit_document(
             payload: req.payload,
             items: req.items,
             idempotency_key: req.idempotency_key,
+            offline_fiscal: req.offline_fiscal,
         },
         Actor::user(auth.user_id(), auth.device_id()),
     )

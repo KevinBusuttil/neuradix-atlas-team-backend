@@ -1,46 +1,56 @@
 #!/usr/bin/env bash
-# Restore an Atlas Team Postgres backup produced by scripts/backup.sh.
+# Restore an Atlas Team backup produced by scripts/backup.sh into a database
+# of the compose `postgres` service.
 #
 # Usage:
-#   scripts/restore.sh <backup-file.sql> [database-name]
+#   scripts/restore.sh <backup.dump|backup.dump.age|backup.sql> [database-name]
 #
-# By default restores into the live `atlas` database (the dump is created
-# with --clean --if-exists, so existing objects are dropped first). For a
-# restore DRILL against a copy — strongly recommended before you need it —
-# pass a scratch database name, e.g.:
+# Default target is the LIVE `atlas` database — stop the backend first
+# (`docker compose stop backend`). Prefer proving the backup with
+# scripts/restore_drill.sh, which restores into a separate, throwaway
+# PostgreSQL instance and verifies the result, before you ever need this.
 #
-#   scripts/restore.sh backups/atlas-20260706-120000.sql atlas_drill
-#
-# The scratch database is created if missing; point a spare backend at it with
-# DATABASE_URL=postgres://atlas:...@localhost:5432/atlas_drill to verify.
+# Encrypted backups need ATLAS_BACKUP_AGE_IDENTITY (path to the age private
+# key). Legacy plain .sql dumps (pre-custom-format) are still accepted.
 
 set -euo pipefail
-
 cd "$(dirname "$0")/.."
 
 if [[ $# -lt 1 ]]; then
-    echo "usage: $0 <backup-file.sql> [database-name]" >&2
+    echo "usage: $0 <backup> [database-name]" >&2
     exit 1
 fi
-
 BACKUP_FILE="$1"
 DB_NAME="${2:-atlas}"
+[[ -f "${BACKUP_FILE}" ]] || { echo "error: backup file not found: ${BACKUP_FILE}" >&2; exit 1; }
 
-if [[ ! -f "${BACKUP_FILE}" ]]; then
-    echo "error: backup file not found: ${BACKUP_FILE}" >&2
-    exit 1
+if [[ -f "${BACKUP_FILE}.sha256" ]]; then
+    ( cd "$(dirname "${BACKUP_FILE}")" && sha256sum --check --quiet "$(basename "${BACKUP_FILE}").sha256" )
 fi
 
-if [[ "${DB_NAME}" != "atlas" ]]; then
-    echo "Ensuring scratch database '${DB_NAME}' exists ..."
-    docker compose exec -T postgres psql -U atlas -d postgres -tc \
-        "select 1 from pg_database where datname = '${DB_NAME}'" | grep -q 1 ||
-        docker compose exec -T postgres createdb -U atlas "${DB_NAME}"
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+SOURCE="${BACKUP_FILE}"
+if [[ "${BACKUP_FILE}" == *.age ]]; then
+    : "${ATLAS_BACKUP_AGE_IDENTITY:?set ATLAS_BACKUP_AGE_IDENTITY to decrypt}"
+    SOURCE="${WORK}/backup.dump"
+    age --decrypt --identity "${ATLAS_BACKUP_AGE_IDENTITY}" --output "${SOURCE}" "${BACKUP_FILE}"
 fi
+
+docker compose exec -T postgres psql -U atlas -d postgres -tc \
+    "select 1 from pg_database where datname = '${DB_NAME}'" | grep -q 1 ||
+    docker compose exec -T postgres createdb -U atlas "${DB_NAME}"
 
 echo "Restoring ${BACKUP_FILE} into database '${DB_NAME}' ..."
-docker compose exec -T postgres psql -U atlas -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
-    < "${BACKUP_FILE}" > /dev/null
+if [[ "${SOURCE}" == *.sql ]]; then
+    docker compose exec -T postgres psql -U atlas -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
+        < "${SOURCE}" > /dev/null
+else
+    docker compose exec -T postgres pg_restore -U atlas -d "${DB_NAME}" \
+        --clean --if-exists --no-owner --exit-on-error < "${SOURCE}"
+fi
 
-echo "Done. Sanity-check row counts, e.g.:"
-echo "  docker compose exec postgres psql -U atlas -d ${DB_NAME} -c 'select count(*) from mutations;'"
+echo "Verifying ..."
+docker compose exec -T postgres psql -U atlas -d "${DB_NAME}" -v ON_ERROR_STOP=1 \
+    < scripts/verify_restore.sql
+echo "Done."

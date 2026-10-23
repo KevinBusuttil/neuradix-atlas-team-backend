@@ -659,6 +659,7 @@ async fn stripe_webhook(
             payload,
             items: Vec::new(),
             idempotency_key: Some(idempotency_key),
+            offline_fiscal: false,
         },
         Actor::system(PAYMENTS_DEVICE_ID),
     )

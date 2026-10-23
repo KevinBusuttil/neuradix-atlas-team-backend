@@ -32,7 +32,13 @@ impl PgStore {
     /// Connect and apply the embedded migrations.
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let pool = PgPool::connect(database_url).await?;
-        sqlx::migrate!("./migrations")
+        // Rollback support: a previous release must still start against a
+        // database the newer release already migrated. Migrations are
+        // additive by policy (docs/OPERATIONS.md, "Migrations"), so the
+        // older binary tolerates applied migrations it does not know.
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&pool)
             .await
             .map_err(|e| StoreError::Internal(format!("migration failed: {e}")))?;
@@ -334,6 +340,13 @@ fn document_from_row(row: &PgRow) -> Result<PostedDocument, StoreError> {
 
 #[async_trait]
 impl Store for PgStore {
+    async fn readiness(&self) -> Result<Option<i64>, StoreError> {
+        let row = sqlx::query("select max(version) as version from _sqlx_migrations where success")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("version")?)
+    }
+
     async fn create_company(&self, name: &str) -> Result<Company, StoreError> {
         let row = sqlx::query(
             "insert into companies (id, name) values ($1, $2) returning id, name, created_at",
@@ -722,9 +735,17 @@ impl Store for PgStore {
         let limit = usize::try_from(limit).unwrap_or(0);
         let has_more = out.len() > limit;
         out.truncate(limit);
+        let head: i64 = sqlx::query(
+            "select coalesce(max(sync_version), 0) as head from mutations where company_id = $1",
+        )
+        .bind(company_id)
+        .fetch_one(&self.pool)
+        .await?
+        .try_get("head")?;
         Ok(MutationPage {
             mutations: out,
             has_more,
+            head,
         })
     }
 
@@ -1170,8 +1191,56 @@ impl Store for PgStore {
             }
         }
 
+        // Offline-fiscal POS confirmation (see the MemStore twin): unique
+        // receipt number per doctype, and one device per till series. The
+        // advisory lock above serializes this check with every other commit
+        // of the company; the unique index of 0011 is the backstop.
+        if let Some(number) = &commit.preassigned_number {
+            let taken = sqlx::query(
+                "select 1 from documents \
+                 where company_id = $1 and doctype = $2 and official_number = $3",
+            )
+            .bind(company)
+            .bind(&document.doctype)
+            .bind(number)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if taken.is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "official number {number} is already used by another {}",
+                    document.doctype
+                )));
+            }
+        }
+        if let Some((series, device)) = &commit.till_binding {
+            let bound_elsewhere = sqlx::query(
+                "select 1 from documents \
+                 where company_id = $1 and doctype = $2 \
+                   and payload->>'till_series' = $3 \
+                   and payload->>'till_device' is not null \
+                   and payload->>'till_device' <> $4 \
+                 limit 1",
+            )
+            .bind(company)
+            .bind(&document.doctype)
+            .bind(series)
+            .bind(device)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if bound_elsewhere.is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "till series {series} is bound to another device; \
+                     give this register its own receipt series"
+                )));
+            }
+        }
+
         // Gap-free number allocation inside the transaction.
         let mut response = commit.response;
+        if let Some(number) = &commit.preassigned_number {
+            document.official_number = Some(number.clone());
+            response["number"] = json!(number);
+        }
         if let Some(series) = &commit.series_key {
             sqlx::query(
                 "insert into numbering_series (company_id, series_key, next_value) \
