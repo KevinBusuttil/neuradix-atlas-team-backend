@@ -143,13 +143,21 @@ missing or unknown).
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 | POST | `/companies/{id}/commands/import-solo-opening` | **device token**, Owner | One-time Solo → Team take-on: posts `SOLO-OPENING-{migration_id}`, checks the trial balance, receivables, payables and stock against the package, sets numbering floors. Idempotent on `migration_id` (409 if the package changed); refused once done or if the company already has postings. Tests: `tests/solo_migration.rs` |
 | POST | `/companies/{id}/commands/report-lost-history` | **device token**, Owner/Admin/Accountant | C4: a recovering device lists the official records the restored server lost. The response says which are still present and which numbers were since issued to other documents, and the server raises each series past the lost numbers. Idempotent on `recovery_id`; audited as `sync.lost_history`. Tests: `tests/history.rs` |
+| POST | `/companies/{id}/commands/set-books-lock` | **device token**, Owner/Admin/Accountant to lock, **Owner/Admin to reopen** | C5.2: the one way to move a Team company's books lock. Body `{lock_date, expected_current, reason?}`; compare-and-set under the company's posting lock, so a device that has not seen the current lock gets a 409 instead of overriding it. A lock later than tomorrow (UTC) is a 422. Audited as `settings.books_lock` / `settings.books_unlock` with from, to, role and reason. Tests: `tests/c5_authority.rs` |
 
 Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
 Command-role gates: Sales Invoice → sales/owner/admin · Purchase
 Invoice/Receipt → purchasing/owner/admin · Delivery Note →
 stock/sales/owner/admin · POS Invoice → pos/owner/admin · Stock Entry →
-stock/owner/admin · Payment Entry → accountant/owner/admin (cancel requires
-the same role as submit).
+stock/owner/admin · Payment Entry → accountant/owner/admin · Journal Entry →
+accountant/owner/admin · Expense → purchasing/accountant/owner/admin ·
+Customer Deposit → sales/accountant/owner/admin (cancel requires the same
+role as submit).
+
+`PUT …/settings` no longer moves `books_lock_date`: a changed value is a 409
+that points at `set-books-lock` (the same value, or leaving it out, passes),
+and a `sync/push` Company row carrying a stale lock is put back to the
+server's lock (audited as `sync.books_lock_pinned`).
 
 ## ROADMAP_V2 §6 — [P2] acceptance criteria coverage
 
@@ -301,7 +309,8 @@ re-converts. Fixture `0011-uom-conversion.json` pins the behaviour.
 
 Documents may carry `currency` + `conversion_rate` (absent/non-positive ⇒ 1).
 The Dart `_baseStampDocTypes` set applies — Sales Invoice, Purchase Invoice
-and Payment Entry (Journal Entry is not a posted doctype here yet): every
+Payment Entry and Journal Entry (Expense and Customer Deposit refuse a
+foreign `conversion_rate` for now): every
 transaction-currency GL leg is stamped with `conversion_rate`,
 `base_debit`/`base_credit` = amount × rate and `currency`; customer /
 supplier subledger rows get `conversion_rate` + `base_amount`. Base amounts
@@ -323,6 +332,34 @@ two-document flow clears GRNI at matching values). POS *session close*
 remains Phase 6 client-side work — the POS Invoice posting itself is
 supported here.
 
+## Journal Entry, Expense and Customer Deposit (C5)
+
+These follow the Dart engine's posting, pinned by the shared fixtures
+`0013-journal-entry.json` to `0016-period-lock-journal-expense-deposit.json`:
+
+- **Journal Entry** (series `JV`): at least two lines with an amount, each
+  line debit or credit (never both, never negative), an account on every
+  amount line, a party on Customer/Supplier lines, balanced within 0.005.
+  Totals are recomputed by the server. Lines keep their party and cost centre;
+  base stamping as above. Customer and supplier lines write Adjustment rows.
+- **Expense** (series `EXP`): debit the expense account and the VAT account
+  (company `default_vat_account` unless the document names one); credit
+  `paid_from` when paid, otherwise the supplier's `credit_to` with an Invoice
+  row for the gross. A sent gross must equal net + VAT.
+- **Customer Deposit** (series `DEP`): debit the cash account, credit the
+  deposit liability (`default_customer_deposit_account`). A Receive Payment
+  Entry naming `deposit` applies it: it must credit that liability, belong to
+  the same customer and fit in what is left. The check runs again inside the
+  serialized commit, so two devices cannot apply the same balance twice. A
+  deposit is cancelled only after the entries applying it are cancelled.
+- Every doctype: a posting to a group account is refused, and the books lock
+  is checked again inside the commit, so a lock that moves while a submit is
+  being built makes that submit fail rather than land in the closed period.
+
+Not covered yet (kept blocked or refused, see the client's
+`docs/team/TEAM_1_0_SCOPE_AND_PILOT.md`): foreign-currency Expense and
+Customer Deposit, and refunding part of a deposit.
+
 ## Posting authority on the sync plane
 
 The mutation log replicates whatever a device pushes, and the client applies
@@ -336,9 +373,8 @@ official state (`src/authority.rs`, `tests/authority_guard.rs`):
 - **Official lifecycle.** `submitDocument` / `cancelDocument`, or a row
   envelope with `docstatus >= 1`, on any server-authority doctype: Sales /
   Purchase Invoice, Purchase Receipt, Delivery Note, Payment Entry, Stock
-  Entry, and Journal Entry, Expense and Customer Deposit. The backend cannot
-  post the last three yet, so they cannot be made official in a Team company
-  at all.
+  Entry, and Journal Entry, Expense and Customer Deposit (posted by the
+  backend since C5).
 - **System provenance.** The reserved device ids (`atlas-backend`,
   `atlas-payments`, `atlas-portal`) and mutation-id prefixes (`postmut-`,
   `portal-`). A squatted deterministic id would otherwise silently swallow
@@ -566,7 +602,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 120 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation); no DB required
+cargo test          # 149 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation + C4 history + C5 authority); no DB required
 
 # The SAME suite over PgStore (what production runs): point the harness at a
 # disposable Postgres server's admin URL. Every test creates its own uniquely
@@ -585,7 +621,8 @@ company_settings, idempotency_keys), `0003_portal.sql` for the portal
 the payment plane (pay_links), `0005_subledgers.sql` for the customer /
 supplier / tax subledger rows (party_transactions, tax_transactions),
 `0006_sle_uom.sql` for the stock ledger's transaction-UOM column,
-`0007_base_stamping.sql` for the GL multi-currency base columns, and
+`0007_base_stamping.sql` for the GL multi-currency base columns,
+`0014_gl_cost_center.sql` for the Journal Entry cost centre on GL rows, and
 `0011_official_number_unique.sql` for unique official numbers plus the
 till-series lookup. Migrations are additive by policy, so a previous release
 still starts against a newer schema (rollback, docs/OPERATIONS.md).

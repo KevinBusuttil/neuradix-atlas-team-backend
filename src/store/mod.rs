@@ -322,6 +322,14 @@ pub trait Store: Send + Sync {
         payment_no: &str,
     ) -> Result<Vec<Settlement>, StoreError>;
 
+    /// Which of `ids` the company log already holds. A re-push of one of
+    /// them is a replay the log ignores (it is idempotent on id).
+    async fn known_mutation_ids(
+        &self,
+        company_id: Uuid,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError>;
+
     /// C5: the submitted-or-cancelled Payment Entries that name Customer
     /// Deposit `deposit_id` in their `deposit` field (callers count the
     /// submitted ones).

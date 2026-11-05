@@ -821,8 +821,13 @@ async fn sync_push(
     // official (submitted or cancelled), the sync plane may not touch it —
     // changes must go through the command API, which posts reversals instead
     // of editing history.
+    // A mutation the log already holds is a replay (a retried push, or the
+    // Solo take-on publishing its opening draft again): the log ignores it,
+    // so it cannot touch an official document and is not refused for one.
+    let ids: Vec<String> = req.mutations.iter().map(|m| m.id.clone()).collect();
+    let known = state.store.known_mutation_ids(company_id, &ids).await?;
     for mutation in &req.mutations {
-        if !POSTED_DOCTYPES.contains(&mutation.doc_type.as_str()) {
+        if !POSTED_DOCTYPES.contains(&mutation.doc_type.as_str()) || known.contains(&mutation.id) {
             continue;
         }
         if let Some(doc) = state

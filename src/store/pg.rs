@@ -1111,6 +1111,26 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn known_mutation_ids(
+        &self,
+        company_id: Uuid,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let rows = sqlx::query(
+            "select mutation_id from mutations where company_id = $1 and mutation_id = any($2)",
+        )
+        .bind(company_id)
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                row.try_get::<String, _>("mutation_id")
+                    .map_err(StoreError::from)
+            })
+            .collect()
+    }
+
     async fn deposit_applications(
         &self,
         company_id: Uuid,

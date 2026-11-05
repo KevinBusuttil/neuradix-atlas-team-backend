@@ -693,6 +693,23 @@ impl Store for MemStore {
         Ok(())
     }
 
+    async fn known_mutation_ids(
+        &self,
+        company_id: Uuid,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter(|id| {
+                inner
+                    .mutation_versions
+                    .contains_key(&(company_id, (*id).clone()))
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn deposit_applications(
         &self,
         company_id: Uuid,

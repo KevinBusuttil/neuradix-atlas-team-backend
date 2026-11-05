@@ -828,3 +828,60 @@ async fn a_stale_device_cannot_spread_an_old_lock_through_its_company_row() {
         .iter()
         .any(|e| e["action"] == "sync.books_lock_pinned"));
 }
+
+#[tokio::test]
+async fn a_posted_journal_is_immutable_on_the_sync_plane_but_replays_pass() {
+    let mut app = TestApp::new().await;
+    let token = app.device_token("owner").await;
+    let draft = |id: &str| {
+        json!({
+            "id": id, "type": "createDocument", "docType": "Journal Entry",
+            "documentId": "JE-S1",
+            "payload": { "id": "JE-S1", "doctype": "Journal Entry", "docstatus": 0,
+                         "payload": "{\"posting_date\":\"2026-09-30\"}" },
+            "deviceId": "dev-1", "userId": "u", "localTimestamp": 1, "syncVersion": null,
+            "status": "pending",
+        })
+    };
+    let uri = format!("/companies/{}/sync/push", app.company_id);
+    let (status, _) = app
+        .request(
+            Method::POST,
+            &uri,
+            Some(&token),
+            json!({ "mutations": [draft("m-je-1")] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = app
+        .submit_as(
+            "owner",
+            journal(
+                "JE-S1",
+                "2026-09-30",
+                json!([{ "account": "Cash", "debit": 5 }, { "account": "Sales", "credit": 5 }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The same draft mutation again (a retried push) is a harmless replay ...
+    let (status, body) = app
+        .request(
+            Method::POST,
+            &uri,
+            Some(&token),
+            json!({ "mutations": [draft("m-je-1")] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // ... a new edit of the posted journal is refused.
+    let (status, body) = app
+        .request(
+            Method::POST,
+            &uri,
+            Some(&token),
+            json!({ "mutations": [draft("m-je-2")] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
