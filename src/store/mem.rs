@@ -100,7 +100,12 @@ impl Inner {
             .filter(|((c, doctype, _), doc)| {
                 *c == company_id
                     && doctype == "Payment Entry"
-                    && doc.payload.get("deposit").and_then(Value::as_str) == Some(deposit_id)
+                    && doc
+                        .payload
+                        .get("deposit")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        == Some(deposit_id)
             })
             .map(|(_, doc)| doc.clone())
             .collect()
@@ -528,13 +533,21 @@ impl Store for MemStore {
         })
     }
 
-    async fn lost_history_lookup(
+    async fn record_lost_history(
         &self,
         company_id: Uuid,
-        records: &[crate::history::LostRecord],
-    ) -> Result<Vec<(bool, Option<String>)>, StoreError> {
-        let inner = self.inner.lock().unwrap();
-        Ok(records
+        report: &crate::history::LostHistoryReport,
+        mut audit: AuditEntry,
+    ) -> Result<(Value, bool), StoreError> {
+        // One mutex section: the lookup, floors, record and audit row are
+        // atomic with respect to every other write.
+        let mut inner = self.inner.lock().unwrap();
+        let key = (company_id, report.recovery_id.clone());
+        if let Some(stored) = inner.history_recoveries.get(&key) {
+            return Ok((stored.clone(), true));
+        }
+        let found: Vec<(bool, Option<String>)> = report
+            .lost
             .iter()
             .map(|r| {
                 let present = inner.documents.contains_key(&(
@@ -556,23 +569,9 @@ impl Store for MemStore {
                 });
                 (present, holder)
             })
-            .collect())
-    }
-
-    async fn commit_lost_history(
-        &self,
-        company_id: Uuid,
-        _device_id: Option<Uuid>,
-        report: &crate::history::LostHistoryReport,
-        floors: &[(String, i64)],
-        response: Value,
-    ) -> Result<(Value, bool), StoreError> {
-        let mut inner = self.inner.lock().unwrap();
-        let key = (company_id, report.recovery_id.clone());
-        if let Some(stored) = inner.history_recoveries.get(&key) {
-            return Ok((stored.clone(), true));
-        }
-        for (series, floor) in floors {
+            .collect();
+        let (response, floors) = crate::history::lost_history_outcome(report, &found);
+        for (series, floor) in &floors {
             let next = inner
                 .series
                 .entry((company_id, series.clone()))
@@ -580,6 +579,8 @@ impl Store for MemStore {
             *next = (*next).max(*floor);
         }
         inner.history_recoveries.insert(key, response.clone());
+        audit.detail = crate::history::lost_history_audit_detail(report, &response);
+        inner.audit.push(audit);
         Ok((response, false))
     }
 

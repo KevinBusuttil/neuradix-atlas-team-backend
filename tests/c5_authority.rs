@@ -885,3 +885,56 @@ async fn a_posted_journal_is_immutable_on_the_sync_plane_but_replays_pass() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
+
+/// Review fix: a padded deposit reference is stored normalized, so it counts
+/// against the deposit's balance and blocks its cancellation; a deposit
+/// application at a foreign conversion rate is refused (deposits are held in
+/// the company currency, so a rate would mis-state the liability).
+#[tokio::test]
+async fn a_padded_deposit_reference_still_counts_and_a_foreign_rate_is_refused() {
+    let mut app = TestApp::new().await;
+    let (status, _) = app
+        .submit_as("owner", deposit("DEP-P", "CUST-1", 100.0))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, res) = app
+        .submit_as("accountant", application("PAY-P1", "  DEP-P ", 60.0))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    // Only 40 is left: the padded application counted.
+    let (status, res) = app
+        .submit_as("accountant", application("PAY-P2", "DEP-P", 40.01))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{res}");
+    assert!(
+        res["error"].as_str().unwrap().contains("40.00 left"),
+        "{res}"
+    );
+    // And the deposit cannot be cancelled while it is applied.
+    let (status, res) = app
+        .cancel_as(
+            "accountant",
+            json!({ "doctype": "Customer Deposit", "document_id": "DEP-P" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{res}");
+    assert!(res["error"].as_str().unwrap().contains("PAY-P1"), "{res}");
+
+    // A foreign-rate application is refused and posts nothing.
+    let mut foreign = application("PAY-P3", "DEP-P", 10.0);
+    foreign["payload"]["conversion_rate"] = json!(1.1);
+    let (status, res) = app.submit_as("accountant", foreign).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{res}");
+    assert!(
+        res["error"].as_str().unwrap().contains("company currency"),
+        "{res}"
+    );
+    assert!(app.gl_entry("GL-PAY-P3-to").await.is_none());
+    // A rate of exactly 1 is the company currency and is accepted.
+    let mut home = application("PAY-P4", "DEP-P", 40.0);
+    home["payload"]["conversion_rate"] = json!(1.0);
+    let (status, res) = app.submit_as("accountant", home).await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert!(approx(app.account_balance("Customer Deposits").await, 0.0));
+}

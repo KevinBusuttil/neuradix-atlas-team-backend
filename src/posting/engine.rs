@@ -2497,6 +2497,10 @@ async fn deposit_application(
     let Some(deposit_id) = as_non_empty(payload.get("deposit")) else {
         return Ok(None);
     };
+    // The stored payment must name the deposit exactly as the guard does:
+    // the application lookup matches the stored `deposit` field, so a padded
+    // reference would otherwise escape every later balance check.
+    payload.insert("deposit".into(), json!(deposit_id));
     if as_non_empty(payload.get("payment_type")).as_deref() != Some("Receive") {
         return Err(PostingError::Validation(format!(
             "deposit {deposit_id} can only be applied by a Receive payment"
@@ -2528,6 +2532,18 @@ async fn deposit_application(
             "a payment applying deposit {deposit_id} must debit its liability account \
              {liability}, not {paid_to}"
         )));
+    }
+    // A deposit is held in the company currency (Customer Deposit refuses a
+    // foreign rate), and the guard counts `paid_amount` against it. A
+    // base-stamped foreign payment would move rate x paid_amount of the
+    // liability while the guard counted paid_amount, so refuse it.
+    if let Some(rate) = sent_number(payload, "conversion_rate") {
+        if (rate - 1.0).abs() > 1e-9 {
+            return Err(PostingError::Validation(format!(
+                "a payment applying deposit {deposit_id} must be in the company currency \
+                 (conversion_rate {rate}); deposits are held in the company currency"
+            )));
+        }
     }
     let party = as_non_empty(payload.get("party")).unwrap_or_default();
     let guard = DepositGuard::Apply {

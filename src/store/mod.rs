@@ -195,24 +195,19 @@ pub trait Store: Send + Sync {
         company_id: Uuid,
         at: i64,
     ) -> Result<crate::history::HistoryCheckpoint, StoreError>;
-    /// C4: for each (doctype, document id, official number) a recovering
-    /// device reported lost: whether the server still has that document, and
-    /// which other document (if any) now holds that official number.
-    async fn lost_history_lookup(
+    /// C4: answers a lost-history report and records it in one step, under
+    /// the company's posting lock: for each reported record, whether the
+    /// server still has it and which other document now holds its official
+    /// number (`crate::history::lost_history_outcome`); then raises the
+    /// numbering floors, stores the response and appends `audit` (its
+    /// detail filled from the response). Returns the stored response, and
+    /// `true`, when `recovery_id` was already recorded: a retried report
+    /// changes nothing and is not audited again.
+    async fn record_lost_history(
         &self,
         company_id: Uuid,
-        records: &[crate::history::LostRecord],
-    ) -> Result<Vec<(bool, Option<String>)>, StoreError>;
-    /// C4: records a lost-history report and raises the numbering floors in
-    /// one step. Returns the stored response instead when `recovery_id` was
-    /// already recorded (a retried report changes nothing).
-    async fn commit_lost_history(
-        &self,
-        company_id: Uuid,
-        device_id: Option<Uuid>,
         report: &crate::history::LostHistoryReport,
-        floors: &[(String, i64)],
-        response: Value,
+        audit: AuditEntry,
     ) -> Result<(Value, bool), StoreError>;
     /// Marks the given mutation ids acknowledged; returns how many matched.
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError>;
