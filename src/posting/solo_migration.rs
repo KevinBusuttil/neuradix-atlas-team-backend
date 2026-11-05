@@ -305,6 +305,7 @@ async fn build(
             credit: line.credit,
             party_type: party_type.clone(),
             party: party.clone(),
+            cost_center: None,
             voucher_type: OPENING_DOCTYPE.into(),
             voucher_no: document_id.clone(),
             posting_date: posting_date.clone(),
@@ -623,5 +624,7 @@ async fn build(
             migration_id: cmd.migration_id.clone(),
             package_sha256: sha.to_string(),
         }),
+        lock_check_date: Some(posting_date.clone()),
+        deposit_guard: None,
     })
 }

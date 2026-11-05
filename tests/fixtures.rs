@@ -584,6 +584,13 @@ fixture_test!(
     fixture_0012_multicurrency_base_stamping,
     "0012-multicurrency-base-stamping.json"
 );
+fixture_test!(fixture_0013_journal_entry, "0013-journal-entry.json");
+fixture_test!(fixture_0014_expense, "0014-expense.json");
+fixture_test!(fixture_0015_customer_deposit, "0015-customer-deposit.json");
+fixture_test!(
+    fixture_0016_period_lock_journal_expense_deposit,
+    "0016-period-lock-journal-expense-deposit.json"
+);
 
 /// Every fixture file on disk must be wired to a test above — a new fixture
 /// that nobody runs is a silent hole in the contract.
@@ -602,6 +609,10 @@ fn every_fixture_file_is_covered() {
         "0010-pos-and-delivery.json",
         "0011-uom-conversion.json",
         "0012-multicurrency-base-stamping.json",
+        "0013-journal-entry.json",
+        "0014-expense.json",
+        "0015-customer-deposit.json",
+        "0016-period-lock-journal-expense-deposit.json",
     ];
     let mut on_disk: Vec<String> = std::fs::read_dir(fixtures_dir())
         .expect("fixtures dir")

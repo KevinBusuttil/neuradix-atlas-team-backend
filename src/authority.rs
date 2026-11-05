@@ -51,10 +51,8 @@ pub const DERIVED_DOCTYPES: [&str; 8] = [
 
 /// Every document type whose submission produces official ledger effects
 /// (the Dart `LedgerDerivation.postingSources`) except POS Invoice. Their
-/// drafts sync; their official lifecycle is server-only. Journal Entry,
-/// Expense and Customer Deposit are listed although the backend cannot post
-/// them yet: until it can, they cannot be made official in a Team company at
-/// all, which is the safe failure (the client says so before submitting).
+/// drafts sync; their official lifecycle is server-only (Journal Entry,
+/// Expense and Customer Deposit since C5).
 pub const SERVER_AUTHORITY_DOCTYPES: [&str; 9] = [
     "Sales Invoice",
     "Purchase Invoice",
@@ -121,6 +119,55 @@ pub fn check_client_mutation(mutation: &MutationRecord) -> Result<(), String> {
     Ok(())
 }
 
+/// C5.2: a device's Company row cannot move the Team books lock. The lock
+/// lives in the server's settings and changes only through
+/// `commands/set-books-lock`; a Company create/update pushed by a device
+/// that still holds an older lock (or edited it locally) has its
+/// `books_lock_date` set back to the server's value before it reaches the
+/// log, so no other device ever applies the stale lock. Returns whether the
+/// mutation was changed (the API audits it).
+pub fn pin_books_lock(mutation: &mut MutationRecord, lock: Option<&str>) -> bool {
+    if mutation.doc_type != "Company"
+        || !matches!(
+            mutation.mutation_type,
+            MutationType::CreateDocument | MutationType::UpdateDocument
+        )
+    {
+        return false;
+    }
+    let server = lock.map_or(Value::Null, |lock| Value::String(lock.to_string()));
+    let pin = |fields: &mut serde_json::Map<String, Value>| -> bool {
+        let Some(current) = fields.get("books_lock_date") else {
+            return false;
+        };
+        let blank = |v: &Value| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty());
+        let same = if blank(current) || blank(&server) {
+            blank(current) && blank(&server)
+        } else {
+            current.as_str().map(str::trim) == server.as_str()
+        };
+        if same {
+            return false;
+        }
+        fields.insert("books_lock_date".into(), server.clone());
+        true
+    };
+    match mutation.payload.get_mut("payload") {
+        Some(Value::String(inner)) => {
+            let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(inner) else {
+                return false;
+            };
+            if !pin(&mut fields) {
+                return false;
+            }
+            *inner = Value::Object(fields).to_string();
+            true
+        }
+        Some(Value::Object(fields)) => pin(fields),
+        _ => pin(&mut mutation.payload),
+    }
+}
+
 /// The row envelope's `docstatus` (absent or malformed reads as a draft).
 fn docstatus(mutation: &MutationRecord) -> i64 {
     match mutation.payload.get("docstatus") {
@@ -152,6 +199,43 @@ mod tests {
             sync_version: None,
             status: MutationStatus::Pending,
         }
+    }
+
+    #[test]
+    fn a_device_cannot_move_the_books_lock_through_its_company_row() {
+        let company = |inner: Value| MutationRecord {
+            payload: json!({ "id": "CO", "doctype": "Company", "payload": inner.to_string() })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ..mutation("Company", MutationType::UpdateDocument, 0)
+        };
+        let inner = |m: &MutationRecord| -> Value {
+            serde_json::from_str(m.payload["payload"].as_str().unwrap()).unwrap()
+        };
+        // A stale (or locally edited) lock is put back to the server's.
+        let mut stale = company(json!({ "company_name": "A", "books_lock_date": "2026-01-31" }));
+        assert!(pin_books_lock(&mut stale, Some("2026-06-30")));
+        assert_eq!(inner(&stale)["books_lock_date"], "2026-06-30");
+        assert_eq!(inner(&stale)["company_name"], "A");
+        // Clearing it locally does not clear the server lock either.
+        let mut cleared = company(json!({ "books_lock_date": "" }));
+        assert!(pin_books_lock(&mut cleared, Some("2026-06-30")));
+        assert_eq!(inner(&cleared)["books_lock_date"], "2026-06-30");
+        // Nor can a device lock a company the server has not locked.
+        let mut locked = company(json!({ "books_lock_date": "2026-06-30" }));
+        assert!(pin_books_lock(&mut locked, None));
+        assert!(inner(&locked)["books_lock_date"].is_null());
+        // The same lock, a row without the field, other doctypes: untouched.
+        let mut same = company(json!({ "books_lock_date": "2026-06-30" }));
+        assert!(!pin_books_lock(&mut same, Some("2026-06-30")));
+        let mut without = company(json!({ "company_name": "A" }));
+        assert!(!pin_books_lock(&mut without, Some("2026-06-30")));
+        let mut other = mutation("Customer", MutationType::UpdateDocument, 0);
+        other
+            .payload
+            .insert("books_lock_date".into(), json!("2020-01-01"));
+        assert!(!pin_books_lock(&mut other, Some("2026-06-30")));
     }
 
     #[test]

@@ -1,0 +1,107 @@
+{
+  "name": "Period lock covers Journal Entry, Expense and Customer Deposit: dated on or before the lock is refused, after it posts",
+  "setup": {
+    "settings": {
+      "books_lock_date": "2026-06-30"
+    }
+  },
+  "actions": [
+    {
+      "comment": "Journal into the locked period",
+      "submit": {
+        "doctype": "Journal Entry",
+        "document_id": "JE-L1",
+        "payload": {
+          "posting_date": "2026-06-30",
+          "accounts": [
+            {
+              "account": "Cash",
+              "debit": 10,
+              "credit": 0
+            },
+            {
+              "account": "Sales",
+              "debit": 0,
+              "credit": 10
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 422,
+      "error_contains": "locked"
+    },
+    {
+      "comment": "Expense into the locked period",
+      "submit": {
+        "doctype": "Expense",
+        "document_id": "EXP-L1",
+        "payload": {
+          "posting_date": "2026-06-15",
+          "description": "Paper",
+          "expense_account": "Office Costs",
+          "net_amount": 10,
+          "tax_amount": 0,
+          "is_paid": 1,
+          "paid_from": "Cash"
+        },
+        "items": []
+      },
+      "expect_status": 422,
+      "error_contains": "locked"
+    },
+    {
+      "comment": "Deposit into the locked period",
+      "submit": {
+        "doctype": "Customer Deposit",
+        "document_id": "DEP-L1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-06-01",
+          "amount": 10
+        },
+        "items": []
+      },
+      "expect_status": 422,
+      "error_contains": "locked"
+    },
+    {
+      "comment": "The first open day posts, and takes the first number",
+      "submit": {
+        "doctype": "Journal Entry",
+        "document_id": "JE-L2",
+        "payload": {
+          "posting_date": "2026-07-01",
+          "accounts": [
+            {
+              "account": "Cash",
+              "debit": 10,
+              "credit": 0
+            },
+            {
+              "account": "Sales",
+              "debit": 0,
+              "credit": 10
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "JV-00001",
+        "gl_count": {
+          "JE-L2": 2
+        }
+      }
+    }
+  ],
+  "expect": {
+    "account_balances": {
+      "Cash": 10,
+      "Sales": -10,
+      "Office Costs": 0,
+      "Customer Deposits": 0
+    }
+  }
+}

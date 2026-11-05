@@ -303,16 +303,63 @@ impl TestApp {
         token
     }
 
+    /// PATCHes settings as the owner. A `books_lock_date` in the patch goes
+    /// through `commands/set-books-lock` (C5: settings no longer move it).
     pub async fn put_settings(&self, patch: Value) {
+        let mut patch = patch;
+        let lock = patch
+            .as_object_mut()
+            .and_then(|m| m.remove("books_lock_date"));
+        if patch.as_object().is_some_and(|m| !m.is_empty()) {
+            let (status, body) = self
+                .request(
+                    Method::PUT,
+                    &format!("/companies/{}/settings", self.company_id),
+                    Some(&self.owner_token),
+                    patch,
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "settings failed: {body}");
+        }
+        if let Some(lock) = lock {
+            let (status, body) = self.set_books_lock(&self.owner_token.clone(), lock).await;
+            assert_eq!(status, StatusCode::OK, "set-books-lock failed: {body}");
+        }
+    }
+
+    /// The current server lock (`GET settings`).
+    pub async fn books_lock(&self) -> Value {
         let (status, body) = self
             .request(
-                Method::PUT,
+                Method::GET,
                 &format!("/companies/{}/settings", self.company_id),
                 Some(&self.owner_token),
-                patch,
+                Value::Null,
             )
             .await;
-        assert_eq!(status, StatusCode::OK, "settings failed: {body}");
+        assert_eq!(status, StatusCode::OK, "settings read failed: {body}");
+        body["books_lock_date"].clone()
+    }
+
+    /// `commands/set-books-lock` with `token`, expecting the current lock.
+    pub async fn set_books_lock(&self, token: &str, lock: Value) -> (StatusCode, Value) {
+        let expected = self.books_lock().await;
+        self.set_books_lock_expecting(token, lock, expected).await
+    }
+
+    pub async fn set_books_lock_expecting(
+        &self,
+        token: &str,
+        lock: Value,
+        expected: Value,
+    ) -> (StatusCode, Value) {
+        self.request(
+            Method::POST,
+            &format!("/companies/{}/commands/set-books-lock", self.company_id),
+            Some(token),
+            serde_json::json!({ "lock_date": lock, "expected_current": expected }),
+        )
+        .await
     }
 
     pub async fn upsert_item(&self, item: Value) {

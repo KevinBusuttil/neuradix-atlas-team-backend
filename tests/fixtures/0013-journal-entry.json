@@ -1,0 +1,209 @@
+{
+  "name": "Journal Entry: balanced lines post GL with party and cost centre, party lines book subledger adjustments; an unbalanced journal is refused; cancelling reverses everything",
+  "setup": {},
+  "actions": [
+    {
+      "comment": "Unbalanced: refused, nothing posts",
+      "submit": {
+        "doctype": "Journal Entry",
+        "document_id": "JE-U1",
+        "payload": {
+          "posting_date": "2026-09-30",
+          "accounts": [
+            {
+              "account": "Cash",
+              "debit": 100,
+              "credit": 0
+            },
+            {
+              "account": "Sales",
+              "debit": 0,
+              "credit": 90
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 422,
+      "error_contains": "balance",
+      "expect": {
+        "gl_count": {
+          "JE-U1": 0
+        }
+      }
+    },
+    {
+      "comment": "Customer owes 250 more, we owe the supplier 100 more, 150 income in the Retail cost centre",
+      "submit": {
+        "doctype": "Journal Entry",
+        "document_id": "JE-1",
+        "payload": {
+          "posting_date": "2026-09-30",
+          "accounts": [
+            {
+              "account": "Debtors",
+              "debit": 250,
+              "credit": 0,
+              "party_type": "Customer",
+              "party": "CUST-1",
+              "cost_center": "Retail"
+            },
+            {
+              "account": "Creditors",
+              "debit": 0,
+              "credit": 100,
+              "party_type": "Supplier",
+              "party": "SUPP-1"
+            },
+            {
+              "account": "Sales",
+              "debit": 0,
+              "credit": 150,
+              "cost_center": "Retail"
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "JV-00001",
+        "gl_count": {
+          "JE-1": 3
+        },
+        "gl_rows": [
+          {
+            "id": "GL-JE-1-0",
+            "account": "Debtors",
+            "debit": 250,
+            "credit": 0,
+            "base_debit": 250,
+            "conversion_rate": 1
+          },
+          {
+            "id": "GL-JE-1-1",
+            "account": "Creditors",
+            "debit": 0,
+            "credit": 100
+          },
+          {
+            "id": "GL-JE-1-2",
+            "account": "Sales",
+            "debit": 0,
+            "credit": 150
+          }
+        ],
+        "party_rows": [
+          {
+            "doctype": "Customer Transaction",
+            "id": "CT-JE-1-0",
+            "trans_type": "Adjustment",
+            "party": "CUST-1",
+            "amount": 250
+          },
+          {
+            "doctype": "Supplier Transaction",
+            "id": "VT-JE-1-1",
+            "trans_type": "Adjustment",
+            "party": "SUPP-1",
+            "amount": 100
+          }
+        ],
+        "party_count": {
+          "JE-1": 2
+        },
+        "account_balances": {
+          "Debtors": 250,
+          "Creditors": -100,
+          "Sales": -150
+        }
+      }
+    },
+    {
+      "comment": "Cancelling posts the mirror image and nets the subledgers",
+      "cancel": {
+        "doctype": "Journal Entry",
+        "document_id": "JE-1"
+      },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "gl_count": {
+          "JE-1": 6
+        },
+        "party_rows": [
+          {
+            "doctype": "Customer Transaction",
+            "id": "CT-JE-1-0-reversal",
+            "trans_type": "Adjustment",
+            "amount": -250,
+            "is_reversal": true,
+            "party": "CUST-1"
+          },
+          {
+            "doctype": "Supplier Transaction",
+            "id": "VT-JE-1-1-reversal",
+            "trans_type": "Adjustment",
+            "amount": -100,
+            "is_reversal": true,
+            "party": "SUPP-1"
+          }
+        ],
+        "account_balances": {
+          "Debtors": 0,
+          "Creditors": 0,
+          "Sales": 0
+        }
+      }
+    },
+    {
+      "comment": "A foreign-currency journal is base-stamped at its rate",
+      "submit": {
+        "doctype": "Journal Entry",
+        "document_id": "JE-FX",
+        "payload": {
+          "posting_date": "2026-09-30",
+          "currency": "USD",
+          "conversion_rate": 0.9,
+          "accounts": [
+            {
+              "account": "Bank",
+              "debit": 100,
+              "credit": 0
+            },
+            {
+              "account": "Sales",
+              "debit": 0,
+              "credit": 100
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "JV-00002",
+        "gl_rows": [
+          {
+            "id": "GL-JE-FX-0",
+            "account": "Bank",
+            "debit": 100,
+            "base_debit": 90,
+            "conversion_rate": 0.9,
+            "currency": "USD",
+            "credit": 0
+          },
+          {
+            "id": "GL-JE-FX-1",
+            "account": "Sales",
+            "credit": 100,
+            "base_credit": 90,
+            "conversion_rate": 0.9,
+            "currency": "USD",
+            "debit": 0
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -20,9 +20,9 @@ use uuid::Uuid;
 
 use crate::model::AuditEntry;
 use crate::posting::model::{
-    series_key, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
-    PostingBatch, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction, UomConversion,
-    POSTED_DOCTYPES,
+    deposit_guard_violation, series_key, Bin, CommitOutcome, CompanySettings, DepositGuard,
+    GlEntry, Item, PartyKind, PartyTransaction, PostingBatch, PostingCommit, Settlement,
+    StockLedgerEntry, TaxTransaction, UomConversion, POSTED_DOCTYPES,
 };
 use crate::posting::stock::{compute_balance, issue_rate, LedgerRow};
 use crate::posting::values::{
@@ -150,6 +150,11 @@ pub fn allowed_roles(doctype: &str) -> Option<&'static [crate::model::Role]> {
         "POS Invoice" => &[Owner, Admin, Pos],
         "Stock Entry" => &[Owner, Admin, Stock],
         "Payment Entry" => &[Owner, Admin, Accountant],
+        // C5. A journal can move any account, so only the finance roles;
+        // an expense is a purchase; a deposit is taken at the point of sale.
+        "Journal Entry" => &[Owner, Admin, Accountant],
+        "Expense" => &[Owner, Admin, Accountant, Purchasing],
+        "Customer Deposit" => &[Owner, Admin, Accountant, Sales],
         _ => return None,
     })
 }
@@ -274,6 +279,35 @@ pub async fn cancel_document(
     ))
 }
 
+/// The commit a submit would make, built but not applied. A test seam for
+/// the C5 concurrency checks (a lock or a deposit application landing
+/// between build and commit); the API never calls it.
+#[doc(hidden)]
+pub async fn prepare_submit(
+    store: &dyn Store,
+    company_id: Uuid,
+    cmd: SubmitCommand,
+    actor: Actor,
+) -> Result<PostingCommit, PostingError> {
+    let document_id = cmd
+        .document_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    build_submit(store, company_id, &cmd, &document_id, actor).await
+}
+
+/// The commit a cancel would make, built but not applied (see
+/// [`prepare_submit`]).
+#[doc(hidden)]
+pub async fn prepare_cancel(
+    store: &dyn Store,
+    company_id: Uuid,
+    cmd: CancelCommand,
+    actor: Actor,
+) -> Result<PostingCommit, PostingError> {
+    build_cancel(store, company_id, &cmd, actor).await
+}
+
 /// An idempotency key replays only the command it was first used for: a
 /// key reused for a different document (a client bug, or a device probing
 /// another document's outcome) is a 409, never someone else's response — a
@@ -388,7 +422,16 @@ async fn build_submit(
         )));
     }
 
+    // A Payment Entry applying a Customer Deposit takes the deposit's
+    // liability account and customer (the Dart `DepositApplicationInterceptor`
+    // defaults) before the generic account fallbacks run.
+    let deposit_guard = if doctype == "Payment Entry" {
+        deposit_application(store, company_id, &mut payload).await?
+    } else {
+        None
+    };
     resolve_account_fallbacks(doctype, &mut payload, &settings);
+    validate_c5_document(doctype, &mut payload, &settings)?;
     if matches!(doctype, "Sales Invoice" | "Purchase Invoice") {
         validate_tax_rows(&payload)?;
         validate_invoice_totals(&mut payload, true)?;
@@ -442,6 +485,7 @@ async fn build_submit(
     }
 
     check_balanced(&gl)?;
+    check_group_accounts(store, company_id, &gl).await?;
     let stock_shortfalls = if cmd.offline_fiscal {
         // The sale already happened at the till: report, never refuse.
         stock_shortfalls(&ledgers)
@@ -526,6 +570,8 @@ async fn build_submit(
         response,
         numbering_floors: Vec::new(),
         solo_migration: None,
+        lock_check_date: Some(posting_date),
+        deposit_guard,
     })
 }
 
@@ -576,6 +622,24 @@ async fn build_cancel(
         None => today(),
     };
     check_period_lock(&settings, &posting_date)?;
+
+    // A Customer Deposit still applied by a submitted Payment Entry cannot
+    // be cancelled: the application would point at a deposit that no
+    // longer exists and the liability would go negative.
+    let deposit_guard = if cmd.doctype == "Customer Deposit" {
+        let guard = DepositGuard::Release {
+            deposit_id: cmd.document_id.clone(),
+        };
+        let applications = store
+            .deposit_applications(company_id, &cmd.document_id)
+            .await?;
+        if let Some(reason) = deposit_guard_violation(&guard, Some(&document), &applications) {
+            return Err(PostingError::Conflict(reason));
+        }
+        Some(guard)
+    } else {
+        None
+    };
 
     let document_id = cmd.document_id.as_str();
     let batch_id = format!("PB-{document_id}{REVERSAL_SUFFIX}");
@@ -739,6 +803,8 @@ async fn build_cancel(
         response,
         numbering_floors: Vec::new(),
         solo_migration: None,
+        lock_check_date: Some(posting_date),
+        deposit_guard,
     })
 }
 
@@ -773,6 +839,7 @@ impl RowContext<'_> {
             credit,
             party_type: party_type.map(str::to_string),
             party,
+            cost_center: None,
             voucher_type: self.doctype.to_string(),
             voucher_no: self.document_id.to_string(),
             posting_date: self.posting_date.to_string(),
@@ -855,6 +922,8 @@ fn resolve_account_fallbacks(
         "Sales Invoice" => &[("debit_to", "receivable"), ("income_account", "income")],
         "Purchase Invoice" => &[("credit_to", "payable"), ("expense_account", "expense")],
         "POS Invoice" => &[("cash_account", "cash"), ("income_account", "income")],
+        "Expense" => &[("paid_from", "cash"), ("credit_to", "payable")],
+        "Customer Deposit" => &[("cash_account", "cash"), ("deposit_account", "deposit")],
         "Payment Entry" => match as_non_empty(payload.get("payment_type")).as_deref() {
             Some("Receive") => &[("paid_from", "receivable"), ("paid_to", "cash")],
             Some("Pay") => &[("paid_from", "cash"), ("paid_to", "payable")],
@@ -869,6 +938,7 @@ fn resolve_account_fallbacks(
                 "payable" => &settings.default_payable_account,
                 "income" => &settings.default_income_account,
                 "expense" => &settings.default_expense_account,
+                "deposit" => &settings.default_customer_deposit_account,
                 _ => &settings.default_cash_account,
             };
             payload.insert((*field).to_string(), json!(value));
@@ -1172,10 +1242,106 @@ fn derive_monetary_gl(ctx: &RowContext<'_>, payload: &Map<String, Value>) -> Vec
                 ),
             ]
         }
+        // Lightweight expense (the Dart `_expense`): Dr category (net) + Dr
+        // input VAT / Cr cash-bank when paid, or Cr payable (with the
+        // supplier) when owed — gross.
+        "Expense" => {
+            let net = as_num(payload.get("net_amount"));
+            let tax = as_num(payload.get("tax_amount"));
+            let gross = as_num(payload.get("gross_amount"));
+            let paid = is_true(payload.get("is_paid"));
+            let supplier = as_non_empty(payload.get("supplier"));
+            let mut gl = vec![ctx.gl(
+                format!("GL-{id}-debit"),
+                as_non_empty(payload.get("expense_account")).unwrap_or_default(),
+                net,
+                0.0,
+                None,
+                None,
+            )];
+            if tax != 0.0 {
+                gl.push(ctx.gl(
+                    format!("GL-{id}-tax"),
+                    as_non_empty(payload.get("tax_account")).unwrap_or_default(),
+                    tax,
+                    0.0,
+                    None,
+                    None,
+                ));
+            }
+            let credit_account = if paid { "paid_from" } else { "credit_to" };
+            gl.push(ctx.gl(
+                format!("GL-{id}-credit"),
+                as_non_empty(payload.get(credit_account)).unwrap_or_default(),
+                0.0,
+                gross,
+                (!paid).then_some("Supplier"),
+                if paid { None } else { supplier },
+            ));
+            gl
+        }
+        // Customer Deposit (the Dart `_customerDeposit`): Dr cash, Cr the
+        // deposit liability. Applying it later is a Receive Payment Entry
+        // whose `paid_to` is that liability.
+        "Customer Deposit" => {
+            let amount = as_num(payload.get("amount"));
+            vec![
+                ctx.gl(
+                    format!("GL-{id}-cash"),
+                    as_non_empty(payload.get("cash_account")).unwrap_or_default(),
+                    amount,
+                    0.0,
+                    None,
+                    None,
+                ),
+                ctx.gl(
+                    format!("GL-{id}-liability"),
+                    as_non_empty(payload.get("deposit_account")).unwrap_or_default(),
+                    0.0,
+                    amount,
+                    None,
+                    None,
+                ),
+            ]
+        }
+        // Journal Entry (the Dart `_journalEntry`): one `GL-{id}-{i}` per
+        // `accounts` row, with its party and cost centre. Index `i` is the
+        // row position, so ids match the Dart ones.
+        "Journal Entry" => journal_rows(payload)
+            .map(|(i, row)| {
+                let mut entry = ctx.gl(
+                    format!("GL-{id}-{i}"),
+                    as_non_empty(row.get("account")).unwrap_or_default(),
+                    as_num(row.get("debit")),
+                    as_num(row.get("credit")),
+                    None,
+                    as_non_empty(row.get("party")),
+                );
+                entry.party_type = as_non_empty(row.get("party_type"));
+                entry.cost_center = as_non_empty(row.get("cost_center"));
+                entry
+            })
+            .collect(),
         // Purchase Receipt / Stock Entry: GL comes only from costed stock
         // movements.
         _ => Vec::new(),
     }
+}
+
+/// A Journal Entry's `accounts` rows with their positions, skipping rows
+/// without an account (the Dart derivation skips them; validation has
+/// already refused any such row that carries an amount).
+fn journal_rows(
+    payload: &Map<String, Value>,
+) -> impl Iterator<Item = (usize, &Map<String, Value>)> {
+    let rows = match payload.get("accounts") {
+        Some(Value::Array(rows)) => rows.as_slice(),
+        _ => &[],
+    };
+    rows.iter().enumerate().filter_map(|(i, row)| {
+        let row = row.as_object()?;
+        as_non_empty(row.get("account")).map(|_| (i, row))
+    })
 }
 
 /// One VAT GL leg per invoice tax row: output VAT credited on sales, input
@@ -1215,14 +1381,15 @@ fn tax_legs(ctx: &RowContext<'_>, payload: &Map<String, Value>, is_output: bool)
 
 /// Vouchers whose monetary rows are denominated in the document's
 /// transaction `currency`, so base-currency amounts get stamped onto them —
-/// the Dart `_baseStampDocTypes` minus Journal Entry (not a posted doctype
-/// here yet). Stock vouchers (POS / Delivery / Receipt / Stock Entry) carry
+/// the Dart `_baseStampDocTypes`. Expense and Customer Deposit are not
+/// stamped in Solo either, so both refuse a foreign-currency rate
+/// ([`validate_c5_document`]). Stock vouchers (POS / Delivery / Receipt / Stock Entry) carry
 /// their cost on SLEs at valuation cost — already base currency — so they
 /// are excluded; their GL legs are emitted after costing with rate 1.
 fn is_base_stamped(doctype: &str) -> bool {
     matches!(
         doctype,
-        "Sales Invoice" | "Purchase Invoice" | "Payment Entry"
+        "Sales Invoice" | "Purchase Invoice" | "Payment Entry" | "Journal Entry"
     )
 }
 
@@ -1358,6 +1525,68 @@ fn derive_subledger_rows(
                     }
                     _ => {}
                 }
+            }
+        }
+        // Expense: the VAT row for the return, and money owed to the
+        // supplier when unpaid (the Dart `_expense`).
+        "Expense" => {
+            let net = as_num(payload.get("net_amount"));
+            let tax = as_num(payload.get("tax_amount"));
+            let supplier = as_non_empty(payload.get("supplier"));
+            if tax != 0.0 {
+                tax_rows.push(TaxTransaction {
+                    id: format!("TT-{id}-0"),
+                    company_id: ctx.company_id,
+                    tax_type: "VAT".to_string(),
+                    tax: as_non_empty(payload.get("tax_code")),
+                    posting_date: ctx.posting_date.to_string(),
+                    base_amount: net,
+                    tax_amount: tax,
+                    rate: if net != 0.0 {
+                        round2(tax / net * 100.0)
+                    } else {
+                        0.0
+                    },
+                    party_type: "Supplier".to_string(),
+                    party: supplier.clone(),
+                    voucher_type: ctx.doctype.to_string(),
+                    voucher_no: id.to_string(),
+                    is_reversal: false,
+                    batch_id: ctx.batch_id.to_string(),
+                });
+            }
+            if let (false, Some(supplier)) = (is_true(payload.get("is_paid")), supplier) {
+                let mut row = party_txn(
+                    PartyKind::Supplier,
+                    "Invoice",
+                    supplier,
+                    as_num(payload.get("gross_amount")),
+                );
+                row.due_date = None;
+                party_rows.push(row);
+            }
+        }
+        // Journal Entry: an `Adjustment` per party line, `CT-{id}-{i}` /
+        // `VT-{id}-{i}` (the Dart `_partyAdjustment`). A debit raises what a
+        // customer owes; a credit raises what we owe a supplier.
+        "Journal Entry" => {
+            for (i, row) in journal_rows(payload) {
+                let Some(party) = as_non_empty(row.get("party")) else {
+                    continue;
+                };
+                let net = as_num(row.get("debit")) - as_num(row.get("credit"));
+                let (kind, amount) = match as_non_empty(row.get("party_type"))
+                    .as_deref()
+                    .and_then(PartyKind::parse)
+                {
+                    Some(PartyKind::Customer) => (PartyKind::Customer, net),
+                    Some(PartyKind::Supplier) => (PartyKind::Supplier, -net),
+                    None => continue,
+                };
+                let mut txn = party_txn(kind, "Adjustment", party, amount);
+                txn.id = format!("{}-{i}", txn.id);
+                txn.due_date = None;
+                party_rows.push(txn);
             }
         }
         _ => {}
@@ -2104,6 +2333,251 @@ fn recompute_bins(company_id: Uuid, ledgers: &Ledgers) -> Vec<Bin> {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// C5: Journal Entry, Expense, Customer Deposit
+// ---------------------------------------------------------------------------
+
+/// A rate other than 1 on a voucher Solo never converts. Solo posts Expense
+/// and Customer Deposit amounts as they are (they are not base-stamped), so
+/// Team refuses a foreign-currency one instead of posting it unconverted.
+fn refuse_foreign_rate(doctype: &str, payload: &Map<String, Value>) -> Result<(), PostingError> {
+    match sent_number(payload, "conversion_rate") {
+        Some(rate) if (rate - 1.0).abs() > 1e-9 => Err(PostingError::Validation(format!(
+            "{doctype} posts in the company currency only (conversion_rate {rate}); \
+             record a foreign-currency amount with a Journal Entry or a Purchase Invoice"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A finite, non-negative money field.
+fn money_field(payload: &Map<String, Value>, field: &str, what: &str) -> Result<f64, PostingError> {
+    let value = as_num(payload.get(field));
+    if !value.is_finite() || value < 0.0 {
+        return Err(PostingError::Validation(format!(
+            "{what}: {field} must be zero or more, got {value}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Submit-side rules for the C5 doctypes, over the payload the GL is then
+/// derived from. They match the Solo guards (`JournalBalanceGuard`,
+/// `ExpenseDefaults`, the required fields of each form) and add the checks
+/// a server cannot leave to a well-behaved client: amounts are numbers and
+/// not negative, every GL leg names an account, derived totals are
+/// recomputed rather than trusted.
+fn validate_c5_document(
+    doctype: &str,
+    payload: &mut Map<String, Value>,
+    settings: &CompanySettings,
+) -> Result<(), PostingError> {
+    match doctype {
+        "Journal Entry" => {
+            let rows = match payload.get("accounts") {
+                Some(Value::Array(rows)) => rows.clone(),
+                _ => Vec::new(),
+            };
+            let (mut debit, mut credit, mut lines) = (0.0, 0.0, 0);
+            for (i, row) in rows.iter().enumerate() {
+                let Some(row) = row.as_object() else {
+                    return Err(PostingError::Validation(format!(
+                        "accounts[{i}] must be an object"
+                    )));
+                };
+                let what = format!("accounts[{i}]");
+                let d = money_field(row, "debit", &what)?;
+                let c = money_field(row, "credit", &what)?;
+                if d > 0.0 && c > 0.0 {
+                    return Err(PostingError::Validation(format!(
+                        "{what} has both a debit and a credit; use two lines"
+                    )));
+                }
+                if as_non_empty(row.get("account")).is_none() {
+                    if d > 0.0 || c > 0.0 {
+                        return Err(PostingError::Validation(format!(
+                            "{what} has an amount but no account"
+                        )));
+                    }
+                    continue;
+                }
+                if let Some(party_type) = as_non_empty(row.get("party_type")) {
+                    if PartyKind::parse(&party_type).is_some()
+                        && as_non_empty(row.get("party")).is_none()
+                    {
+                        return Err(PostingError::Validation(format!(
+                            "{what} names party_type {party_type} but no party"
+                        )));
+                    }
+                }
+                if d > 0.0 || c > 0.0 {
+                    lines += 1;
+                }
+                debit += d;
+                credit += c;
+            }
+            if lines < 2 {
+                return Err(PostingError::Validation(
+                    "a Journal Entry needs at least two lines with an amount".into(),
+                ));
+            }
+            if (debit - credit).abs() >= BALANCE_TOLERANCE {
+                return Err(PostingError::Validation(format!(
+                    "Journal Entry does not balance: total debit {debit} ≠ total credit {credit}"
+                )));
+            }
+            // Display totals are derived, never taken from the client.
+            payload.insert("total_debit".into(), json!(debit));
+            payload.insert("total_credit".into(), json!(credit));
+            payload.insert("difference".into(), json!(debit - credit));
+        }
+        "Expense" => {
+            refuse_foreign_rate(doctype, payload)?;
+            // The Solo form defaults `is_paid` to 1: an expense that does
+            // not say otherwise was paid.
+            if matches!(payload.get("is_paid"), None | Some(Value::Null)) {
+                payload.insert("is_paid".into(), json!(1));
+            }
+            let net = money_field(payload, "net_amount", "Expense")?;
+            if net <= 0.0 {
+                return Err(PostingError::Validation(
+                    "Expense: net_amount must be more than zero".into(),
+                ));
+            }
+            let tax = money_field(payload, "tax_amount", "Expense")?;
+            let gross = round2(net + tax);
+            if let Some(sent) = sent_number(payload, "gross_amount") {
+                if (sent - gross).abs() > MONEY_EPS {
+                    return Err(PostingError::Validation(format!(
+                        "Expense: gross_amount {sent} does not equal net {net} + VAT {tax}"
+                    )));
+                }
+            }
+            payload.insert("gross_amount".into(), json!(gross));
+            if as_non_empty(payload.get("expense_account")).is_none() {
+                return Err(PostingError::Validation(
+                    "Expense needs a category (expense_account)".into(),
+                ));
+            }
+            if tax != 0.0 && as_non_empty(payload.get("tax_account")).is_none() {
+                payload.insert("tax_account".into(), json!(settings.default_vat_account));
+            }
+        }
+        "Customer Deposit" => {
+            refuse_foreign_rate(doctype, payload)?;
+            let amount = money_field(payload, "amount", "Customer Deposit")?;
+            if amount <= 0.0 {
+                return Err(PostingError::Validation(
+                    "Customer Deposit: amount must be more than zero".into(),
+                ));
+            }
+            if as_non_empty(payload.get("customer")).is_none() {
+                return Err(PostingError::Validation(
+                    "Customer Deposit needs a customer".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A Payment Entry that names a Customer Deposit (`deposit`): fills the
+/// Dart defaults (`paid_to` = the deposit's liability account, the party =
+/// its customer), checks the application against the deposit, and returns
+/// the guard the store re-checks inside the commit. `None` when the payment
+/// applies no deposit.
+async fn deposit_application(
+    store: &dyn Store,
+    company_id: Uuid,
+    payload: &mut Map<String, Value>,
+) -> Result<Option<DepositGuard>, PostingError> {
+    let Some(deposit_id) = as_non_empty(payload.get("deposit")) else {
+        return Ok(None);
+    };
+    if as_non_empty(payload.get("payment_type")).as_deref() != Some("Receive") {
+        return Err(PostingError::Validation(format!(
+            "deposit {deposit_id} can only be applied by a Receive payment"
+        )));
+    }
+    let deposit = store
+        .posted_document(company_id, "Customer Deposit", &deposit_id)
+        .await?;
+    let Some(deposit_doc) = deposit.as_ref().filter(|d| d.docstatus == 1) else {
+        return Err(PostingError::Validation(format!(
+            "deposit {deposit_id} is not submitted; submit it before applying it"
+        )));
+    };
+    let liability = as_non_empty(deposit_doc.payload.get("deposit_account")).unwrap_or_default();
+    let customer = as_non_empty(deposit_doc.payload.get("customer")).unwrap_or_default();
+    if as_non_empty(payload.get("paid_to")).is_none() {
+        payload.insert("paid_to".into(), json!(liability));
+    }
+    if as_non_empty(payload.get("party")).is_none() {
+        payload.insert("party_type".into(), json!("Customer"));
+        payload.insert("party".into(), json!(customer));
+    }
+    // Applying a deposit moves its liability: a payment that names the
+    // deposit but debits another account would leave the deposit standing
+    // AND settle the invoice — the deposit could then be applied again.
+    let paid_to = as_non_empty(payload.get("paid_to")).unwrap_or_default();
+    if paid_to != liability {
+        return Err(PostingError::Validation(format!(
+            "a payment applying deposit {deposit_id} must debit its liability account \
+             {liability}, not {paid_to}"
+        )));
+    }
+    let party = as_non_empty(payload.get("party")).unwrap_or_default();
+    let guard = DepositGuard::Apply {
+        deposit_id: deposit_id.clone(),
+        customer: party,
+        amount: as_num(payload.get("paid_amount")),
+    };
+    let applications = store.deposit_applications(company_id, &deposit_id).await?;
+    if let Some(reason) = deposit_guard_violation(&guard, deposit.as_ref(), &applications) {
+        return Err(PostingError::Validation(reason));
+    }
+    Ok(Some(guard))
+}
+
+/// No GL leg may land on a group account (the Dart
+/// `GroupAccountPostingGuardInterceptor`): the synced Account master says
+/// which accounts are groups. An account the server has never seen is not
+/// refused here (the server's own default chart has no master).
+async fn check_group_accounts(
+    store: &dyn Store,
+    company_id: Uuid,
+    gl: &[GlEntry],
+) -> Result<(), PostingError> {
+    let mut accounts: Vec<&str> = gl.iter().map(|e| e.account.as_str()).collect();
+    accounts.sort_unstable();
+    accounts.dedup();
+    let mut groups = Vec::new();
+    for account in accounts {
+        if account.is_empty() {
+            return Err(PostingError::Validation(
+                "a ledger line has no account; set the account (or the company default)".into(),
+            ));
+        }
+        if let Some(doc) = store
+            .company_document(company_id, "Account", account)
+            .await?
+        {
+            if is_true(doc.payload.get("is_group")) {
+                groups.push(account.to_string());
+            }
+        }
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
+    Err(PostingError::Validation(format!(
+        "cannot post to group account{} {}: choose a leaf (posting) account",
+        if groups.len() > 1 { "s" } else { "" },
+        groups.join(", ")
+    )))
 }
 
 /// Document types a Payment Entry may settle.
