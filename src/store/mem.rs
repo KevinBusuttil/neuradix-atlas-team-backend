@@ -49,6 +49,10 @@ struct Inner {
     mutation_versions: HashMap<(Uuid, String), i64>,
     /// company -> last assigned version
     counters: HashMap<Uuid, i64>,
+    /// company -> chain value per version (index = version - 1); C4
+    chain: HashMap<Uuid, Vec<Vec<u8>>>,
+    /// (company_id, recovery id) -> stored lost-history response; C4
+    history_recoveries: HashMap<(Uuid, String), Value>,
     /// (company_id, sha256) -> bytes
     blobs: HashMap<(Uuid, String), Vec<u8>>,
     audit: Vec<AuditEntry>,
@@ -109,6 +113,13 @@ impl Inner {
             let version = *next;
             self.mutation_versions.insert(key, version);
             versions.push((record.id.clone(), version));
+            let links = self.chain.entry(company_id).or_default();
+            let prev = links
+                .last()
+                .cloned()
+                .unwrap_or_else(|| crate::history::GENESIS.to_vec());
+            let json = serde_json::to_value(&record).unwrap_or(Value::Null);
+            links.push(crate::history::link(&prev, version, &record.id, &json));
             // The materialized document read model follows the log inside
             // the same mutex hold (same atomicity as the log write).
             self.apply_projection(company_id, &record);
@@ -473,6 +484,88 @@ impl Store for MemStore {
             has_more,
             head,
         })
+    }
+
+    async fn history_checkpoint(
+        &self,
+        company_id: Uuid,
+        at: i64,
+    ) -> Result<crate::history::HistoryCheckpoint, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        let head = inner.counters.get(&company_id).copied().unwrap_or(0);
+        let links = inner.chain.get(&company_id);
+        let hash_at = |v: i64| -> Option<Vec<u8>> {
+            if v <= 0 {
+                return Some(crate::history::GENESIS.to_vec());
+            }
+            links.and_then(|l| l.get(usize::try_from(v - 1).ok()?).cloned())
+        };
+        Ok(crate::history::HistoryCheckpoint {
+            protocol: crate::history::HISTORY_PROTOCOL,
+            head,
+            head_hash: hex::encode(hash_at(head).unwrap_or_default()),
+            at: at.max(0),
+            at_hash: if at > head {
+                None
+            } else {
+                hash_at(at).map(hex::encode)
+            },
+        })
+    }
+
+    async fn lost_history_lookup(
+        &self,
+        company_id: Uuid,
+        records: &[crate::history::LostRecord],
+    ) -> Result<Vec<(bool, Option<String>)>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(records
+            .iter()
+            .map(|r| {
+                let present = inner.documents.contains_key(&(
+                    company_id,
+                    r.doctype.clone(),
+                    r.document_id.clone(),
+                ));
+                let holder = r.number.as_ref().filter(|n| !n.is_empty()).and_then(|n| {
+                    inner
+                        .documents
+                        .values()
+                        .find(|d| {
+                            d.company_id == company_id
+                                && d.doctype == r.doctype
+                                && d.id != r.document_id
+                                && d.official_number.as_deref() == Some(n.as_str())
+                        })
+                        .map(|d| d.id.clone())
+                });
+                (present, holder)
+            })
+            .collect())
+    }
+
+    async fn commit_lost_history(
+        &self,
+        company_id: Uuid,
+        _device_id: Option<Uuid>,
+        report: &crate::history::LostHistoryReport,
+        floors: &[(String, i64)],
+        response: Value,
+    ) -> Result<(Value, bool), StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let key = (company_id, report.recovery_id.clone());
+        if let Some(stored) = inner.history_recoveries.get(&key) {
+            return Ok((stored.clone(), true));
+        }
+        for (series, floor) in floors {
+            let next = inner
+                .series
+                .entry((company_id, series.clone()))
+                .or_insert(0);
+            *next = (*next).max(*floor);
+        }
+        inner.history_recoveries.insert(key, response.clone());
+        Ok((response, false))
     }
 
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError> {

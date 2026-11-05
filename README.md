@@ -129,6 +129,7 @@ missing or unknown).
 | POST | `/companies/{id}/devices` | user token | `{name}` → `{deviceId, deviceToken}` |
 | POST | `/companies/{id}/sync/push` | **device token** | `{mutations: [MutationRecord…]}` → `{versions: {id: version}}`; idempotent on mutation id |
 | GET | `/companies/{id}/sync/pull?after={v}` | **device token** | `{mutations: […], hasMore, head}` with `syncVersion` set, ordered by version; `after` omitted = from 0; `head` = newest version (a cursor beyond it means the server was restored) |
+| GET | `/companies/{id}/sync/history?at=N` | **device token** | C4 history identity: `{protocol, head, headHash, at, atHash}`. `atHash` is the log's hash-chain value at version N, or null when the log ends before N. A device compares it with its checkpoint to detect a restored server, even one whose log has grown past the device's cursor. Submit and cancel responses carry `history: {version, hash}` |
 | POST | `/companies/{id}/sync/ack` | **device token** | `{ids: […]}` → `{acknowledged: n}` |
 | PUT | `/companies/{id}/blobs/{sha256}` | member | Raw bytes body; 201, or **422** if the body's SHA-256 ≠ path |
 | GET / HEAD | `/companies/{id}/blobs/{sha256}` | member | Bytes / existence; 404 when absent |
@@ -141,6 +142,7 @@ missing or unknown).
 | POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, party_transactions, tax_transactions, bins, settlements}` |
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
 | POST | `/companies/{id}/commands/import-solo-opening` | **device token**, Owner | One-time Solo → Team take-on: posts `SOLO-OPENING-{migration_id}`, checks the trial balance, receivables, payables and stock against the package, sets numbering floors. Idempotent on `migration_id` (409 if the package changed); refused once done or if the company already has postings. Tests: `tests/solo_migration.rs` |
+| POST | `/companies/{id}/commands/report-lost-history` | **device token**, Owner/Admin/Accountant | C4: a recovering device lists the official records the restored server lost. The response says which are still present and which numbers were since issued to other documents, and the server raises each series past the lost numbers. Idempotent on `recovery_id`; audited as `sync.lost_history`. Tests: `tests/history.rs` |
 
 Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
 Command-role gates: Sales Invoice → sales/owner/admin · Purchase

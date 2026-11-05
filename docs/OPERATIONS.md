@@ -108,15 +108,20 @@ production at any time. It is the first check after any incident.
    `docker compose up -d backend` and `curl -s 127.0.0.1:8080/ready`.
 4. Point DNS / nginx at the new host. Devices reconnect with their existing
    tokens (the hashes are in the dump).
-5. **Devices that synced after the backup's time are ahead of the server.**
-   Every pull returns the log `head`; a client whose cursor is beyond it
-   detects the restored server and re-pulls from 0 automatically (the hub's
-   `TeamSyncRunner`; applying is idempotent). Drafts a device pushed after the
-   backup are no longer on the server: they are still on that device but
-   marked synced, so re-save them (or re-enter them) to queue them again.
-   Official postings made after the backup are lost with the RPO window and
-   must be re-submitted from the source paperwork. Record which in the
-   incident log.
+5. **Devices that synced after the backup's time hold history the server no
+   longer has.** The log carries a hash chain (`src/history.rs`); each device
+   checks its last checkpoint (`GET …/sync/history?at=N`) before it syncs, so
+   it notices the restore even if the log has since grown past its cursor
+   (C4). Sync and Team posting pause on that device and the Team screen
+   offers **Recover this device**: an encrypted copy of the device's books,
+   a book rebuilt from the server, a list of every official record the
+   server lost (sent with `POST …/commands/report-lost-history`, which flags
+   numbers since reused and raises each series past the lost numbers), and
+   the device's unsent drafts and offline till sales kept. Nothing is
+   re-posted automatically: lost official documents are re-entered from the
+   source paperwork. Collect `team-recovery/<id>/archive/recovery-report.json`
+   from one owner, admin or accountant device and file it with the incident
+   log, together with the `sync.lost_history` audit rows.
 
 ## Migrations and rollback
 

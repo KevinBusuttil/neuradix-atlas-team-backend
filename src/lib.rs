@@ -13,6 +13,7 @@ pub mod api;
 pub mod auth;
 pub mod authority;
 pub mod error;
+pub mod history;
 pub mod limit;
 pub mod model;
 pub mod pay;
