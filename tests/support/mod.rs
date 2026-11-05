@@ -45,6 +45,20 @@ pub struct PgTestDb {
     name: String,
 }
 
+impl PgTestDb {
+    /// The connection URL of this test's own database.
+    pub fn url(&self) -> String {
+        format!(
+            "{}/{}",
+            self.admin_url
+                .rsplit_once('/')
+                .map(|(base, _)| base)
+                .unwrap_or(&self.admin_url),
+            self.name
+        )
+    }
+}
+
 impl Drop for PgTestDb {
     fn drop(&mut self) {
         let admin_url = self.admin_url.clone();
@@ -201,6 +215,13 @@ impl TestApp {
         app.owner_token = body["token"].as_str().unwrap().to_string();
         app.owner_user_id = body["userId"].as_str().unwrap().to_string();
         app
+    }
+
+    /// The PostgreSQL URL of this app's database, when the suite runs on
+    /// PostgreSQL (None on the in-memory store).
+    #[allow(dead_code)]
+    pub fn pg_url(&self) -> Option<String> {
+        self._db.as_ref().map(PgTestDb::url)
     }
 
     pub fn company_uuid(&self) -> Uuid {

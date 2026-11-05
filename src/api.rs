@@ -135,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/companies/{company_id}/sync/push", post(sync_push))
         .route("/companies/{company_id}/sync/pull", get(sync_pull))
         .route("/companies/{company_id}/sync/ack", post(sync_ack))
+        .route("/companies/{company_id}/sync/history", get(sync_history))
         .route(
             "/companies/{company_id}/blobs/{sha256}",
             put(put_blob)
@@ -162,6 +163,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/companies/{company_id}/commands/import-solo-opening",
             post(import_solo_opening),
+        )
+        .route(
+            "/companies/{company_id}/commands/report-lost-history",
+            post(report_lost_history),
         )
         // Portal-link + pay-link management (bearer auth, not rate-limited).
         .merge(crate::portal::management_routes())
@@ -911,6 +916,138 @@ async fn sync_ack(
     Ok(Json(json!({ "acknowledged": acknowledged })))
 }
 
+#[derive(Deserialize)]
+struct HistoryQuery {
+    at: Option<i64>,
+}
+
+/// C4: the log's history identity — its head, the chain value at the head,
+/// and the chain value at `at` (the device's checkpoint; null when the log
+/// no longer reaches it). A device that finds its checkpoint changed knows
+/// the server was restored, even if the log has since grown past it. See
+/// `crate::history`.
+async fn sync_history(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    let checkpoint = state
+        .store
+        .history_checkpoint(company_id, query.at.unwrap_or(0))
+        .await?;
+    Ok(Json(json!(checkpoint)))
+}
+
+/// Adds the log head and its chain value to a posting response, so the
+/// device can move its history checkpoint past the rows it just caused
+/// (a restore that loses them is then detected on its next sync).
+async fn with_history(
+    state: &AppState,
+    company_id: Uuid,
+    mut response: Value,
+) -> Result<Json<Value>, ApiError> {
+    let checkpoint = state.store.history_checkpoint(company_id, 0).await?;
+    response["history"] = json!({ "version": checkpoint.head, "hash": checkpoint.head_hash });
+    Ok(Json(response))
+}
+
+/// C4: a device recovering from a restored server reports the official
+/// records it had that the server no longer has. The server answers which
+/// of them it does still have, which official numbers have since been
+/// issued to other documents, and raises each series past the lost numbers
+/// so they are never issued again. Nothing is re-posted: the lost documents
+/// must be re-entered. Owner, Admin or Accountant; idempotent on
+/// `recovery_id`; audited.
+async fn report_lost_history(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(report): Json<crate::history::LostHistoryReport>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    require_role(role, &[Role::Owner, Role::Admin, Role::Accountant])?;
+    let id_ok = !report.recovery_id.is_empty()
+        && report.recovery_id.len() <= 80
+        && report
+            .recovery_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !id_ok {
+        return Err(ApiError::BadRequest("recovery_id is not valid".into()));
+    }
+    if report.lost.len() > 10_000 {
+        return Err(ApiError::BadRequest(
+            "too many records in one report".into(),
+        ));
+    }
+    let found = state
+        .store
+        .lost_history_lookup(company_id, &report.lost)
+        .await?;
+    let mut still_present = Vec::new();
+    let mut number_reused = Vec::new();
+    let mut floors: std::collections::BTreeMap<String, i64> = Default::default();
+    for (record, (present, holder)) in report.lost.iter().zip(found) {
+        if present {
+            still_present
+                .push(json!({ "doctype": record.doctype, "document_id": record.document_id }));
+            continue;
+        }
+        if let Some(holder) = holder {
+            number_reused.push(json!({
+                "doctype": record.doctype,
+                "number": record.number,
+                "lost_document_id": record.document_id,
+                "server_document_id": holder,
+            }));
+        }
+        if let Some((key, value)) = record
+            .number
+            .as_deref()
+            .and_then(|n| crate::history::floor_for(&record.doctype, n))
+        {
+            let floor = floors.entry(key.to_string()).or_insert(0);
+            *floor = (*floor).max(value);
+        }
+    }
+    let floors: Vec<(String, i64)> = floors.into_iter().collect();
+    let response = json!({
+        "recovery_id": report.recovery_id,
+        "reported": report.lost.len(),
+        "still_present": still_present,
+        "number_reused": number_reused,
+        "numbering_floors": floors
+            .iter()
+            .map(|(series, value)| json!({ "series": series, "floor": value }))
+            .collect::<Vec<_>>(),
+    });
+    let (stored, replayed) = state
+        .store
+        .commit_lost_history(company_id, auth.device_id(), &report, &floors, response)
+        .await?;
+    if !replayed {
+        audit(
+            &state,
+            company_id,
+            Some(&auth),
+            "sync.lost_history",
+            json!({
+                "recovery_id": report.recovery_id,
+                "reported": report.lost.len(),
+                "number_reused": stored["number_reused"].as_array().map(|a| a.len()).unwrap_or(0),
+            }),
+        )
+        .await?;
+    }
+    let mut out = stored;
+    out["replayed"] = json!(replayed);
+    Ok(Json(out))
+}
+
 // ---------------------------------------------------------------------------
 // Blobs (content-addressed attachment bytes, ADR-048 contract)
 // ---------------------------------------------------------------------------
@@ -1228,7 +1365,7 @@ async fn submit_document(
         Actor::user(auth.user_id(), auth.device_id()),
     )
     .await?;
-    Ok(Json(outcome.response))
+    with_history(&state, company_id, outcome.response).await
 }
 
 #[derive(Deserialize)]
@@ -1263,7 +1400,7 @@ async fn cancel_document(
         Actor::user(auth.user_id(), auth.device_id()),
     )
     .await?;
-    Ok(Json(outcome.response))
+    with_history(&state, company_id, outcome.response).await
 }
 
 /// C3 — the one-time Solo → Team take-on (see `posting::solo_migration`).

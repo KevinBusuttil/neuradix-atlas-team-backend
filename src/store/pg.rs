@@ -189,6 +189,7 @@ async fn append_mutations(
             .fetch_one(&mut *conn)
             .await?;
     let mut last: i64 = row.try_get("last_version")?;
+    let mut chain = chain_tip(&mut *conn, company_id, last).await?;
 
     let mut versions = Vec::with_capacity(mutations.len());
     for record in mutations {
@@ -205,14 +206,16 @@ async fn append_mutations(
         }
         last += 1;
         let json = serde_json::to_value(&record)?;
+        chain = crate::history::link(&chain, last, &record.id, &json);
         sqlx::query(
-            "insert into mutations (company_id, mutation_id, sync_version, record) \
-             values ($1, $2, $3, $4)",
+            "insert into mutations (company_id, mutation_id, sync_version, record, chain_hash) \
+             values ($1, $2, $3, $4, $5)",
         )
         .bind(company_id)
         .bind(&record.id)
         .bind(last)
         .bind(json)
+        .bind(&chain)
         .execute(&mut *conn)
         .await?;
         // The materialized document read model follows the log inside the
@@ -220,12 +223,63 @@ async fn append_mutations(
         apply_projection(&mut *conn, company_id, &record).await?;
         versions.push((record.id, last));
     }
-    sqlx::query("update sync_counters set last_version = $2 where company_id = $1")
+    sqlx::query("update sync_counters set last_version = $2, last_hash = $3 where company_id = $1")
         .bind(company_id)
         .bind(last)
+        .bind(&chain)
         .execute(&mut *conn)
         .await?;
     Ok(versions)
+}
+
+/// The chain value at the log head `last`, with the company's counter row
+/// already locked. Rows written before the chain existed are linked here,
+/// once, in version order.
+async fn chain_tip(
+    conn: &mut sqlx::PgConnection,
+    company_id: Uuid,
+    last: i64,
+) -> Result<Vec<u8>, StoreError> {
+    if last == 0 {
+        return Ok(crate::history::GENESIS.to_vec());
+    }
+    let stored: Option<Vec<u8>> =
+        sqlx::query("select last_hash from sync_counters where company_id = $1")
+            .bind(company_id)
+            .fetch_one(&mut *conn)
+            .await?
+            .try_get("last_hash")?;
+    if let Some(hash) = stored {
+        return Ok(hash);
+    }
+    let rows = sqlx::query(
+        "select mutation_id, sync_version, record from mutations \
+         where company_id = $1 order by sync_version",
+    )
+    .bind(company_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut chain = crate::history::GENESIS.to_vec();
+    for row in rows {
+        let id: String = row.try_get("mutation_id")?;
+        let version: i64 = row.try_get("sync_version")?;
+        let record: Value = row.try_get("record")?;
+        chain = crate::history::link(&chain, version, &id, &record);
+        sqlx::query(
+            "update mutations set chain_hash = $3 where company_id = $1 and sync_version = $2",
+        )
+        .bind(company_id)
+        .bind(version)
+        .bind(&chain)
+        .execute(&mut *conn)
+        .await?;
+    }
+    sqlx::query("update sync_counters set last_hash = $2 where company_id = $1")
+        .bind(company_id)
+        .bind(&chain)
+        .execute(&mut *conn)
+        .await?;
+    Ok(chain)
 }
 
 fn portal_link_from_row(row: &PgRow) -> Result<PortalLink, StoreError> {
@@ -747,6 +801,137 @@ impl Store for PgStore {
             has_more,
             head,
         })
+    }
+
+    async fn history_checkpoint(
+        &self,
+        company_id: Uuid,
+        at: i64,
+    ) -> Result<crate::history::HistoryCheckpoint, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into sync_counters (company_id, last_version) values ($1, 0) \
+             on conflict (company_id) do nothing",
+        )
+        .bind(company_id)
+        .execute(&mut *tx)
+        .await?;
+        let head: i64 =
+            sqlx::query("select last_version from sync_counters where company_id = $1 for update")
+                .bind(company_id)
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get("last_version")?;
+        let head_hash = chain_tip(&mut tx, company_id, head).await?;
+        let at_hash = if at <= 0 {
+            Some(crate::history::GENESIS.to_vec())
+        } else if at > head {
+            None
+        } else {
+            sqlx::query(
+                "select chain_hash from mutations where company_id = $1 and sync_version = $2",
+            )
+            .bind(company_id)
+            .bind(at)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.try_get::<Option<Vec<u8>>, _>("chain_hash"))
+            .transpose()?
+            .flatten()
+        };
+        tx.commit().await?;
+        Ok(crate::history::HistoryCheckpoint {
+            protocol: crate::history::HISTORY_PROTOCOL,
+            head,
+            head_hash: hex::encode(head_hash),
+            at: at.max(0),
+            at_hash: at_hash.map(hex::encode),
+        })
+    }
+
+    async fn lost_history_lookup(
+        &self,
+        company_id: Uuid,
+        records: &[crate::history::LostRecord],
+    ) -> Result<Vec<(bool, Option<String>)>, StoreError> {
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            let present = sqlx::query(
+                "select 1 from documents where company_id = $1 and doctype = $2 and id = $3",
+            )
+            .bind(company_id)
+            .bind(&r.doctype)
+            .bind(&r.document_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+            let holder = match &r.number {
+                Some(number) if !number.is_empty() => sqlx::query(
+                    "select id from documents where company_id = $1 and doctype = $2 \
+                     and official_number = $3 and id <> $4",
+                )
+                .bind(company_id)
+                .bind(&r.doctype)
+                .bind(number)
+                .bind(&r.document_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|row| row.try_get::<String, _>("id"))
+                .transpose()?,
+                _ => None,
+            };
+            out.push((present, holder));
+        }
+        Ok(out)
+    }
+
+    async fn commit_lost_history(
+        &self,
+        company_id: Uuid,
+        device_id: Option<Uuid>,
+        report: &crate::history::LostHistoryReport,
+        floors: &[(String, i64)],
+        response: Value,
+    ) -> Result<(Value, bool), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "insert into history_recoveries (company_id, recovery_id, device_id, report, response) \
+             values ($1, $2, $3, $4, $5) on conflict (company_id, recovery_id) do nothing",
+        )
+        .bind(company_id)
+        .bind(&report.recovery_id)
+        .bind(device_id)
+        .bind(serde_json::to_value(report)?)
+        .bind(&response)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            let stored: Value = sqlx::query(
+                "select response from history_recoveries where company_id = $1 and recovery_id = $2",
+            )
+            .bind(company_id)
+            .bind(&report.recovery_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("response")?;
+            tx.commit().await?;
+            return Ok((stored, true));
+        }
+        for (series, floor) in floors {
+            sqlx::query(
+                "insert into numbering_series (company_id, series_key, next_value) \
+                 values ($1, $2, $3) on conflict (company_id, series_key) \
+                 do update set next_value = greatest(numbering_series.next_value, excluded.next_value)",
+            )
+            .bind(company_id)
+            .bind(series)
+            .bind(floor)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok((response, false))
     }
 
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError> {

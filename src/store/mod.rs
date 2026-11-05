@@ -171,6 +171,33 @@ pub trait Store: Send + Sync {
         after: i64,
         limit: i64,
     ) -> Result<MutationPage, StoreError>;
+    /// C4: the company log's head and chain value, and the chain value at
+    /// `at` (None when `at` is past the head). Links rows written before the
+    /// chain existed on first use.
+    async fn history_checkpoint(
+        &self,
+        company_id: Uuid,
+        at: i64,
+    ) -> Result<crate::history::HistoryCheckpoint, StoreError>;
+    /// C4: for each (doctype, document id, official number) a recovering
+    /// device reported lost: whether the server still has that document, and
+    /// which other document (if any) now holds that official number.
+    async fn lost_history_lookup(
+        &self,
+        company_id: Uuid,
+        records: &[crate::history::LostRecord],
+    ) -> Result<Vec<(bool, Option<String>)>, StoreError>;
+    /// C4: records a lost-history report and raises the numbering floors in
+    /// one step. Returns the stored response instead when `recovery_id` was
+    /// already recorded (a retried report changes nothing).
+    async fn commit_lost_history(
+        &self,
+        company_id: Uuid,
+        device_id: Option<Uuid>,
+        report: &crate::history::LostHistoryReport,
+        floors: &[(String, i64)],
+        response: Value,
+    ) -> Result<(Value, bool), StoreError>;
     /// Marks the given mutation ids acknowledged; returns how many matched.
     async fn ack_mutations(&self, company_id: Uuid, ids: &[String]) -> Result<u64, StoreError>;
 
