@@ -144,6 +144,20 @@ git checkout vX.Y.(Z-1) && docker compose up -d --build backend
 - If a release ever must break the policy, its notes say so, and rolling back
   past it means restoring the pre-upgrade backup.
 
+### App and server versions (C6 protocol contract)
+
+- Upgrade the **server first**, then the apps. A new app refuses to sync with
+  a server below its minimum protocol and says the server needs updating;
+  nothing on the device is lost, it waits until the server is upgraded.
+- `curl -fsS 127.0.0.1:8080/protocol` shows the protocol this binary speaks
+  and the minimum app protocol it accepts.
+- Rolling the server back below the protocol the apps need stops their sync
+  (with that message) until the server is upgraded again. Check the release
+  notes' protocol before a rollback.
+- Once every device runs a current app, set `ATLAS_MIN_CLIENT_PROTOCOL` to
+  the current protocol (3) so an old install cannot write to the books. An
+  outdated app then gets a 426 asking the user to update.
+
 ## Monitoring and alerting
 
 | Signal | Source | Alert |

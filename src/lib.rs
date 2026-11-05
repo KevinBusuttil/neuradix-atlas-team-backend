@@ -20,6 +20,7 @@ pub mod pay;
 pub mod portal;
 pub mod posting;
 pub mod projection;
+pub mod protocol;
 pub mod store;
 
 use std::sync::Arc;

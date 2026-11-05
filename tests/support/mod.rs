@@ -232,6 +232,8 @@ impl TestApp {
         self.owner_user_id.parse().unwrap()
     }
 
+    /// A request as the current app sends it: with this server's protocol
+    /// level in `X-Atlas-Protocol` (C6).
     pub async fn request(
         &self,
         method: Method,
@@ -239,6 +241,24 @@ impl TestApp {
         token: Option<&str>,
         body: Value,
     ) -> (StatusCode, Value) {
+        let protocol = atlas_team_backend::protocol::PROTOCOL.to_string();
+        let (status, _, value) = self
+            .request_with_protocol(method, uri, token, Some(&protocol), body)
+            .await;
+        (status, value)
+    }
+
+    /// A request carrying `protocol` in `X-Atlas-Protocol` (None: no header,
+    /// as a pre-contract client sends). Returns the response's own
+    /// `X-Atlas-Protocol` too.
+    pub async fn request_with_protocol(
+        &self,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+        protocol: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Option<String>, Value) {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
@@ -246,16 +266,23 @@ impl TestApp {
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
+        if let Some(protocol) = protocol {
+            builder = builder.header(atlas_team_backend::protocol::HEADER, protocol);
+        }
         let request = builder.body(Body::from(body.to_string())).unwrap();
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
+        let server_protocol = response
+            .headers()
+            .get(atlas_team_backend::protocol::HEADER)
+            .map(|v| v.to_str().unwrap().to_string());
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let value = if bytes.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&bytes).unwrap()
         };
-        (status, value)
+        (status, server_protocol, value)
     }
 
     /// A device token whose user holds `role` in the company. The owner's

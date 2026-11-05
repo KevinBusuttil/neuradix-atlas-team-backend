@@ -87,6 +87,7 @@ All read once at startup.
 | `ATLAS_USER_TOKEN_TTL_DAYS` | `30` | Absolute lifetime of newly issued user tokens |
 | `ATLAS_SYNC_PULL_PAGE_SIZE` | `200` | Server-side cap on mutations per `/sync/pull` page |
 | `ATLAS_MAX_BLOB_MB` | `25` | Maximum accepted blob upload size (MiB) |
+| `ATLAS_MIN_CLIENT_PROTOCOL` | `0` | C6: oldest app protocol the client planes accept (clamped to this server's protocol). `0` also accepts apps built before the contract, which send no `X-Atlas-Protocol`; set `3` to refuse them with 426 (see "Protocol contract") |
 
 Rate limiting is an in-process token bucket (capacity = the per-minute
 budget, continuous refill). Over-limit requests get **429** with a JSON
@@ -122,7 +123,8 @@ missing or unknown).
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | Liveness: `{"status":"ok"}` |
-| GET | `/ready` | none | Readiness: 503 unless the database answers; reports `schemaVersion` |
+| GET | `/ready` | none | Readiness: 503 unless the database answers; reports `schemaVersion` and `protocol` |
+| GET | `/protocol` | none | C6: `{protocol, minClientProtocol, version}`, so an app can check a server before signing in or syncing |
 | POST | `/companies` | none (bootstrap; `X-Atlas-Bootstrap-Token` when `ATLAS_BOOTSTRAP_TOKEN` is set) | `{name, owner_email, owner_name}` → company + owner + owner membership; returns a user token |
 | POST | `/companies/{id}/invitations` | user/device token, **owner or admin** | `{email, role}` → `{token, expiresAt}` (7-day expiry) |
 | POST | `/invitations/{token}/accept` | none (token is the credential) | `{display_name}` → creates/joins user + membership; returns a user token |
@@ -359,6 +361,32 @@ These follow the Dart engine's posting, pinned by the shared fixtures
 Not covered yet (kept blocked or refused, see the client's
 `docs/team/TEAM_1_0_SCOPE_AND_PILOT.md`): foreign-currency Expense and
 Customer Deposit, and refunding part of a deposit.
+
+## Protocol contract (C6)
+
+`contract/team_protocol.json` is the client/server compatibility contract;
+the hub keeps a copy and its CI fails when the two differ. `src/protocol.rs`
+holds the same numbers and a unit test checks them against the file.
+
+- The server speaks protocol **3** (1: sync, identity and the first posting
+  commands; 2: C4 history checkpoints; 3: C5 postings and the books-lock
+  command). It says so on `GET /protocol`, on `/ready`, and in the
+  `X-Atlas-Protocol` header of every response.
+- The app sends its level in the same header. On `/companies…` and
+  `/invitations…` a level below `ATLAS_MIN_CLIENT_PROTOCOL` gets **426**
+  with a message to update the app, before authentication or any handler
+  runs. A non-numeric header is a 400. No header counts as 0 (an app from
+  before the contract). Health, readiness, webhooks, portal and pay pages
+  are never refused.
+- The app refuses to sync with a server below its own minimum (3 for this
+  release), so a new app never runs against a server that lacks the
+  commands it relies on.
+- Bump `protocol` (here, in the contract file and in the app) whenever the
+  app starts relying on something an older server does not do. Raise the
+  minimum only when an older app would be unsafe, and update the apps first.
+
+Tests: `src/protocol.rs` (contract file, rules), `tests/protocol.rs` (over
+HTTP with the minimum raised to 3).
 
 ## Posting authority on the sync plane
 
@@ -602,7 +630,7 @@ signature + idempotency + outstanding guards bound even that.
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test          # 149 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation + C4 history + C5 authority); no DB required
+cargo test          # 155 tests over MemStore (unit + API + fixtures + posting + replication + portal + payments + abuse protection + authority guard + tenant isolation + C4 history + C5 authority + C6 protocol); no DB required
 
 # The SAME suite over PgStore (what production runs): point the harness at a
 # disposable Postgres server's admin URL. Every test creates its own uniquely

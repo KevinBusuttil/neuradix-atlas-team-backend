@@ -1,0 +1,22 @@
+{
+  "comment": "The Atlas Team client/server protocol contract. The backend is the source of truth; the hub keeps a copy at test/fixtures/team_protocol.json and CI fails when they differ. Bump `protocol` whenever a client needs something an older server does not do, and record why below.",
+  "protocol": 3,
+  "header": "X-Atlas-Protocol",
+  "unversionedClientProtocol": 0,
+  "defaultMinClientProtocol": 0,
+  "clientMinServerProtocol": 3,
+  "levels": [
+    {
+      "protocol": 1,
+      "summary": "Mutation-log sync, identity, devices, official posting commands for sales, purchasing, stock, POS and payments."
+    },
+    {
+      "protocol": 2,
+      "summary": "C4: history checkpoint on sync pull and posting responses, GET sync/history, report-lost-history."
+    },
+    {
+      "protocol": 3,
+      "summary": "C5: server posts Journal Entry, Expense and Customer Deposit; books lock only through set-books-lock; settings PUT refuses a lock change; GET /protocol and the X-Atlas-Protocol header."
+    }
+  ]
+}

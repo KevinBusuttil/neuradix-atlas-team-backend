@@ -107,6 +107,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/protocol", get(protocol))
         .route(
             "/companies/{company_id}/invitations",
             post(create_invitation),
@@ -184,6 +185,9 @@ pub fn router(state: AppState) -> Router {
         // is rejected by the extractor with a plain 413, before any handler
         // (and thus any `ApiError` mapping) runs.
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT_BYTES))
+        // C6: refuse an outdated client before it touches anything, and
+        // stamp the server's protocol on every response.
+        .layer(axum::middleware::from_fn(crate::protocol::enforce))
         .layer(axum::middleware::from_fn(request_log))
         .with_state(state)
 }
@@ -262,6 +266,12 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
+/// C6: the protocol contract (see `crate::protocol`). Unauthenticated, so
+/// an app can check a server before it signs in or syncs.
+async fn protocol() -> Json<Value> {
+    Json(crate::protocol::describe())
+}
+
 /// Readiness, for monitoring and deploy gates: unlike `/health` (process
 /// liveness), this answers 503 when the database cannot serve a query, and
 /// reports the applied schema version so a deploy can confirm its
@@ -272,6 +282,7 @@ async fn ready(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
             "status": "ready",
             "schemaVersion": schema_version,
             "version": env!("CARGO_PKG_VERSION"),
+            "protocol": crate::protocol::PROTOCOL,
         }))),
         Err(err) => {
             tracing::error!(error = %err, "readiness check failed");
