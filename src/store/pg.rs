@@ -1140,6 +1140,36 @@ impl Store for PgStore {
             }
         }
 
+        // Solo take-on (see the MemStore twin): only into a company with no
+        // official document and no earlier take-on. The advisory lock above
+        // serializes this with every other commit of the company; the
+        // primary key of solo_migrations is the backstop.
+        if let Some(mark) = &commit.solo_migration {
+            let earlier =
+                sqlx::query("select migration_id from solo_migrations where company_id = $1")
+                    .bind(company)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(row) = earlier {
+                let earlier: String = row.try_get("migration_id")?;
+                return Err(StoreError::Conflict(format!(
+                    "this company already received a Solo opening position \
+                     (migration {earlier}); a company can be moved from Solo only once"
+                )));
+            }
+            let official = sqlx::query("select 1 from documents where company_id = $1 limit 1")
+                .bind(company)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if official.is_some() {
+                return Err(StoreError::Conflict(format!(
+                    "this company already holds official documents; migration {} can \
+                     only move a Solo book into a new, empty Team company",
+                    mark.migration_id
+                )));
+            }
+        }
+
         // Optimistic stock-ledger expectations.
         for (item, warehouse, expected) in &commit.sle_expectations {
             let row = sqlx::query(
@@ -1262,6 +1292,31 @@ impl Store for PgStore {
             let number = format_number(series, value);
             document.official_number = Some(number.clone());
             response["number"] = json!(number);
+        }
+
+        for (series, floor) in &commit.numbering_floors {
+            sqlx::query(
+                "insert into numbering_series (company_id, series_key, next_value) \
+                 values ($1, $2, $3) on conflict (company_id, series_key) \
+                 do update set next_value = greatest(numbering_series.next_value, excluded.next_value)",
+            )
+            .bind(company)
+            .bind(series)
+            .bind(floor)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(mark) = &commit.solo_migration {
+            sqlx::query(
+                "insert into solo_migrations (company_id, migration_id, document_id, package_sha256) \
+                 values ($1, $2, $3, $4)",
+            )
+            .bind(company)
+            .bind(&mark.migration_id)
+            .bind(&document.id)
+            .bind(&mark.package_sha256)
+            .execute(&mut *tx)
+            .await?;
         }
 
         if commit.document_is_new {

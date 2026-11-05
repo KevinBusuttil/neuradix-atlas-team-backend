@@ -12,5 +12,6 @@
 pub mod engine;
 pub mod model;
 pub mod replication;
+pub mod solo_migration;
 pub mod stock;
 pub mod values;

@@ -169,7 +169,7 @@ const MAX_POSTING_YEAR: i32 = 2100;
 /// [`MIN_POSTING_YEAR`] and [`MAX_POSTING_YEAR`]. Everything downstream (the
 /// period-lock comparison, GL/SLE stamping, replication) then operates on
 /// validated ISO dates only, so lexicographic date comparison is sound.
-fn validated_posting_date(payload: &Map<String, Value>) -> Result<String, PostingError> {
+pub(crate) fn validated_posting_date(payload: &Map<String, Value>) -> Result<String, PostingError> {
     let date = match payload.get("posting_date") {
         None | Some(Value::Null) => return Ok(today()),
         Some(Value::String(s)) if s.trim().is_empty() => return Ok(today()),
@@ -524,6 +524,8 @@ async fn build_submit(
         replication_device_id: actor.replication_device_id,
         audit: audit_row(company_id, actor, "command.submit-document", audit_detail),
         response,
+        numbering_floors: Vec::new(),
+        solo_migration: None,
     })
 }
 
@@ -735,6 +737,8 @@ async fn build_cancel(
             json!({ "doctype": cmd.doctype, "documentId": document_id }),
         ),
         response,
+        numbering_floors: Vec::new(),
+        solo_migration: None,
     })
 }
 
@@ -1627,7 +1631,7 @@ impl Ledgers {
     }
 }
 
-async fn load_items(
+pub(crate) async fn load_items(
     store: &dyn Store,
     company_id: Uuid,
     sles: &[StockLedgerEntry],
@@ -2023,7 +2027,10 @@ fn split_grni_from_expense(
 // Validation + derived balances
 // ---------------------------------------------------------------------------
 
-fn check_period_lock(settings: &CompanySettings, posting_date: &str) -> Result<(), PostingError> {
+pub(crate) fn check_period_lock(
+    settings: &CompanySettings,
+    posting_date: &str,
+) -> Result<(), PostingError> {
     if let Some(lock) = &settings.books_lock_date {
         // ISO dates compare correctly as strings.
         if posting_date <= lock.as_str() {
@@ -2036,7 +2043,7 @@ fn check_period_lock(settings: &CompanySettings, posting_date: &str) -> Result<(
 }
 
 /// JE-style balance guard over the generated GL.
-fn check_balanced(gl: &[GlEntry]) -> Result<(), PostingError> {
+pub(crate) fn check_balanced(gl: &[GlEntry]) -> Result<(), PostingError> {
     let debit: f64 = gl.iter().map(|entry| entry.debit).sum();
     let credit: f64 = gl.iter().map(|entry| entry.credit).sum();
     if (debit - credit).abs() > BALANCE_TOLERANCE {
@@ -2209,7 +2216,7 @@ async fn payment_outstanding_updates(
     Ok(updates)
 }
 
-fn audit_row(company_id: Uuid, actor: Actor, action: &str, detail: Value) -> AuditEntry {
+pub(crate) fn audit_row(company_id: Uuid, actor: Actor, action: &str, detail: Value) -> AuditEntry {
     AuditEntry {
         id: Uuid::new_v4(),
         company_id,

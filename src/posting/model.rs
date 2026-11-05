@@ -440,6 +440,23 @@ pub struct PostingCommit {
     /// Command response; the store stamps `number` after allocation and
     /// persists it under the idempotency key so replays return it verbatim.
     pub response: Value,
+    /// (series key, last value already issued elsewhere): the store raises
+    /// the series so the next official number follows it. Never lowers a
+    /// series. Used by the Solo → Team take-on so Team numbering continues
+    /// after the last number the Solo book issued.
+    pub numbering_floors: Vec<(String, i64)>,
+    /// Present only on the Solo → Team take-on: the store refuses the commit
+    /// unless the company holds no official document and no earlier
+    /// migration, and records the migration in the same transaction.
+    pub solo_migration: Option<SoloMigrationMark>,
+}
+
+/// The one-time take-on record a [`PostingCommit`] carries (see
+/// `posting::solo_migration`).
+#[derive(Debug, Clone)]
+pub struct SoloMigrationMark {
+    pub migration_id: String,
+    pub package_sha256: String,
 }
 
 /// Result of [`PostingCommit`]: the (possibly number-stamped) response, and
