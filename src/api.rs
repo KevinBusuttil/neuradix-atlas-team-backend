@@ -159,6 +159,10 @@ pub fn router(state: AppState) -> Router {
             "/companies/{company_id}/commands/cancel-document",
             post(cancel_document),
         )
+        .route(
+            "/companies/{company_id}/commands/import-solo-opening",
+            post(import_solo_opening),
+        )
         // Portal-link + pay-link management (bearer auth, not rate-limited).
         .merge(crate::portal::management_routes())
         .merge(crate::pay::management_routes())
@@ -1260,4 +1264,28 @@ async fn cancel_document(
     )
     .await?;
     Ok(Json(outcome.response))
+}
+
+/// C3 — the one-time Solo → Team take-on (see `posting::solo_migration`).
+/// Owner only, from a registered device: it sets the company's opening
+/// position and numbering, which only the owner may decide.
+async fn import_solo_opening(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<crate::posting::solo_migration::SoloOpeningCommand>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    auth.require_device()?;
+    require_role(role, &[Role::Owner])?;
+    let outcome = crate::posting::solo_migration::import_solo_opening(
+        state.store.as_ref(),
+        company_id,
+        req,
+        Actor::user(auth.user_id(), auth.device_id()),
+    )
+    .await?;
+    let mut response = outcome.response;
+    response["replayed"] = json!(outcome.replayed);
+    Ok(Json(response))
 }

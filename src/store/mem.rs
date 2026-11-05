@@ -72,6 +72,8 @@ struct Inner {
     batches: HashMap<(Uuid, String), PostingBatch>,
     /// (company_id, series key) -> last allocated value (gap-free)
     series: HashMap<(Uuid, String), i64>,
+    /// company -> (migration id, opening document id) of its Solo take-on
+    solo_migrations: HashMap<Uuid, (String, String)>,
     /// (company_id, idempotency key) -> committed response
     idempotency: HashMap<(Uuid, String), Value>,
 
@@ -764,6 +766,24 @@ impl Store for MemStore {
             }
         }
 
+        // Solo take-on: only into a company with no official document and
+        // no earlier take-on.
+        if let Some(mark) = &commit.solo_migration {
+            if let Some((earlier, _)) = inner.solo_migrations.get(&company) {
+                return Err(StoreError::Conflict(format!(
+                    "this company already received a Solo opening position \
+                     (migration {earlier}); a company can be moved from Solo only once"
+                )));
+            }
+            if inner.documents.keys().any(|(c, _, _)| *c == company) {
+                return Err(StoreError::Conflict(format!(
+                    "this company already holds official documents; migration {} can \
+                     only move a Solo book into a new, empty Team company",
+                    mark.migration_id
+                )));
+            }
+        }
+
         // Optimistic concurrency: the engine costed/validated against the
         // prior stock ledger; if any touched pair grew since, recompute.
         for (item, warehouse, expected) in &commit.sle_expectations {
@@ -858,6 +878,15 @@ impl Store for MemStore {
             response["number"] = json!(number);
         }
 
+        for (series, floor) in &commit.numbering_floors {
+            let next = inner.series.entry((company, series.clone())).or_insert(0);
+            *next = (*next).max(*floor);
+        }
+        if let Some(mark) = &commit.solo_migration {
+            inner
+                .solo_migrations
+                .insert(company, (mark.migration_id.clone(), document.id.clone()));
+        }
         inner.documents.insert(doc_key, document.clone());
         let seq = inner.sle_seq.entry(company).or_insert(0);
         let mut sequenced = commit.stock_ledger_entries;
