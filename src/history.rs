@@ -107,6 +107,68 @@ pub fn floor_for(doctype: &str, number: &str) -> Option<(&'static str, i64)> {
         .map(|n| (key, n))
 }
 
+/// C4: the answer to a lost-history report, from what the server found for
+/// each reported record (`found[i]`: whether the document is still present,
+/// and which other document now holds its official number). Returns the
+/// response and the numbering floors to raise. Pure, so a store computes it
+/// under the same lock and transaction that records it.
+pub fn lost_history_outcome(
+    report: &LostHistoryReport,
+    found: &[(bool, Option<String>)],
+) -> (serde_json::Value, Vec<(String, i64)>) {
+    use serde_json::json;
+    let mut still_present = Vec::new();
+    let mut number_reused = Vec::new();
+    let mut floors: std::collections::BTreeMap<String, i64> = Default::default();
+    for (record, (present, holder)) in report.lost.iter().zip(found) {
+        if *present {
+            still_present
+                .push(json!({ "doctype": record.doctype, "document_id": record.document_id }));
+            continue;
+        }
+        if let Some(holder) = holder {
+            number_reused.push(json!({
+                "doctype": record.doctype,
+                "number": record.number,
+                "lost_document_id": record.document_id,
+                "server_document_id": holder,
+            }));
+        }
+        if let Some((key, value)) = record
+            .number
+            .as_deref()
+            .and_then(|n| floor_for(&record.doctype, n))
+        {
+            let floor = floors.entry(key.to_string()).or_insert(0);
+            *floor = (*floor).max(value);
+        }
+    }
+    let floors: Vec<(String, i64)> = floors.into_iter().collect();
+    let response = json!({
+        "recovery_id": report.recovery_id,
+        "reported": report.lost.len(),
+        "still_present": still_present,
+        "number_reused": number_reused,
+        "numbering_floors": floors
+            .iter()
+            .map(|(series, value)| json!({ "series": series, "floor": value }))
+            .collect::<Vec<_>>(),
+    });
+    (response, floors)
+}
+
+/// The audit detail recorded with a lost-history report.
+pub fn lost_history_audit_detail(
+    report: &LostHistoryReport,
+    response: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "recovery_id": report.recovery_id,
+        "reported": report.lost.len(),
+        "number_reused": response["number_reused"].as_array().map(|a| a.len()).unwrap_or(0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -236,8 +236,13 @@ async fn append_mutations(
 }
 
 /// The chain value at the log head `last`, with the company's counter row
-/// already locked. Rows written before the chain existed are linked here,
-/// once, in version order.
+/// already locked. Rows that carry no chain value yet (written before the
+/// chain existed, or by an older server binary after a rollback) are linked
+/// here, in version order, from the last row that is already linked.
+///
+/// The cached `sync_counters.last_hash` is trusted only when the row at
+/// `last` carries that same value: an older binary advances `last_version`
+/// without touching `last_hash`, so a stale cache must never be extended.
 async fn chain_tip(
     conn: &mut sqlx::PgConnection,
     company_id: Uuid,
@@ -246,23 +251,40 @@ async fn chain_tip(
     if last == 0 {
         return Ok(crate::history::GENESIS.to_vec());
     }
-    let stored: Option<Vec<u8>> =
+    let cached: Option<Vec<u8>> =
         sqlx::query("select last_hash from sync_counters where company_id = $1")
             .bind(company_id)
             .fetch_one(&mut *conn)
             .await?
             .try_get("last_hash")?;
-    if let Some(hash) = stored {
-        return Ok(hash);
+    // The newest linked row. Linking is strictly in version order, so every
+    // row below it is linked and every unlinked row is above it.
+    let anchor = sqlx::query(
+        "select sync_version, chain_hash from mutations \
+         where company_id = $1 and chain_hash is not null \
+         order by sync_version desc limit 1",
+    )
+    .bind(company_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let (from, mut chain) = match anchor {
+        Some(row) => (
+            row.try_get::<i64, _>("sync_version")?,
+            row.try_get::<Vec<u8>, _>("chain_hash")?,
+        ),
+        None => (0, crate::history::GENESIS.to_vec()),
+    };
+    if from == last && cached.as_deref() == Some(chain.as_slice()) {
+        return Ok(chain);
     }
     let rows = sqlx::query(
         "select mutation_id, sync_version, record from mutations \
-         where company_id = $1 order by sync_version",
+         where company_id = $1 and sync_version > $2 order by sync_version",
     )
     .bind(company_id)
+    .bind(from)
     .fetch_all(&mut *conn)
     .await?;
-    let mut chain = crate::history::GENESIS.to_vec();
     for row in rows {
         let id: String = row.try_get("mutation_id")?;
         let version: i64 = row.try_get("sync_version")?;
@@ -852,20 +874,40 @@ impl Store for PgStore {
         })
     }
 
-    async fn lost_history_lookup(
+    async fn record_lost_history(
         &self,
         company_id: Uuid,
-        records: &[crate::history::LostRecord],
-    ) -> Result<Vec<(bool, Option<String>)>, StoreError> {
-        let mut out = Vec::with_capacity(records.len());
-        for r in records {
+        report: &crate::history::LostHistoryReport,
+        mut audit: AuditEntry,
+    ) -> Result<(Value, bool), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // The same per-company lock every posting commit takes, so no
+        // official number is issued between the lookup and the floors.
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended($1::text, 42))")
+            .bind(company_id)
+            .execute(&mut *tx)
+            .await?;
+        let stored = sqlx::query(
+            "select response from history_recoveries where company_id = $1 and recovery_id = $2",
+        )
+        .bind(company_id)
+        .bind(&report.recovery_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = stored {
+            let response: Value = row.try_get("response")?;
+            tx.commit().await?;
+            return Ok((response, true));
+        }
+        let mut found = Vec::with_capacity(report.lost.len());
+        for r in &report.lost {
             let present = sqlx::query(
                 "select 1 from documents where company_id = $1 and doctype = $2 and id = $3",
             )
             .bind(company_id)
             .bind(&r.doctype)
             .bind(&r.document_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .is_some();
             let holder = match &r.number {
@@ -877,40 +919,30 @@ impl Store for PgStore {
                 .bind(&r.doctype)
                 .bind(number)
                 .bind(&r.document_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?
                 .map(|row| row.try_get::<String, _>("id"))
                 .transpose()?,
                 _ => None,
             };
-            out.push((present, holder));
+            found.push((present, holder));
         }
-        Ok(out)
-    }
-
-    async fn commit_lost_history(
-        &self,
-        company_id: Uuid,
-        device_id: Option<Uuid>,
-        report: &crate::history::LostHistoryReport,
-        floors: &[(String, i64)],
-        response: Value,
-    ) -> Result<(Value, bool), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let (response, floors) = crate::history::lost_history_outcome(report, &found);
         let inserted = sqlx::query(
             "insert into history_recoveries (company_id, recovery_id, device_id, report, response) \
              values ($1, $2, $3, $4, $5) on conflict (company_id, recovery_id) do nothing",
         )
         .bind(company_id)
         .bind(&report.recovery_id)
-        .bind(device_id)
+        .bind(audit.device_id)
         .bind(serde_json::to_value(report)?)
         .bind(&response)
         .execute(&mut *tx)
         .await?
         .rows_affected();
         if inserted == 0 {
-            let stored: Value = sqlx::query(
+            // Unreachable under the lock; kept so a retry never double-audits.
+            let response: Value = sqlx::query(
                 "select response from history_recoveries where company_id = $1 and recovery_id = $2",
             )
             .bind(company_id)
@@ -919,9 +951,9 @@ impl Store for PgStore {
             .await?
             .try_get("response")?;
             tx.commit().await?;
-            return Ok((stored, true));
+            return Ok((response, true));
         }
-        for (series, floor) in floors {
+        for (series, floor) in &floors {
             sqlx::query(
                 "insert into numbering_series (company_id, series_key, next_value) \
                  values ($1, $2, $3) on conflict (company_id, series_key) \
@@ -933,6 +965,20 @@ impl Store for PgStore {
             .execute(&mut *tx)
             .await?;
         }
+        audit.detail = crate::history::lost_history_audit_detail(report, &response);
+        sqlx::query(
+            "insert into audit_log (id, company_id, user_id, device_id, action, detail, at) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(audit.id)
+        .bind(audit.company_id)
+        .bind(audit.user_id)
+        .bind(audit.device_id)
+        .bind(&audit.action)
+        .bind(&audit.detail)
+        .bind(audit.at)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok((response, false))
     }
@@ -1139,7 +1185,7 @@ impl Store for PgStore {
         let rows = sqlx::query(
             "select company_id, doctype, id, payload, docstatus, official_number, created_at \
              from documents where company_id = $1 and doctype = 'Payment Entry' \
-             and payload ->> 'deposit' = $2 order by id",
+             and btrim(payload ->> 'deposit') = $2 order by id",
         )
         .bind(company_id)
         .bind(deposit_id)

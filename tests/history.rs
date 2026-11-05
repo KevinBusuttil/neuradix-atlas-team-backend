@@ -315,3 +315,58 @@ async fn lost_history_reports_are_guarded() {
         .await;
     assert_ne!(status, StatusCode::OK);
 }
+
+/// Review fix: an older server binary (deployed by a rollback) appends rows
+/// without chain values and without moving `last_hash`. The next current
+/// binary must link those rows from the last linked one, not extend the
+/// stale cached tip, so the chain stays one consistent history.
+#[tokio::test]
+async fn rows_appended_by_an_older_binary_are_linked_from_the_last_linked_row() {
+    let mut app = TestApp::new().await;
+    push(
+        &mut app,
+        (1..=3)
+            .map(|i| mutation(&format!("m-{i}"), &format!("C-{i}"), "x"))
+            .collect(),
+    )
+    .await;
+    let Some(url) = app.pg_url() else {
+        return; // the in-memory store has no older binary
+    };
+    push(&mut app, vec![mutation("m-4", "C-4", "x")]).await;
+    push(&mut app, vec![mutation("m-5", "C-5", "x")]).await;
+    let reference = history(&mut app, 3).await;
+    let reference_at_4 = history(&mut app, 4).await["atHash"].clone();
+
+    // Rewind to what an older binary leaves behind after writing m-4 and
+    // m-5: rows without chain values, and last_hash still at version 3.
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let tip3: Vec<u8> = sqlx::query_scalar(
+        "select chain_hash from mutations where company_id = $1 and sync_version = 3",
+    )
+    .bind(app.company_uuid())
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update mutations set chain_hash = null where company_id = $1 and sync_version > 3",
+    )
+    .bind(app.company_uuid())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query("update sync_counters set last_hash = $2 where company_id = $1")
+        .bind(app.company_uuid())
+        .bind(&tip3)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+
+    // The current binary reproduces the same chain, and extends it from 5.
+    assert_eq!(history(&mut app, 3).await, reference);
+    assert_eq!(history(&mut app, 4).await["atHash"], reference_at_4);
+    push(&mut app, vec![mutation("m-6", "C-6", "x")]).await;
+    assert_eq!(history(&mut app, 5).await["atHash"], reference["headHash"]);
+}

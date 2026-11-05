@@ -1002,7 +1002,7 @@ async fn with_history(
 /// issued to other documents, and raises each series past the lost numbers
 /// so they are never issued again. Nothing is re-posted: the lost documents
 /// must be re-entered. Owner, Admin or Accountant; idempotent on
-/// `recovery_id`; audited.
+/// `recovery_id`; audited in the same transaction.
 async fn report_lost_history(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -1026,65 +1026,23 @@ async fn report_lost_history(
             "too many records in one report".into(),
         ));
     }
-    let found = state
-        .store
-        .lost_history_lookup(company_id, &report.lost)
-        .await?;
-    let mut still_present = Vec::new();
-    let mut number_reused = Vec::new();
-    let mut floors: std::collections::BTreeMap<String, i64> = Default::default();
-    for (record, (present, holder)) in report.lost.iter().zip(found) {
-        if present {
-            still_present
-                .push(json!({ "doctype": record.doctype, "document_id": record.document_id }));
-            continue;
-        }
-        if let Some(holder) = holder {
-            number_reused.push(json!({
-                "doctype": record.doctype,
-                "number": record.number,
-                "lost_document_id": record.document_id,
-                "server_document_id": holder,
-            }));
-        }
-        if let Some((key, value)) = record
-            .number
-            .as_deref()
-            .and_then(|n| crate::history::floor_for(&record.doctype, n))
-        {
-            let floor = floors.entry(key.to_string()).or_insert(0);
-            *floor = (*floor).max(value);
-        }
-    }
-    let floors: Vec<(String, i64)> = floors.into_iter().collect();
-    let response = json!({
-        "recovery_id": report.recovery_id,
-        "reported": report.lost.len(),
-        "still_present": still_present,
-        "number_reused": number_reused,
-        "numbering_floors": floors
-            .iter()
-            .map(|(series, value)| json!({ "series": series, "floor": value }))
-            .collect::<Vec<_>>(),
-    });
+    // The lookup, the numbering floors, the recovery record and its audit
+    // row are one transaction under the company's posting lock: no number
+    // can be issued between the lookup and the floor, and a recovery is
+    // never recorded without its audit row.
+    let audit = AuditEntry {
+        id: Uuid::new_v4(),
+        company_id,
+        user_id: Some(auth.user_id()),
+        device_id: auth.device_id(),
+        action: "sync.lost_history".into(),
+        detail: Value::Null,
+        at: Utc::now(),
+    };
     let (stored, replayed) = state
         .store
-        .commit_lost_history(company_id, auth.device_id(), &report, &floors, response)
+        .record_lost_history(company_id, &report, audit)
         .await?;
-    if !replayed {
-        audit(
-            &state,
-            company_id,
-            Some(&auth),
-            "sync.lost_history",
-            json!({
-                "recovery_id": report.recovery_id,
-                "reported": report.lost.len(),
-                "number_reused": stored["number_reused"].as_array().map(|a| a.len()).unwrap_or(0),
-            }),
-        )
-        .await?;
-    }
     let mut out = stored;
     out["replayed"] = json!(replayed);
     Ok(Json(out))
