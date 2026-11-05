@@ -140,6 +140,7 @@ missing or unknown).
 | POST | `/companies/{id}/items` | **owner, admin or stock** | Item-registry upsert: `{id, item_type, valuation_method, stock_uom, uoms: [{uom, conversion_factor}], *_account overrides}`. Optional: an item missing from the registry is read from the synced `Item` document (same fields, `uoms` child table) |
 | POST | `/companies/{id}/commands/submit-document` | **device token**, role per doctype | Official submission → `{document_id, number, docstatus, gl_entries, stock_ledger_entries, party_transactions, tax_transactions, bins, settlements}` |
 | POST | `/companies/{id}/commands/cancel-document` | **device token**, role per doctype | Reversal batch (negated legs, `-reversal` ids), docstatus 2 |
+| POST | `/companies/{id}/commands/import-solo-opening` | **device token**, Owner | One-time Solo → Team take-on: posts `SOLO-OPENING-{migration_id}`, checks the trial balance, receivables, payables and stock against the package, sets numbering floors. Idempotent on `migration_id` (409 if the package changed); refused once done or if the company already has postings. Tests: `tests/solo_migration.rs` |
 
 Roles: `owner, admin, sales, purchasing, stock, pos, accountant, advisor`.
 Command-role gates: Sales Invoice → sales/owner/admin · Purchase
