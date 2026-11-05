@@ -26,7 +26,7 @@ use crate::posting::engine::{
     allowed_roles, cancel_document as engine_cancel, submit_document as engine_submit, Actor,
     CancelCommand, SubmitCommand,
 };
-use crate::posting::model::{CompanySettings, Item, POSTED_DOCTYPES};
+use crate::posting::model::{BooksLockChange, CompanySettings, Item, POSTED_DOCTYPES};
 use crate::AppState;
 
 const INVITATION_TTL_DAYS: i64 = 7;
@@ -167,6 +167,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/companies/{company_id}/commands/report-lost-history",
             post(report_lost_history),
+        )
+        .route(
+            "/companies/{company_id}/commands/set-books-lock",
+            post(set_books_lock),
         )
         // Portal-link + pay-link management (bearer auth, not rate-limited).
         .merge(crate::portal::management_routes())
@@ -817,8 +821,13 @@ async fn sync_push(
     // official (submitted or cancelled), the sync plane may not touch it —
     // changes must go through the command API, which posts reversals instead
     // of editing history.
+    // A mutation the log already holds is a replay (a retried push, or the
+    // Solo take-on publishing its opening draft again): the log ignores it,
+    // so it cannot touch an official document and is not refused for one.
+    let ids: Vec<String> = req.mutations.iter().map(|m| m.id.clone()).collect();
+    let known = state.store.known_mutation_ids(company_id, &ids).await?;
     for mutation in &req.mutations {
-        if !POSTED_DOCTYPES.contains(&mutation.doc_type.as_str()) {
+        if !POSTED_DOCTYPES.contains(&mutation.doc_type.as_str()) || known.contains(&mutation.id) {
             continue;
         }
         if let Some(doc) = state
@@ -834,11 +843,33 @@ async fn sync_push(
             }
         }
     }
-    let count = req.mutations.len();
-    let assigned = state
-        .store
-        .push_mutations(company_id, req.mutations)
-        .await?;
+    // C5.2: the books lock is the server's; a Company row cannot move it.
+    let mut mutations = req.mutations;
+    if mutations.iter().any(|m| m.doc_type == "Company") {
+        let lock = state
+            .store
+            .company_settings(company_id)
+            .await?
+            .books_lock_date;
+        let pinned: Vec<String> = mutations
+            .iter_mut()
+            .filter_map(|m| {
+                crate::authority::pin_books_lock(m, lock.as_deref()).then(|| m.id.clone())
+            })
+            .collect();
+        if !pinned.is_empty() {
+            audit(
+                &state,
+                company_id,
+                Some(&auth),
+                "sync.books_lock_pinned",
+                json!({ "mutations": pinned, "books_lock_date": lock }),
+            )
+            .await?;
+        }
+    }
+    let count = mutations.len();
+    let assigned = state.store.push_mutations(company_id, mutations).await?;
     audit(
         &state,
         company_id,
@@ -1262,6 +1293,17 @@ async fn put_settings(
         if !target.contains_key(key) {
             return Err(ApiError::BadRequest(format!("unknown setting {key}")));
         }
+        // C5: the books lock has one authoritative path, with its own
+        // permission and concurrency rules. Repeating the current value (a
+        // client sending its whole settings back) is harmless.
+        if key == "books_lock_date" && target.get(key) != Some(value) {
+            let same_empty = value.is_null() && target.get(key).is_none_or(Value::is_null);
+            if !same_empty {
+                return Err(ApiError::Conflict(
+                    "the books lock is changed with commands/set-books-lock, not settings".into(),
+                ));
+            }
+        }
         target.insert(key.clone(), value.clone());
     }
     let settings: CompanySettings = serde_json::from_value(merged)
@@ -1293,6 +1335,107 @@ async fn get_settings(
     Ok(Json(
         serde_json::to_value(&settings).map_err(|e| ApiError::Internal(e.into()))?,
     ))
+}
+
+#[derive(Deserialize)]
+struct SetBooksLockRequest {
+    /// The new lock (YYYY-MM-DD); null clears it.
+    lock_date: Option<String>,
+    /// The lock the caller saw (null = none). A stale view is a 409, so a
+    /// device that missed a change can never silently undo it.
+    expected_current: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// C5.2 — the one way to move a Team company's books lock. Owner, Admin
+/// and Accountant may lock (or move the lock later); unlocking (clearing
+/// it, or moving it earlier) reopens finalised periods and needs Owner or
+/// Admin. The change is a compare-and-set serialized with every posting
+/// commit, audited with who, before, after and why. Devices pick the new
+/// lock up from `GET settings` on their next sync; a submit they make in
+/// the meantime is checked against the server's lock, not theirs.
+async fn set_books_lock(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(company_id): Path<Uuid>,
+    Json(req): Json<SetBooksLockRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let role = require_membership(&state, &auth, company_id).await?;
+    require_role(role, &[Role::Owner, Role::Admin, Role::Accountant])?;
+    let normalize = |date: Option<String>| -> Result<Option<String>, ApiError> {
+        match date.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(raw) => {
+                let mut probe = serde_json::Map::new();
+                probe.insert("posting_date".into(), json!(raw));
+                crate::posting::engine::validated_posting_date(&probe)
+                    .map(Some)
+                    .map_err(|_| {
+                        ApiError::Unprocessable(format!("{raw:?} is not a YYYY-MM-DD date"))
+                    })
+            }
+        }
+    };
+    let lock_date = normalize(req.lock_date)?;
+    let expected = normalize(req.expected_current)?;
+    // "Today" somewhere: a device east of UTC may already be a day ahead.
+    let latest = (Utc::now() + Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    if lock_date
+        .as_deref()
+        .is_some_and(|lock| lock > latest.as_str())
+    {
+        return Err(ApiError::Unprocessable(
+            "the books can be locked through today at the latest".into(),
+        ));
+    }
+    let reopens = match (&expected, &lock_date) {
+        (Some(_), None) => true,
+        (Some(old), Some(new)) => new < old,
+        (None, _) => false,
+    };
+    if reopens {
+        require_role(role, &[Role::Owner, Role::Admin])?;
+    }
+    let reason = req
+        .reason
+        .map(|r| r.trim().chars().take(500).collect::<String>())
+        .filter(|r| !r.is_empty());
+    let outcome = state
+        .store
+        .set_books_lock(
+            company_id,
+            BooksLockChange {
+                expected_current: expected.clone(),
+                lock_date: lock_date.clone(),
+                audit: AuditEntry {
+                    id: Uuid::new_v4(),
+                    company_id,
+                    user_id: Some(auth.user_id()),
+                    device_id: auth.device_id(),
+                    action: if lock_date.is_none() {
+                        "settings.books_unlock".into()
+                    } else {
+                        "settings.books_lock".into()
+                    },
+                    detail: json!({
+                        "from": expected,
+                        "to": lock_date,
+                        "role": role.as_str(),
+                        "reason": reason,
+                    }),
+                    at: Utc::now(),
+                },
+            },
+        )
+        .await?;
+    Ok(Json(json!({
+        "books_lock_date": outcome.lock_date,
+        "previous": outcome.previous,
+        "changed": outcome.changed,
+    })))
 }
 
 /// Item registry upsert: the posting engine's view of an item (stock vs

@@ -1,0 +1,159 @@
+{
+  "name": "Expense: paid with VAT (Dr category + input VAT, Cr cash, VAT row) or owed to a supplier (Cr payable, supplier row); a category is required; cancelling reverses",
+  "setup": {},
+  "actions": [
+    {
+      "comment": "No category: refused",
+      "submit": {
+        "doctype": "Expense",
+        "document_id": "EXP-B1",
+        "payload": {
+          "posting_date": "2026-09-10",
+          "description": "Paper",
+          "net_amount": 100,
+          "tax_amount": 0,
+          "is_paid": 1
+        },
+        "items": []
+      },
+      "expect_status": 422,
+      "expect": {
+        "gl_count": {
+          "EXP-B1": 0
+        }
+      }
+    },
+    {
+      "comment": "Paid from cash: 100 net + 18 VAT",
+      "submit": {
+        "doctype": "Expense",
+        "document_id": "EXP-1",
+        "payload": {
+          "posting_date": "2026-09-10",
+          "description": "Paper",
+          "expense_account": "Office Costs",
+          "net_amount": 100,
+          "tax_amount": 18,
+          "tax_account": "VAT",
+          "is_paid": 1,
+          "paid_from": "Cash"
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "EXP-00001",
+        "gl_rows": [
+          {
+            "id": "GL-EXP-1-debit",
+            "account": "Office Costs",
+            "debit": 100,
+            "credit": 0
+          },
+          {
+            "id": "GL-EXP-1-tax",
+            "account": "VAT",
+            "debit": 18,
+            "credit": 0
+          },
+          {
+            "id": "GL-EXP-1-credit",
+            "account": "Cash",
+            "debit": 0,
+            "credit": 118
+          }
+        ],
+        "tax_rows": [
+          {
+            "id": "TT-EXP-1-0",
+            "tax_type": "VAT",
+            "party_type": "Supplier",
+            "base_amount": 100,
+            "tax_amount": 18
+          }
+        ],
+        "party_count": {
+          "EXP-1": 0
+        },
+        "account_balances": {
+          "Office Costs": 100,
+          "VAT": 18,
+          "Cash": -118
+        }
+      }
+    },
+    {
+      "comment": "Owed to a supplier, no VAT: Cr the payable (the company default) with the supplier, and a supplier row",
+      "submit": {
+        "doctype": "Expense",
+        "document_id": "EXP-2",
+        "payload": {
+          "posting_date": "2026-09-11",
+          "description": "Cleaning",
+          "expense_account": "Office Costs",
+          "supplier": "SUPP-1",
+          "net_amount": 40,
+          "tax_amount": 0,
+          "is_paid": 0
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "EXP-00002",
+        "gl_count": {
+          "EXP-2": 2
+        },
+        "gl_rows": [
+          {
+            "id": "GL-EXP-2-credit",
+            "account": "Creditors",
+            "credit": 40,
+            "debit": 0
+          }
+        ],
+        "tax_count": {
+          "EXP-2": 0
+        },
+        "party_rows": [
+          {
+            "doctype": "Supplier Transaction",
+            "id": "VT-EXP-2",
+            "trans_type": "Invoice",
+            "party": "SUPP-1",
+            "amount": 40
+          }
+        ],
+        "account_balances": {
+          "Creditors": -40,
+          "Office Costs": 140
+        }
+      }
+    },
+    {
+      "comment": "Cancelling the owed expense credits the supplier back",
+      "cancel": {
+        "doctype": "Expense",
+        "document_id": "EXP-2"
+      },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "party_rows": [
+          {
+            "doctype": "Supplier Transaction",
+            "id": "VT-EXP-2-reversal",
+            "trans_type": "CreditNote",
+            "amount": -40,
+            "is_reversal": true,
+            "party": "SUPP-1"
+          }
+        ],
+        "account_balances": {
+          "Creditors": 0,
+          "Office Costs": 100
+        }
+      }
+    }
+  ]
+}

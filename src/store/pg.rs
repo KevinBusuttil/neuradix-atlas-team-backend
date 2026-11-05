@@ -12,11 +12,13 @@ use crate::model::{
     PortalLinkKind, Role, TokenIdentity, User, WebhookEvent, WebhookKind,
 };
 use crate::posting::model::{
-    format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyKind, PartyTransaction,
-    PostedDocument, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
+    deposit_guard_violation, format_number, Bin, BooksLockChange, BooksLockOutcome, CommitOutcome,
+    CompanySettings, DepositGuard, GlEntry, Item, PartyKind, PartyTransaction, PostedDocument,
+    PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
+use crate::store::{books_lock_moved, lock_violation};
 
 use super::{MutationPage, Store, StoreError};
 
@@ -75,6 +77,7 @@ fn gl_from_row(row: &PgRow) -> Result<GlEntry, StoreError> {
         credit: row.try_get("credit")?,
         party_type: row.try_get("party_type")?,
         party: row.try_get("party")?,
+        cost_center: row.try_get("cost_center")?,
         voucher_type: row.try_get("voucher_type")?,
         voucher_no: row.try_get("voucher_no")?,
         posting_date: row.try_get("posting_date")?,
@@ -1090,17 +1093,122 @@ impl Store for PgStore {
         company_id: Uuid,
         settings: CompanySettings,
     ) -> Result<(), StoreError> {
+        // C5: the books lock only moves through `set_books_lock`. A new row
+        // starts unlocked and an update keeps the stored lock, so a settings
+        // write that raced a lock change cannot put the old lock back.
         sqlx::query(
             "insert into company_settings (company_id, settings, updated_at) \
-             values ($1, $2, now()) \
+             values ($1, jsonb_set($2, '{books_lock_date}', 'null'::jsonb), now()) \
              on conflict (company_id) do update \
-             set settings = excluded.settings, updated_at = now()",
+             set settings = jsonb_set(excluded.settings, '{books_lock_date}', \
+                 coalesce(company_settings.settings -> 'books_lock_date', 'null'::jsonb)), \
+                 updated_at = now()",
         )
         .bind(company_id)
         .bind(serde_json::to_value(&settings)?)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn known_mutation_ids(
+        &self,
+        company_id: Uuid,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let rows = sqlx::query(
+            "select mutation_id from mutations where company_id = $1 and mutation_id = any($2)",
+        )
+        .bind(company_id)
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                row.try_get::<String, _>("mutation_id")
+                    .map_err(StoreError::from)
+            })
+            .collect()
+    }
+
+    async fn deposit_applications(
+        &self,
+        company_id: Uuid,
+        deposit_id: &str,
+    ) -> Result<Vec<PostedDocument>, StoreError> {
+        let rows = sqlx::query(
+            "select company_id, doctype, id, payload, docstatus, official_number, created_at \
+             from documents where company_id = $1 and doctype = 'Payment Entry' \
+             and payload ->> 'deposit' = $2 order by id",
+        )
+        .bind(company_id)
+        .bind(deposit_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(document_from_row).collect()
+    }
+
+    async fn set_books_lock(
+        &self,
+        company_id: Uuid,
+        change: BooksLockChange,
+    ) -> Result<BooksLockOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // The same per-company lock every posting commit takes: a submit
+        // either commits before the lock moves or sees the new lock.
+        sqlx::query("select pg_advisory_xact_lock(hashtextextended($1::text, 42))")
+            .bind(company_id)
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query("select settings from company_settings where company_id = $1")
+            .bind(company_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let mut settings: CompanySettings = match row {
+            Some(row) => serde_json::from_value(row.try_get::<Value, _>("settings")?)?,
+            None => CompanySettings::default(),
+        };
+        let previous = settings.books_lock_date.clone();
+        if previous == change.lock_date {
+            return Ok(BooksLockOutcome {
+                previous: previous.clone(),
+                lock_date: previous,
+                changed: false,
+            });
+        }
+        if previous != change.expected_current {
+            return Err(StoreError::Conflict(books_lock_moved(previous.as_deref())));
+        }
+        settings.books_lock_date = change.lock_date.clone();
+        sqlx::query(
+            "insert into company_settings (company_id, settings, updated_at) \
+             values ($1, $2, now()) \
+             on conflict (company_id) do update set settings = excluded.settings, \
+             updated_at = now()",
+        )
+        .bind(company_id)
+        .bind(serde_json::to_value(&settings)?)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "insert into audit_log (id, company_id, user_id, device_id, action, detail, at) \
+             values ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(change.audit.id)
+        .bind(change.audit.company_id)
+        .bind(change.audit.user_id)
+        .bind(change.audit.device_id)
+        .bind(&change.audit.action)
+        .bind(&change.audit.detail)
+        .bind(change.audit.at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(BooksLockOutcome {
+            previous,
+            lock_date: change.lock_date,
+            changed: true,
+        })
     }
 
     async fn upsert_item(&self, company_id: Uuid, item: Item) -> Result<(), StoreError> {
@@ -1193,9 +1301,9 @@ impl Store for PgStore {
         voucher_no: &str,
     ) -> Result<Vec<GlEntry>, StoreError> {
         let rows = sqlx::query(
-            "select company_id, id, account, debit, credit, party_type, party, voucher_type, \
-             voucher_no, posting_date, currency, conversion_rate, base_debit, base_credit, \
-             is_reversal, batch_id \
+            "select company_id, id, account, debit, credit, party_type, party, cost_center, \
+             voucher_type, voucher_no, posting_date, currency, conversion_rate, base_debit, \
+             base_credit, is_reversal, batch_id \
              from gl_entries where company_id = $1 and voucher_no = $2 order by id",
         )
         .bind(company_id)
@@ -1322,6 +1430,58 @@ impl Store for PgStore {
                     response: row.try_get("response")?,
                     replayed: true,
                 });
+            }
+        }
+
+        // C5: the books lock and the deposit invariants, re-checked under the
+        // company lock (see the MemStore twin).
+        if let Some(date) = &commit.lock_check_date {
+            let row = sqlx::query(
+                "select settings ->> 'books_lock_date' as lock \
+                 from company_settings where company_id = $1",
+            )
+            .bind(company)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let lock: Option<String> = match row {
+                Some(row) => row.try_get("lock")?,
+                None => None,
+            };
+            if let Some(reason) = lock_violation(date, lock.as_deref()) {
+                return Err(StoreError::Stale(reason));
+            }
+        }
+        if let Some(guard) = &commit.deposit_guard {
+            let deposit_id = match guard {
+                DepositGuard::Apply { deposit_id, .. } | DepositGuard::Release { deposit_id } => {
+                    deposit_id
+                }
+            };
+            let deposit = sqlx::query(
+                "select company_id, doctype, id, payload, docstatus, official_number, created_at \
+                 from documents where company_id = $1 and doctype = 'Customer Deposit' \
+                 and id = $2",
+            )
+            .bind(company)
+            .bind(deposit_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| document_from_row(&row))
+            .transpose()?;
+            let applications = sqlx::query(
+                "select company_id, doctype, id, payload, docstatus, official_number, created_at \
+                 from documents where company_id = $1 and doctype = 'Payment Entry' \
+                 and payload ->> 'deposit' = $2",
+            )
+            .bind(company)
+            .bind(deposit_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(document_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+            if let Some(reason) = deposit_guard_violation(guard, deposit.as_ref(), &applications) {
+                return Err(StoreError::Stale(reason));
             }
         }
 
@@ -1538,8 +1698,9 @@ impl Store for PgStore {
                 "insert into gl_entries \
                  (company_id, id, account, debit, credit, party_type, party, voucher_type, \
                   voucher_no, posting_date, currency, conversion_rate, base_debit, base_credit, \
-                  is_reversal, batch_id) \
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                  is_reversal, batch_id, cost_center) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                  $17)",
             )
             .bind(company)
             .bind(&entry.id)
@@ -1557,6 +1718,7 @@ impl Store for PgStore {
             .bind(entry.base_credit)
             .bind(entry.is_reversal)
             .bind(&entry.batch_id)
+            .bind(&entry.cost_center)
             .execute(&mut *tx)
             .await?;
         }
@@ -1980,9 +2142,9 @@ impl Store for PgStore {
 
     async fn gl_entries_ordered(&self, company_id: Uuid) -> Result<Vec<GlEntry>, StoreError> {
         let rows = sqlx::query(
-            "select company_id, id, account, debit, credit, party_type, party, voucher_type, \
-             voucher_no, posting_date, currency, conversion_rate, base_debit, base_credit, \
-             is_reversal, batch_id \
+            "select company_id, id, account, debit, credit, party_type, party, cost_center, \
+             voucher_type, voucher_no, posting_date, currency, conversion_rate, base_debit, \
+             base_credit, is_reversal, batch_id \
              from gl_entries where company_id = $1 \
              order by posting_date, voucher_no, id",
         )

@@ -132,7 +132,8 @@ mod tests {
         assert_eq!(floor_for("Sales Invoice", "SINV-00042"), Some(("SINV", 42)));
         assert_eq!(floor_for("Sales Invoice", "SINV-.2026.-0042"), None);
         assert_eq!(floor_for("Sales Invoice", "PINV-00042"), None);
-        assert_eq!(floor_for("Journal Entry", "JV-00001"), None);
+        assert_eq!(floor_for("Journal Entry", "JV-00001"), Some(("JV", 1)));
+        assert_eq!(floor_for("Quotation", "QTN-00001"), None);
         assert_eq!(floor_for("Sales Invoice", "SINV-"), None);
     }
 }

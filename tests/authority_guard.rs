@@ -433,8 +433,9 @@ async fn offline_confirmation_preconditions() {
     bad_total["payload"]["grand_total"] = json!(1);
     let (status, _) = app.submit_as("pos", bad_total).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    app.put_settings(json!({ "books_lock_date": "2026-12-31" }))
-        .await;
+    // Locked through today (a lock cannot be set in the future, C5).
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    app.put_settings(json!({ "books_lock_date": today })).await;
     let (status, _) = app
         .submit_as("pos", till_sale("POS-TILL1-0001", "TILL1", 1.0))
         .await;

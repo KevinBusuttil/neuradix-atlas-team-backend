@@ -308,7 +308,7 @@ async fn commands_require_device_tokens_and_write_audit_rows() {
     let (status, _) = app
         .submit_as(
             "owner",
-            json!({ "doctype": "Journal Entry", "payload": {}, "items": [] }),
+            json!({ "doctype": "Quotation", "payload": {}, "items": [] }),
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

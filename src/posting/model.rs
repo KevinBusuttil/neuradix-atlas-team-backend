@@ -11,7 +11,7 @@ use crate::model::AuditEntry;
 
 /// Doctypes the posting authority accepts. Everything else stays on the
 /// draft/sync plane.
-pub const POSTED_DOCTYPES: [&str; 7] = [
+pub const POSTED_DOCTYPES: [&str; 10] = [
     "Sales Invoice",
     "Purchase Invoice",
     "Purchase Receipt",
@@ -19,6 +19,9 @@ pub const POSTED_DOCTYPES: [&str; 7] = [
     "POS Invoice",
     "Payment Entry",
     "Stock Entry",
+    "Journal Entry",
+    "Expense",
+    "Customer Deposit",
 ];
 
 /// Official-number series key per doctype. One strictly sequential, gap-free
@@ -33,6 +36,9 @@ pub fn series_key(doctype: &str) -> Option<&'static str> {
         "POS Invoice" => "POS",
         "Payment Entry" => "PAY",
         "Stock Entry" => "STE",
+        "Journal Entry" => "JV",
+        "Expense" => "EXP",
+        "Customer Deposit" => "DEP",
         _ => return None,
     })
 }
@@ -68,6 +74,9 @@ pub struct GlEntry {
     pub party_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub party: Option<String>,
+    /// Journal Entry dimension (the Dart `_gl` `cost_center`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_center: Option<String>,
     pub voucher_type: String,
     pub voucher_no: String,
     pub posting_date: String,
@@ -365,6 +374,11 @@ pub struct CompanySettings {
     pub default_cogs_account: String,
     pub default_grni_account: String,
     pub default_stock_adjustment_account: String,
+    /// Liability a Customer Deposit credits (Dart seed `Customer Deposits`).
+    pub default_customer_deposit_account: String,
+    /// Input VAT account an Expense with VAT and no `tax_account` debits
+    /// (Dart seed `VAT`).
+    pub default_vat_account: String,
     /// A Stripe Payment Link URL (`https://buy.stripe.com/...`). When set,
     /// the pay page's "Pay by card" button links here with
     /// `?client_reference_id={pay token}` appended — the backend itself never
@@ -389,6 +403,8 @@ impl Default for CompanySettings {
             default_cogs_account: "COGS".into(),
             default_grni_account: "GRNI".into(),
             default_stock_adjustment_account: "Stock Adjustment".into(),
+            default_customer_deposit_account: "Customer Deposits".into(),
+            default_vat_account: "VAT".into(),
             stripe_payment_link_url: None,
             payment_instructions: None,
         }
@@ -449,6 +465,31 @@ pub struct PostingCommit {
     /// unless the company holds no official document and no earlier
     /// migration, and records the migration in the same transaction.
     pub solo_migration: Option<SoloMigrationMark>,
+    /// C5: the posting date the store re-checks against the books lock
+    /// INSIDE the commit, so a lock set between the engine's check and the
+    /// commit still wins (the store answers `Stale`, the engine rebuilds and
+    /// refuses with the 422).
+    pub lock_check_date: Option<String>,
+    /// C5: a Customer Deposit invariant the store re-checks inside the
+    /// commit (see [`DepositGuard`]).
+    pub deposit_guard: Option<DepositGuard>,
+}
+
+/// Customer Deposit invariants that depend on OTHER documents, so they are
+/// checked again inside the serialized commit (two devices applying the
+/// same deposit at once cannot both pass).
+#[derive(Debug, Clone)]
+pub enum DepositGuard {
+    /// A Payment Entry applying `amount` of deposit `deposit_id`: the
+    /// deposit is submitted, belongs to `customer`, and its submitted
+    /// applications plus this one stay within its amount.
+    Apply {
+        deposit_id: String,
+        customer: String,
+        amount: f64,
+    },
+    /// Cancelling deposit `deposit_id`: no submitted application remains.
+    Release { deposit_id: String },
 }
 
 /// The one-time take-on record a [`PostingCommit`] carries (see
@@ -466,4 +507,84 @@ pub struct SoloMigrationMark {
 pub struct CommitOutcome {
     pub response: Value,
     pub replayed: bool,
+}
+
+/// C5: one change of the company's books lock through the authorised
+/// command (`commands/set-books-lock`). The store applies it as a
+/// compare-and-set on `expected_current`, serialized with every posting
+/// commit of the company, and writes `audit` in the same transaction.
+#[derive(Debug, Clone)]
+pub struct BooksLockChange {
+    /// The lock the caller saw (`None` = no lock). A stale view is refused.
+    pub expected_current: Option<String>,
+    /// The new lock (`None` clears it).
+    pub lock_date: Option<String>,
+    pub audit: AuditEntry,
+}
+
+/// What [`BooksLockChange`] did. `changed` is false when the lock already
+/// had the requested value (a retried command), which writes nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct BooksLockOutcome {
+    pub previous: Option<String>,
+    pub lock_date: Option<String>,
+    pub changed: bool,
+}
+
+/// Why a [`DepositGuard`] fails against the current official documents, or
+/// `None` when it holds. Shared by the engine (before the commit) and both
+/// stores (inside it) so the two checks can never disagree.
+pub fn deposit_guard_violation(
+    guard: &DepositGuard,
+    deposit: Option<&PostedDocument>,
+    applications: &[PostedDocument],
+) -> Option<String> {
+    use crate::posting::values::{as_non_empty, as_num};
+    const MONEY_EPS: f64 = 0.005;
+    match guard {
+        DepositGuard::Apply {
+            deposit_id,
+            customer,
+            amount,
+        } => {
+            let Some(deposit) = deposit.filter(|d| d.docstatus == 1) else {
+                return Some(format!(
+                    "deposit {deposit_id} is not submitted; submit it before applying it"
+                ));
+            };
+            let owner = as_non_empty(deposit.payload.get("customer")).unwrap_or_default();
+            if &owner != customer {
+                return Some(format!(
+                    "deposit {deposit_id} belongs to {owner}, not {customer}"
+                ));
+            }
+            let total = as_num(deposit.payload.get("amount"));
+            let applied: f64 = applications
+                .iter()
+                .filter(|p| p.docstatus == 1)
+                .map(|p| as_num(p.payload.get("paid_amount")))
+                .sum();
+            let remaining = total - applied;
+            (*amount > remaining + MONEY_EPS).then(|| {
+                format!(
+                    "deposit {deposit_id} has {remaining:.2} left; \
+                     this application of {amount:.2} exceeds it"
+                )
+            })
+        }
+        DepositGuard::Release { deposit_id } => {
+            let live: Vec<&str> = applications
+                .iter()
+                .filter(|p| p.docstatus == 1)
+                .map(|p| p.id.as_str())
+                .collect();
+            (!live.is_empty()).then(|| {
+                format!(
+                    "deposit {deposit_id} is applied by {}; cancel those payment \
+                     entries first",
+                    live.join(", ")
+                )
+            })
+        }
+    }
 }

@@ -1,0 +1,188 @@
+{
+  "name": "Customer Deposit: received into a liability, applied in part through Receive payments, never beyond what is left, and not cancellable while applied",
+  "setup": {
+    "items": [
+      {
+        "id": "SVC-1",
+        "item_type": "Service"
+      }
+    ]
+  },
+  "actions": [
+    {
+      "comment": "Deposit 500: Dr cash, Cr the deposit liability",
+      "submit": {
+        "doctype": "Customer Deposit",
+        "document_id": "DEP-1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-09-01",
+          "amount": 500
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "number": "DEP-00001",
+        "gl_rows": [
+          {
+            "id": "GL-DEP-1-cash",
+            "account": "Cash",
+            "debit": 500,
+            "credit": 0
+          },
+          {
+            "id": "GL-DEP-1-liability",
+            "account": "Customer Deposits",
+            "debit": 0,
+            "credit": 500
+          }
+        ],
+        "party_count": {
+          "DEP-1": 0
+        },
+        "account_balances": {
+          "Cash": 500,
+          "Customer Deposits": -500
+        }
+      }
+    },
+    {
+      "comment": "Invoice the customer 300",
+      "submit": {
+        "doctype": "Sales Invoice",
+        "document_id": "SINV-D1",
+        "payload": {
+          "customer": "CUST-1",
+          "posting_date": "2026-09-10"
+        },
+        "items": [
+          {
+            "item": "SVC-1",
+            "qty": 1,
+            "rate": 300
+          }
+        ]
+      },
+      "expect_status": 200,
+      "expect": {
+        "outstanding": {
+          "Sales Invoice/SINV-D1": 300
+        }
+      }
+    },
+    {
+      "comment": "Apply 300 of the deposit to the invoice: Dr the liability (from the deposit), Cr receivable, settles the invoice",
+      "submit": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-D1",
+        "payload": {
+          "payment_type": "Receive",
+          "deposit": "DEP-1",
+          "paid_amount": 300,
+          "posting_date": "2026-09-10",
+          "references": [
+            {
+              "reference_doctype": "Sales Invoice",
+              "reference_name": "SINV-D1",
+              "allocated_amount": 300
+            }
+          ]
+        },
+        "items": []
+      },
+      "expect_status": 200,
+      "expect": {
+        "gl_rows": [
+          {
+            "id": "GL-PAY-D1-to",
+            "account": "Customer Deposits",
+            "debit": 300,
+            "credit": 0
+          },
+          {
+            "id": "GL-PAY-D1-from",
+            "account": "Debtors",
+            "credit": 300,
+            "debit": 0
+          }
+        ],
+        "outstanding": {
+          "Sales Invoice/SINV-D1": 0
+        },
+        "account_balances": {
+          "Customer Deposits": -200,
+          "Debtors": 0,
+          "Cash": 500
+        }
+      }
+    },
+    {
+      "comment": "Applying 250 more is refused: only 200 is left",
+      "submit": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-D2",
+        "payload": {
+          "payment_type": "Receive",
+          "deposit": "DEP-1",
+          "paid_amount": 250,
+          "posting_date": "2026-09-11",
+          "references": []
+        },
+        "items": []
+      },
+      "expect_status": 422,
+      "error_contains": "left",
+      "expect": {
+        "gl_count": {
+          "PAY-D2": 0
+        }
+      }
+    },
+    {
+      "comment": "The deposit cannot be cancelled while a payment applies it",
+      "cancel": {
+        "doctype": "Customer Deposit",
+        "document_id": "DEP-1"
+      },
+      "expect_status": 409,
+      "expect": {
+        "account_balances": {
+          "Customer Deposits": -200
+        }
+      }
+    },
+    {
+      "comment": "Cancel the application: the deposit is whole again and the invoice owed again",
+      "cancel": {
+        "doctype": "Payment Entry",
+        "document_id": "PAY-D1"
+      },
+      "expect_status": 200,
+      "expect": {
+        "outstanding": {
+          "Sales Invoice/SINV-D1": 300
+        },
+        "account_balances": {
+          "Customer Deposits": -500,
+          "Debtors": 300
+        }
+      }
+    },
+    {
+      "comment": "Refund: cancelling the unapplied deposit reverses it",
+      "cancel": {
+        "doctype": "Customer Deposit",
+        "document_id": "DEP-1"
+      },
+      "expect_status": 200,
+      "expect": {
+        "docstatus": 2,
+        "account_balances": {
+          "Customer Deposits": 0,
+          "Cash": 0
+        }
+      }
+    }
+  ]
+}

@@ -14,11 +14,13 @@ use crate::model::{
     TokenIdentity, User, WebhookEvent, WebhookKind,
 };
 use crate::posting::model::{
-    format_number, Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction,
-    PostedDocument, PostingBatch, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
+    deposit_guard_violation, format_number, Bin, BooksLockChange, BooksLockOutcome, CommitOutcome,
+    CompanySettings, DepositGuard, GlEntry, Item, PartyTransaction, PostedDocument, PostingBatch,
+    PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::posting::replication::{replication_mutations, ReplicationSources, SYSTEM_DEVICE_ID};
 use crate::projection::{fold_mutation, CompanyDocument, ProjectionAction};
+use crate::store::{books_lock_moved, lock_violation};
 
 use super::{MutationPage, Store, StoreError};
 
@@ -91,6 +93,19 @@ struct Inner {
 }
 
 impl Inner {
+    /// Payment Entries naming `deposit_id` (any docstatus).
+    fn deposit_applications(&self, company_id: Uuid, deposit_id: &str) -> Vec<PostedDocument> {
+        self.documents
+            .iter()
+            .filter(|((c, doctype, _), doc)| {
+                *c == company_id
+                    && doctype == "Payment Entry"
+                    && doc.payload.get("deposit").and_then(Value::as_str) == Some(deposit_id)
+            })
+            .map(|(_, doc)| doc.clone())
+            .collect()
+    }
+
     /// Appends to the company mutation log with the same idempotent,
     /// monotonic version assignment as `push_mutations` — callable while the
     /// store mutex is already held (e.g. inside `posting_commit`). A record
@@ -666,8 +681,70 @@ impl Store for MemStore {
         settings: CompanySettings,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.lock().unwrap();
+        // C5: the books lock only moves through `set_books_lock`; a settings
+        // write that raced a lock change must not put the old lock back.
+        let lock = inner
+            .settings
+            .get(&company_id)
+            .and_then(|current| current.books_lock_date.clone());
+        let mut settings = settings;
+        settings.books_lock_date = lock;
         inner.settings.insert(company_id, settings);
         Ok(())
+    }
+
+    async fn known_mutation_ids(
+        &self,
+        company_id: Uuid,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter(|id| {
+                inner
+                    .mutation_versions
+                    .contains_key(&(company_id, (*id).clone()))
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn deposit_applications(
+        &self,
+        company_id: Uuid,
+        deposit_id: &str,
+    ) -> Result<Vec<PostedDocument>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.deposit_applications(company_id, deposit_id))
+    }
+
+    async fn set_books_lock(
+        &self,
+        company_id: Uuid,
+        change: BooksLockChange,
+    ) -> Result<BooksLockOutcome, StoreError> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut settings = inner.settings.get(&company_id).cloned().unwrap_or_default();
+        let previous = settings.books_lock_date.clone();
+        if previous == change.lock_date {
+            return Ok(BooksLockOutcome {
+                previous: previous.clone(),
+                lock_date: previous,
+                changed: false,
+            });
+        }
+        if previous != change.expected_current {
+            return Err(StoreError::Conflict(books_lock_moved(previous.as_deref())));
+        }
+        settings.books_lock_date = change.lock_date.clone();
+        inner.settings.insert(company_id, settings);
+        inner.audit.push(change.audit);
+        Ok(BooksLockOutcome {
+            previous,
+            lock_date: change.lock_date,
+            changed: true,
+        })
     }
 
     async fn upsert_item(&self, company_id: Uuid, item: Item) -> Result<(), StoreError> {
@@ -856,6 +933,33 @@ impl Store for MemStore {
                     response: response.clone(),
                     replayed: true,
                 });
+            }
+        }
+
+        // C5: the books lock and the deposit invariants, re-checked inside the
+        // commit; a failure sends the engine back to rebuild (and refuse).
+        if let Some(date) = &commit.lock_check_date {
+            let lock = inner
+                .settings
+                .get(&company)
+                .and_then(|settings| settings.books_lock_date.clone());
+            if let Some(reason) = lock_violation(date, lock.as_deref()) {
+                return Err(StoreError::Stale(reason));
+            }
+        }
+        if let Some(guard) = &commit.deposit_guard {
+            let deposit_id = match guard {
+                DepositGuard::Apply { deposit_id, .. } | DepositGuard::Release { deposit_id } => {
+                    deposit_id
+                }
+            };
+            let deposit = inner
+                .documents
+                .get(&(company, "Customer Deposit".to_string(), deposit_id.clone()))
+                .cloned();
+            let applications = inner.deposit_applications(company, deposit_id);
+            if let Some(reason) = deposit_guard_violation(guard, deposit.as_ref(), &applications) {
+                return Err(StoreError::Stale(reason));
             }
         }
 

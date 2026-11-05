@@ -123,6 +123,9 @@ pub fn replication_mutations(
         if let Some(party) = &entry.party {
             fields.insert("party".into(), json!(party));
         }
+        if let Some(cost_center) = &entry.cost_center {
+            fields.insert("cost_center".into(), json!(cost_center));
+        }
         fields.insert("voucher_type".into(), json!(entry.voucher_type));
         fields.insert("voucher_no".into(), json!(entry.voucher_no));
         // Multi-currency base stamping (the Dart `_stampBaseAmounts` /

@@ -14,8 +14,8 @@ use crate::model::{
     TokenIdentity, User, WebhookEvent, WebhookKind,
 };
 use crate::posting::model::{
-    Bin, CommitOutcome, CompanySettings, GlEntry, Item, PartyTransaction, PostedDocument,
-    PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
+    Bin, BooksLockChange, BooksLockOutcome, CommitOutcome, CompanySettings, GlEntry, Item,
+    PartyTransaction, PostedDocument, PostingCommit, Settlement, StockLedgerEntry, TaxTransaction,
 };
 use crate::projection::CompanyDocument;
 
@@ -37,6 +37,22 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Internal(String),
+}
+
+/// C5: why a posting dated `date` may not commit under books lock `lock`
+/// (`None` when it may). ISO dates compare correctly as strings.
+pub fn lock_violation(date: &str, lock: Option<&str>) -> Option<String> {
+    lock.filter(|lock| date <= *lock).map(|lock| {
+        format!("posting date {date} falls in a locked period (books locked through {lock})")
+    })
+}
+
+/// C5: the refusal of a books-lock change made from a stale view.
+pub fn books_lock_moved(current: Option<&str>) -> String {
+    format!(
+        "the books lock changed on another device: it is now {}. Reload and try again",
+        current.map_or("cleared".to_string(), |lock| format!("through {lock}"))
+    )
 }
 
 /// One page of a paginated mutation pull.
@@ -305,6 +321,33 @@ pub trait Store: Send + Sync {
         company_id: Uuid,
         payment_no: &str,
     ) -> Result<Vec<Settlement>, StoreError>;
+
+    /// Which of `ids` the company log already holds. A re-push of one of
+    /// them is a replay the log ignores (it is idempotent on id).
+    async fn known_mutation_ids(
+        &self,
+        company_id: Uuid,
+        ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, StoreError>;
+
+    /// C5: the submitted-or-cancelled Payment Entries that name Customer
+    /// Deposit `deposit_id` in their `deposit` field (callers count the
+    /// submitted ones).
+    async fn deposit_applications(
+        &self,
+        company_id: Uuid,
+        deposit_id: &str,
+    ) -> Result<Vec<PostedDocument>, StoreError>;
+
+    /// C5: moves the company's books lock (compare-and-set on
+    /// `change.expected_current`), serialized with every posting commit of
+    /// the company, writing `change.audit` in the same step.
+    /// `StoreError::Conflict` when the lock is no longer what the caller saw.
+    async fn set_books_lock(
+        &self,
+        company_id: Uuid,
+        change: BooksLockChange,
+    ) -> Result<BooksLockOutcome, StoreError>;
 
     /// A previously committed response for this idempotency key, if any.
     async fn idempotent_response(
